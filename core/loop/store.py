@@ -178,7 +178,7 @@ class Store:
         with self.db:
             changed = self.db.execute(
                 "UPDATE jobs SET phase='review',attempts=0,next_at=0,detail='' "
-                "WHERE id=? AND phase IN ('blocked','candidate','stale','design-needed','forest-held')", (job_id,),
+                "WHERE id=? AND phase IN ('blocked','candidate','stale','design-needed','forest-held','wiki-needed')", (job_id,),
             )
             if changed.rowcount != 1:
                 raise ValueError("retry requires a blocked, candidate, stale or design-pending job")

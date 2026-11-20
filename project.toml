@@ -1,6 +1,6 @@
 [project]
 name = "kevin-agent-kit"
-version = "0.2.0"
+version = "0.3.0"
 
 [loop]
 repo = ""
@@ -8,6 +8,8 @@ target = "main"
 max_rounds = 5
 design_gate = true
 repeat_class_rounds = 2
+wiki_landing = true
+wiki_dir = "docs/research"
 max_jobs = 2
 poll_seconds = 2
 timeout_seconds = 900

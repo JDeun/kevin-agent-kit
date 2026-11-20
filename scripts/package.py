@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from core.loop.config import NAME, project
 
-RUNTIME = ("core", "reviews", "guards", "verify")
+RUNTIME = ("core", "reviews", "guards", "verify", "wiki")
 DOCUMENTS = ("reviews/persona/README.md", "verify/README.md")
 ENTRIES = (
     "project.toml", "LICENSE", "README.md", "CHANGELOG.md", "AGENTS.md", "docs", "agents",

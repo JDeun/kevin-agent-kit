@@ -25,6 +25,9 @@
   repairs in the candidate bundle.
 - Reserve shared ordinals and ports through the resource ledger before using
   them. Run the migration check against the current target for numbered changes.
+- Before research or design, read the wiki map and related synthesis pages
+  (`wiki_dir`, default `docs/research`). Land findings in a synthesis page with
+  cited sources and enqueue research with `--kind research`.
 - Use the project's configured `max_model` for assignments that need the
   maximum-capability model. Choose a smaller model for a routine role when
   it meets the task's needs. Confirm any increase with the project owner.

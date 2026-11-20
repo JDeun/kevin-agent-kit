@@ -1,0 +1,9 @@
+wiki-lint:
+  # The referenced runner image supplies the approved kit on PATH.
+  image: $WIKI_RUNNER_IMAGE
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - docs/research/**/*
+  script:
+    - kevin-agent-kit wiki lint --dir docs/research

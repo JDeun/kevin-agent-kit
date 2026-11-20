@@ -147,6 +147,12 @@ def config(path=None, *, control_only=False):
         raise ValueError("design_gate must be a boolean")
     if type(data["repeat_class_rounds"]) is not int or data["repeat_class_rounds"] < 2:
         raise ValueError("repeat_class_rounds must be an integer of at least two")
+    if type(data["wiki_landing"]) is not bool:
+        raise ValueError("wiki_landing must be a boolean")
+    wiki_dir = data["wiki_dir"]
+    if (not isinstance(wiki_dir, str) or wiki_dir.startswith("/") or wiki_dir.endswith("/")
+            or ".." in wiki_dir.split("/") or not wiki_dir):
+        raise ValueError("wiki_dir must be a relative repository path")
     for key in ("max_rounds", "max_jobs", "poll_seconds", "timeout_seconds", "retry_initial_seconds",
                 "retry_limit", "retry_max_seconds", "evidence_ttl_seconds"):
         if type(data[key]) is not int or data[key] < 1:

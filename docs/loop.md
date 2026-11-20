@@ -243,7 +243,8 @@ Reserve `--kind routine` for work that leaves the design intact. Treat task
 classification as an operator decision. The default `design_gate = true`
 returns an implementation lacking approval as `design-needed` before review.
 To turn off initial admission, set `design_gate = false` in the profile
-and restart the daemon.
+and restart the daemon. Research branches (`--kind research`) skip the design
+gate; see the [knowledge wiki](wiki.md) for their landing check.
 
 When one finding class occurs in `repeat_class_rounds` consecutive rounds
 (two by default), the loop moves the job to `forest` before invoking the next

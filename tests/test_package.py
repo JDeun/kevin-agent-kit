@@ -37,7 +37,7 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     invoke(source, "build", result)
     manifest = json.loads((result / "plugin/.claude-plugin/plugin.json").read_text())
     assert manifest["name"] == "different-kit"
-    assert manifest["version"] == original_config["project"]["version"] == "0.2.0"
+    assert manifest["version"] == original_config["project"]["version"] == "0.3.0"
     market = json.loads((result / ".claude-plugin/marketplace.json").read_text())
     assert market["name"] == market["plugins"][0]["name"] == "different-kit"
     assert market["plugins"][0]["source"] == "./plugin"
@@ -75,6 +75,9 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     output = subprocess.run([str(prefix / "bin/different-kit"), "fitness", "--help"], cwd=source,
                             capture_output=True, check=True, text=True, env=isolated_env)
     assert "ratchet" in output.stdout
+    output = subprocess.run([str(prefix / "bin/different-kit"), "wiki", "--help"], cwd=source,
+                            capture_output=True, check=True, text=True, env=isolated_env)
+    assert "knowledge wiki" in output.stdout
     guard = prefix / "share/different-kit/different_kit/guards/agent-sec"
     output = subprocess.run([str(guard), "--help"], cwd=source, capture_output=True,
                             check=True, text=True, env=isolated_env)

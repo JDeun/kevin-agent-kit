@@ -1,0 +1,14 @@
+name: wiki-lint
+on:
+  pull_request:
+    paths:
+      - "docs/research/**"
+permissions:
+  contents: read
+jobs:
+  wiki-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The kit must be installed from a pinned, reviewed release.
+      - run: kevin-agent-kit wiki lint --dir docs/research

@@ -4,7 +4,7 @@ import re
 from .git import Conflict
 
 DESIGN_LENSES = ("architect", "sre")
-TASK_KINDS = ("unclassified", "routine", "feature", "architecture")
+TASK_KINDS = ("unclassified", "routine", "feature", "architecture", "research")
 SECTIONS = (
     "canonical design", "failure modes and rollback", "latency budget", "memory budget", "test plan",
 )
@@ -43,3 +43,13 @@ def approval_matches(git, approval, base, head, policy):
                 and document(git, head, approval["path"]) == approval["blob"])
     except (Conflict, ValueError):
         return False
+
+
+def wiki_landed(changed, directory):
+    """True when a change set edits a wiki synthesis page, not only its map or sources."""
+    prefix = directory + "/"
+    for name in changed:
+        rest = name.removeprefix(prefix) if name.startswith(prefix) else ""
+        if rest.endswith(".md") and "/" not in rest and rest not in ("README.md", "AGENTS.md"):
+            return True
+    return False

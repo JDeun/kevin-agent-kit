@@ -1,7 +1,7 @@
 {
   "name": "kevin-agent-kit",
   "description": "Coordinate implementation, review and integration with human decisions.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {"name": "JDeun"},
   "repository": "https://github.com/JDeun/kevin-agent-kit.git",
   "license": "MIT"

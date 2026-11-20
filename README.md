@@ -119,6 +119,7 @@ the build directory on `PYTHONPATH`. See the [architecture](docs/architecture.md
 - [Screenshot verification](verify/README.md) supplies running-app evidence for a PR or MR.
 - [Guards](docs/guards.md) and [ledgers](docs/ledgers.md) describe the available checks and records.
 - [Architecture fitness](docs/fitness.md) shows how to run `kevin-agent-kit fitness` and ratchet known violations in CI.
+- [Knowledge wiki](docs/wiki.md) keeps research as immutable sources, synthesis pages and a map, with `kevin-agent-kit wiki` and a loop landing check.
 - [Observability](docs/observability.md) defines the loop's status metrics and shows how to verify SLOs after rollout.
 - [Cost and context](docs/cost.md) covers agent model choice and session usage.
 

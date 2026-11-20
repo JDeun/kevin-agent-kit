@@ -81,7 +81,7 @@ Path("example.txt").write_text("correct" + chr(10))
         checks={"example": ["check-fixture"]}, repair_paths=["example.txt"],
         lenses={}, lens_reviewers={"security": review_command}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
         evidence_ttl_seconds=60, retry_limit=1, retry_initial_seconds=1, retry_max_seconds=1,
-        design_gate=False, repeat_class_rounds=2,
+        design_gate=False, repeat_class_rounds=2, wiki_landing=False, wiki_dir="docs/research",
         memory={stage: {"max_anon_mib": 0, "min_available_mib": 0} for stage in ("review", "test")},
     )
     # The standalone demo uses only its in-process fixture sources.
@@ -118,6 +118,7 @@ def main(argv=None):
         "ledger": "core.ledgers",
         "guard": "guards",
         "fitness": "guards.fitness",
+        "wiki": "wiki",
         "screenshot": "verify.screenshot",
     }
     if argv and argv[0] in modules:

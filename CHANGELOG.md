@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Add `wiki` for repository knowledge: `init`, `ingest`, `lint` with
+  judgement-task generation, and read-only linting of hosted wikis. Sources are
+  immutable and checked by digest.
+- Hold `research` branches in `wiki-needed` until a synthesis page lands, with
+  `wiki_landing` and `wiki_dir` profile settings. Add a research rule and
+  wiki CI examples.
+
 ## 0.2.0
 
 - Require design-only architect and SRE review before feature and architecture

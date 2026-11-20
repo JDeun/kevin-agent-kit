@@ -12,7 +12,7 @@ import time
 from uuid import uuid4
 
 from .config import config, repo_id
-from .design import DESIGN_LENSES, approval_matches, document, validate_document
+from .design import DESIGN_LENSES, approval_matches, document, validate_document, wiki_landed
 from .evidence import canonical, signed_receipt, source_id
 from .git import Conflict, Git, MergeFailure
 from .review import BLOCKING, brief, lenses, observed_review, prompt, review_receipt, verified_check
@@ -236,6 +236,9 @@ class Engine:
         merge_base = self.git.run("merge-base", base, head, allowed=(0, 1)).stdout.strip()
         if not merge_base:
             raise MergeFailure("unrelated-histories")
+        if (self.cfg["wiki_landing"] and job["kind"] == "research"
+                and not wiki_landed(self.git.paths(merge_base, head), self.cfg["wiki_dir"])):
+            return "wiki-needed", "land the research in a wiki synthesis page before review", None
         with self.git.snapshot(self.cfg["state"], base, head) as (git, root), ExitStack() as repairs:
             candidate = git.candidate(base, head)
             evidence = {
@@ -358,7 +361,7 @@ class Engine:
         self.store.update(job, phase, detail=detail[:500], evidence=evidence)
 
     def design_gate(self, job, base, forest, approval):
-        required = self.cfg["design_gate"] and job["kind"] != "routine"
+        required = self.cfg["design_gate"] and job["kind"] not in ("routine", "research")
         if not required and not forest:
             return None, None
         approved = approval_matches(self.git, approval, base, job["sha"], self.cfg["policy_id"])

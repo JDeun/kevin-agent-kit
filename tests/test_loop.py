@@ -81,7 +81,7 @@ def queue(tmp_path, monkeypatch):
     return git, cfg
 
 
-def engine_run(cfg, branch, sha, runner, *, retry=False, authenticate=None):
+def engine_run(cfg, branch, sha, runner, *, retry=False, authenticate=None, kind="unclassified"):
     if authenticate is None:
         authenticate = lambda raw, _: json.loads(raw)
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store, Engine(
@@ -90,7 +90,7 @@ def engine_run(cfg, branch, sha, runner, *, retry=False, authenticate=None):
         if retry:
             store.retry(1)
         else:
-            store.enqueue(branch, sha)
+            store.enqueue(branch, sha, kind=kind)
         end = time.monotonic() + 8
         while time.monotonic() < end:
             engine.tick()
@@ -754,3 +754,32 @@ def test_status_counts_candidate_merge_conflicts(queue):
     result = engine_run(cfg, "feature", git.head("feature"), clean_run)
     assert result["counts"] == {"blocked": 1}
     assert result["metrics"]["merge_failures"] == {"conflict": 1}
+
+
+@pytest.mark.parametrize("case, phase", [
+    ("no-wiki-change", "wiki-needed"), ("map-only", "wiki-needed"), ("sources-only", "wiki-needed"),
+    ("synthesis-page", "candidate"), ("landing-disabled", "candidate"), ("not-research", "candidate"),
+])
+def test_research_task_needs_a_wiki_synthesis_page_to_land(queue, case, phase):
+    git, cfg = queue
+    cfg.update(wiki_landing=case != "landing-disabled", wiki_dir="docs/research")
+    git.run("switch", "-c", "study", "main")
+    touched = {"map-only": "docs/research/README.md", "sources-only": "docs/research/sources/2026-01-01-n.md",
+               "synthesis-page": "docs/research/topic.md"}.get(case, "notes.txt")
+    path = git.repo / touched
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("finding\n")
+    git.run("add", touched)
+    git.run("commit", "--quiet", "-m", "research")
+    calls = []
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        calls.append(role)
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+
+    kind = "feature" if case == "not-research" else "research"
+    cfg["design_gate"] = False
+    result = engine_run(cfg, "study", git.head("study"), runner, kind=kind)
+    assert result["counts"] == {phase: 1}
+    if phase == "wiki-needed":
+        assert calls == []
