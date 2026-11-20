@@ -80,12 +80,14 @@ def environment(allowed, extra=None):
 
 
 def execution_policy(settings, forbidden=()):
-    if not isinstance(settings, dict) or settings.keys() - {"tools", "env", "sockets"}:
-        raise ValueError("execution settings accept tools, env and sockets")
-    policy = {"tools": {}, "env": {}, "sockets": {}}
+    if not isinstance(settings, dict) or settings.keys() - {"tools", "env", "sockets", "isolation"}:
+        raise ValueError("execution settings accept tools, env, sockets and isolation")
+    if settings.get("isolation", "bwrap") not in ("bwrap", "none"):
+        raise ValueError('isolation must be "bwrap" or "none"')
+    policy = {"tools": {}, "env": {}, "sockets": {}, "isolation": settings.get("isolation", "bwrap")}
     ambient = (*(Path(path) for path in (*SYSTEM_MOUNTS, *PUBLIC_FILES)), ROOT / "rules")
     forbidden = (*forbidden, *ambient)
-    if any(not isinstance(settings.get(section, {}), dict) for section in policy):
+    if any(not isinstance(settings.get(section, {}), dict) for section in ("tools", "env", "sockets")):
         raise ValueError("tools, env and sockets must be tables")
     for name, value in settings.get("tools", {}).items():
         if not TOOL_NAME.fullmatch(name):
@@ -122,9 +124,41 @@ def command_tools(argv, policy):
     return selected
 
 
+def unisolated_command(argv, cwd, role, policy, extra, tools, bundle):
+    """Run without Bubblewrap. The command has this account's full file and network access."""
+    tools = tools or {}
+    mapped = []
+    for part in argv:
+        name = part.removeprefix("/tools/")
+        if part.startswith("/tools/"):
+            if name not in tools:
+                raise ValueError(f"unknown sandbox tool: {name}")
+            part = str(tools[name])
+        mapped.append(part)
+    env = {
+        "PATH": ":".join([*(str(path.parent) for path in list(tools.values())[:1]), os.environ.get("PATH", "/usr/bin:/bin")]),
+        "HOME": os.environ.get("HOME", "/"), "LANG": "C.UTF-8", "GIT_TERMINAL_PROMPT": "0",
+        "TERM": "dumb",
+    }
+    reserved = {"SSH_AUTH_SOCK", "BASH_ENV", "ENV", "CDPATH"}
+    for name in policy["env"].get(role, []):
+        if (not NAME.fullmatch(name) or name in reserved or name.startswith(("AGENT_", "LD_", "DYLD_"))):
+            raise ValueError(f"reserved or invalid environment name: {name}")
+        if name in os.environ:
+            env[name] = os.environ[name]
+    env.update(extra or {})
+    if cwd is not None:
+        env["AGENT_WORKSPACE"] = str(cwd)
+    if bundle is not None:
+        env["AGENT_CANDIDATE_BUNDLE"] = str(bundle)
+    return mapped, env
+
+
 def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None):
     if not argv:
         raise ValueError(f"configure the {role} command in the trusted profile")
+    if policy.get("isolation") == "none":
+        return unisolated_command(argv, cwd, role, policy, extra, tools, bundle)
     forward = environment(policy["env"].get(role, []), extra)
     cmd = [BWRAP, "--unshare-user", "--unshare-all", "--disable-userns", "--die-with-parent",
            "--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
@@ -179,16 +213,35 @@ def redact(text, env_names):
     return text
 
 
-def probe():
+ISOLATION_HELP = (
+    "Bubblewrap cannot create its mount namespace here (a container without user namespaces, or an "
+    "AppArmor or seccomp profile, usually causes this). Run the kit on a host or VM where "
+    "`bwrap --unshare-all --ro-bind / / true` works, or inside a container you accept as the isolation "
+    'boundary and set `isolation = "none"` under [loop.execution] with `trust = "local"` in the trusted '
+    "profile. That mode gives every adapter this account's files, network and credentials."
+)
+
+
+def isolation_status():
+    """Return (available, detail) for Bubblewrap without raising."""
     import subprocess
 
-    cmd, env = command_line(["/usr/bin/true"], None, "verify", execution_policy({}))
+    if not os.access(BWRAP, os.X_OK):
+        return False, f"{BWRAP} is not installed"
     try:
+        cmd, env = command_line(["/usr/bin/true"], None, "verify", execution_policy({}))
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env, cwd="/")
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ValueError("Bubblewrap isolation unavailable") from error
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return False, f"Bubblewrap probe failed: {error}"
     if result.returncode:
-        raise ValueError(f"Bubblewrap isolation unavailable: {result.stderr.strip()[:250]}")
+        return False, result.stderr.strip()[:250] or f"exit status {result.returncode}"
+    return True, "Bubblewrap isolation works"
+
+
+def probe():
+    available, detail = isolation_status()
+    if not available:
+        raise ValueError(f"Bubblewrap isolation unavailable: {detail}. {ISOLATION_HELP}")
 
 
 def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None, bundle=None):
@@ -202,4 +255,5 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
             path.chmod(0o500 if tool.executable else 0o400)
             paths[name] = path
         cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle)
-        return run(cmd, "/", cancel, timeout, prompt=stdin, env=env)
+        unisolated = policy.get("isolation") == "none"
+        return run(cmd, str(cwd) if unisolated and cwd is not None else "/", cancel, timeout, prompt=stdin, env=env)

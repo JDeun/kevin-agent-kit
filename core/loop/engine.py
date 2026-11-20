@@ -16,7 +16,7 @@ from .design import DESIGN_LENSES, approval_matches, document, validate_document
 from .evidence import canonical, signed_receipt, source_id
 from .git import Conflict, Git, MergeFailure
 from .review import BLOCKING, brief, lenses, observed_review, prompt, review_receipt, verified_check
-from .runtime import Cancelled, MemoryGate, Retry, private_dir
+from .runtime import Cancelled, CommandFailed, MemoryGate, Retry, private_dir
 from .sandbox import execute, redact
 from .store import SHA, now
 
@@ -93,6 +93,7 @@ class Engine:
         self.memory = MemoryGate()
         self.executor = ThreadPoolExecutor(max_workers=cfg["max_jobs"])
         self.active = {}
+        self.runs = {}
 
     def __enter__(self):
         self.store.recover_pending_reviews()
@@ -125,8 +126,29 @@ class Engine:
         }
         if role in {"reviewer", "worker"}:
             extra["AGENT_MODEL"] = self.cfg[f"{role}_model"]
-        return self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
-                           policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
+        started = time.monotonic()
+        try:
+            output = self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
+                                 policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
+        except Exception as error:
+            code = error.code if isinstance(error, CommandFailed) else None
+            self.note(evidence, role, argv, code, type(error).__name__, started)
+            raise
+        self.note(evidence, role, argv, 0, None, started, output)
+        return output
+
+    def note(self, evidence, role, argv, code, error, started, output=""):
+        """Keep the exit code and size of every command as evidence of what actually ran."""
+        runs = self.runs.setdefault(evidence["run"], [])
+        if len(runs) < 200:
+            runs.append({
+                "role": role, "command": Path(argv[0]).name if argv else "", "exit_code": code,
+                "error": error, "seconds": round(time.monotonic() - started, 3),
+                "output_sha256": hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest(),
+            })
+
+    def trace(self, evidence):
+        return list(self.runs.get(evidence["run"], []))
 
     def review_result(self, argv, work, evidence, request, previous=(), prior_round=()):
         output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous, prior_round))
@@ -181,7 +203,7 @@ class Engine:
 
     def review(self, job_id, work, package, evidence, paths, prior, history, rounds, prior_round):
         bundle, scope = package
-        observer = self.cfg["evidence"]["observer"]
+        observer = self.cfg["evidence"].get("observer")
         items = list(prior)
         selected = dict.fromkeys((*lenses(paths, self.cfg["lenses"]), *(item["lens"] for item in prior)))
         for lens in selected:
@@ -197,6 +219,15 @@ class Engine:
                 review = self.review_result(argv, work, evidence, request, previous, prior_round)
                 self.store.record_protected(job_id, request, rounds,
                                             [item for item in review["findings"] if item["risk"] in BLOCKING])
+                if self.cfg.get("trust", "signed") == "local":
+                    # No independent observer: record the reviewer's own result as unsigned.
+                    review["observation"] = {"source": "local-unsigned", "status": "complete",
+                                             "reviewed_paths": paths, "resolved": review["resolved"]}
+                    review["collected_at"] = now()
+                    history.append(review)
+                    items = [item for item in items if item["lens"] != lens]
+                    items.extend({**item, "lens": lens} for item in review["findings"])
+                    continue
                 review_input = {"review": review, "prior_protected": previous}
                 observation = {**request, **scope, "retention_seconds": observer["retention_seconds"],
                                "kind": "review-observation", "invocation": uuid4().hex,
@@ -209,11 +240,13 @@ class Engine:
                 observed = observed_review(self.authenticate(output, key), observation, review["resolved"])
                 review["observation"] = {**observed, "source": source_id(key)}
             except (OSError, ValueError, Retry, sqlite3.Error) as cause:
-                if review is not None:
+                found = review["findings"] if review is not None else getattr(cause, "salvaged", [])
+                if found:
                     known = {item["id"] for item in items if item["lens"] == lens}
-                    items.extend({**item, "lens": lens} for item in review["findings"]
+                    items.extend({**item, "lens": lens} for item in found
                                  if item["risk"] in BLOCKING and item["id"] not in known)
-                report = {**evidence, "reviews": history, "findings": items, "rounds": rounds}
+                report = {**evidence, "reviews": history, "findings": items, "rounds": rounds,
+                          "runs": self.trace(evidence)}
                 raise InterruptedAttempt(cause, report) from cause
             review["collected_at"] = now()
             history.append(review)
@@ -250,8 +283,10 @@ class Engine:
             prior_round = []
             classes = deque(maxlen=self.cfg["repeat_class_rounds"])
             approvals = self.cfg["evidence"]
-            observer = approvals["observer"]
-            scopes = {adapter["bundle"] for adapter in (observer, *approvals["checks"].values())}
+            local = self.cfg.get("trust", "signed") == "local"
+            observer = approvals.get("observer")
+            scopes = set() if local else {
+                adapter["bundle"] for adapter in (observer, *approvals["checks"].values())}
             seen = {(item["lens"], item["id"]): item for item in prior}
             for rounds in range(1, self.cfg["max_rounds"] + 1):
                 if approval and not approval_matches(git, approval, base, evidence["candidate"], self.cfg["policy_id"]):
@@ -259,19 +294,22 @@ class Engine:
                 packages = {scope: candidate_bundle(git, root, evidence, scope) for scope in sorted(scopes)}
                 evidence["diff_sha256"] = git.diff_digest(base, evidence["candidate"])
                 paths = sorted(git.paths(base, evidence["candidate"]))
-                items = self.review(job["id"], git.repo, packages[observer["bundle"]],
+                items = self.review(job["id"], git.repo, (None, None) if local else packages[observer["bundle"]],
                                     evidence, paths, seen.values(), history, rounds, prior_round)
                 open_protected = [item for item in items if item["risk"] in BLOCKING]
                 seen.update(((item["lens"], item["id"]), item) for item in open_protected)
-                report = {**evidence, "reviews": history, "rounds": rounds, "findings": items}
+                report = {**evidence, "reviews": history, "rounds": rounds, "findings": items,
+                          "runs": self.trace(evidence)}
                 if approval:
                     report["design"] = {key: approval[key] for key in ("head", "path", "blob", "reviewed_at")}
                 prior_round = items
-                classes.append({item["finding_class"] for item in items})
+                classes.append({(item["lens"], item["finding_class"]) for item in items})
                 if len(classes) == classes.maxlen and (repeated := set.intersection(*classes)):
                     self.authority(evidence)
-                    self.store.record_round(job, evidence["run"], rounds,
-                                            escalation={**report, "repeated_classes": sorted(repeated)})
+                    self.store.record_round(
+                        job, evidence["run"], rounds,
+                        escalation={**report, "repeated_classes": sorted({name for _, name in repeated}),
+                                    "repeated_by_lens": sorted(f"{lens}:{name}" for lens, name in repeated)})
                     return None  # The worker already recorded the hold and its evidence atomically.
                 self.store.record_round(job, evidence["run"], rounds)
                 if not items:
@@ -296,6 +334,15 @@ class Engine:
 
             receipts = []
             for name, argv in sorted(self.cfg["checks"].items()):
+                if local:
+                    try:
+                        receipts.append(self.local_check(name, argv, git.repo, evidence))
+                    except (OSError, ValueError, Retry) as cause:
+                        failed = {"check": name, "status": "failed", "source": "local-unsigned",
+                                  "exit_code": getattr(cause, "code", None)}
+                        raise InterruptedAttempt(
+                            cause, {**report, "checks": [*receipts, failed], "runs": self.trace(evidence)}) from cause
+                    continue
                 adapter = approvals["checks"][name]
                 staged, scope = packages[adapter["bundle"]]
                 request = {**evidence, **scope, "retention_seconds": adapter["retention_seconds"],
@@ -323,9 +370,23 @@ class Engine:
             self.authority(evidence)
             staged.replace(bundle)
             return "candidate", "awaiting repository owner", {
-                **report, **export_scope, "checks": receipts,
+                **report, **export_scope, "checks": receipts, "runs": self.trace(evidence),
+                "trust": self.cfg.get("trust", "signed"),
                 "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
+
+    def local_check(self, name, argv, work, evidence):
+        """Run a required check directly in the candidate checkout and keep its exit code."""
+        started = time.monotonic()
+        request = {**evidence, "kind": "required-check", "check": name, "invocation": uuid4().hex}
+        output = self.command("verify", argv, work, evidence, stdin=json.dumps({"request": request}))
+        return {
+            "request": request, "check": name, "status": "passed", "executed": True, "exit_code": 0,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "output_sha256": hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest(),
+            "tool_version": "local", "execution_id": uuid4().hex, "collected_at": now(),
+            "source": "local-unsigned",
+        }
 
     def collect(self, job, future):
         try:
@@ -382,6 +443,6 @@ class Engine:
                 continue
             forest = self.store.latest_forest(job["branch"])
             approval = self.store.design(job["branch"])
-            prior = self.store.protected(job["id"])
+            prior = self.store.inherited_protected(job)
             self.active[job["id"]] = job, self.executor.submit(self.step, job, prior, forest, approval)
             active_branches.add(job["branch"])

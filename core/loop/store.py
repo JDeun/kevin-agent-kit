@@ -51,11 +51,18 @@ class Store:
                     phase TEXT NOT NULL DEFAULT 'review', attempts INTEGER NOT NULL DEFAULT 0,
                     next_at REAL NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '',
                     kind TEXT NOT NULL DEFAULT 'unclassified',
+                    inherits INTEGER REFERENCES jobs,
+                    created_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0,
                     UNIQUE(branch, sha)
                 )
             """)
-            if "kind" not in {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}:
-                self.db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'unclassified'")
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            for name, definition in (
+                ("kind", "TEXT NOT NULL DEFAULT 'unclassified'"), ("inherits", "INTEGER REFERENCES jobs"),
+                ("created_at", "REAL NOT NULL DEFAULT 0"), ("updated_at", "REAL NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
             self.db.execute("""
                 CREATE TABLE IF NOT EXISTS design_reviews (branch TEXT PRIMARY KEY, body TEXT NOT NULL)
             """)
@@ -100,16 +107,35 @@ class Store:
         finally:
             self.db.close()
 
-    def enqueue(self, branch, sha, *, kind="unclassified"):
+    def enqueue(self, branch, sha, *, kind="unclassified", inherits=None):
         if not SHA.fullmatch(sha):
             raise ValueError("expected a full lowercase commit SHA")
         if kind not in TASK_KINDS:
             raise ValueError("unknown task kind")
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha,kind) VALUES (?,?,?)", (branch, sha, kind))
-            recorded = self.db.execute("SELECT kind FROM jobs WHERE branch=? AND sha=?", (branch, sha)).fetchone()
+            self.db.execute("BEGIN IMMEDIATE")
+            if inherits is not None:
+                source = self.db.execute("SELECT phase FROM jobs WHERE id=?", (inherits,)).fetchone()
+                if source is None or source["phase"] != "forest":
+                    raise ValueError("--inherit-from requires a job held for a forest redesign")
+            stamp = time.time()
+            self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha,kind,inherits,created_at,updated_at) "
+                            "VALUES (?,?,?,?,?,?)", (branch, sha, kind, inherits, stamp, stamp))
+            recorded = self.db.execute("SELECT id,kind,phase,inherits FROM jobs WHERE branch=? AND sha=?",
+                                       (branch, sha)).fetchone()
+            if inherits is not None and recorded["inherits"] != inherits:
+                raise ValueError("this branch and SHA are already queued without that inheritance")
             if kind != "unclassified" and recorded["kind"] != kind:
-                raise ValueError("this branch and SHA already have a different task kind")
+                if recorded["kind"] != "unclassified" or recorded["phase"] not in ("review", "design-needed"):
+                    raise ValueError("this branch and SHA already have a different task kind")
+                # Correct the classification of an untouched queue entry; keep the SHA and evidence.
+                self.db.execute(
+                    "UPDATE jobs SET kind=?,updated_at=?,"
+                    "phase=CASE WHEN phase='design-needed' THEN 'review' ELSE phase END WHERE id=?",
+                    (kind, time.time(), recorded["id"]))
+                self.db.execute("INSERT INTO evidence (job_id,phase,body) VALUES (?,?,?)",
+                                (recorded["id"], "reclassified",
+                                 json.dumps({"from": "unclassified", "to": kind, "at": now()})))
 
     def latest_forest(self, branch):
         return self.db.execute(
@@ -149,8 +175,8 @@ class Store:
             self._update(self.db, job, phase, detail, attempts, next_at, evidence)
 
     def _update(self, db, job, phase, detail, attempts, next_at, evidence):
-        db.execute("UPDATE jobs SET phase=?,detail=?,attempts=?,next_at=? WHERE id=?",
-                   (phase, detail, attempts, next_at, job["id"]))
+        db.execute("UPDATE jobs SET phase=?,detail=?,attempts=?,next_at=?,updated_at=? WHERE id=?",
+                   (phase, detail, attempts, next_at, time.time(), job["id"]))
         if evidence is not None:
             db.execute("INSERT INTO evidence (job_id,phase,body) VALUES (?,?,?)",
                        (job["id"], phase, json.dumps(evidence)))
@@ -231,6 +257,21 @@ class Store:
                 )
             db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job_id,))
 
+    def inherited_protected(self, job):
+        """Protected findings a redesign must still resolve: held jobs on the same branch and an explicit parent."""
+        sources = {row["id"] for row in self.db.execute(
+            """SELECT DISTINCT j.id FROM jobs j JOIN evidence e ON e.job_id=j.id
+               WHERE j.branch=? AND e.phase='forest' AND j.id<>?""", (job["branch"], job["id"]))}
+        if job["inherits"] is not None:
+            sources.add(job["inherits"])
+        merged = {}
+        for source in sorted(sources):
+            for finding in self.protected(source):
+                merged[finding["lens"], finding["id"]] = finding
+        for finding in self.protected(job["id"]):
+            merged[finding["lens"], finding["id"]] = finding
+        return list(merged.values())
+
     def protected(self, job_id):
         # A retry rebuilds from the approved source, so prior repair resolutions
         # must be re-checked against the rebuilt candidate.
@@ -255,6 +296,14 @@ class Store:
         return list(protected.values())
 
     def status(self):
+        # One read transaction so counts, jobs and counters describe the same moment.
+        self.db.execute("BEGIN")
+        try:
+            return self._status()
+        finally:
+            self.db.rollback()
+
+    def _status(self):
         rows = []
         for row in self.db.execute("""
             SELECT j.*, e.body FROM jobs j LEFT JOIN evidence e ON e.id =
@@ -281,8 +330,13 @@ class Store:
             SELECT json_extract(body, '$.merge_failure') AS reason, count(*) FROM evidence
             WHERE reason IS NOT NULL GROUP BY reason ORDER BY reason
         """))
+        stamp = time.time()
+        runnable = [row for row in rows if row["phase"] == "review" and row["next_at"] <= stamp]
+        started = [row["updated_at"] for row in runnable if row["updated_at"]]
         metrics = {
             "queue_length": counts.get("review", 0),
+            "runnable": len(runnable),
+            "oldest_runnable_age_seconds": round(stamp - min(started), 1) if started else None,
             "review_rounds": self.db.execute("SELECT count(*) FROM review_rounds").fetchone()[0],
             "forest_escalations": counts.get("forest", 0),
             "merge_failures": merge_failures,

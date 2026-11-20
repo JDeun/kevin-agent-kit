@@ -41,6 +41,8 @@ sample gauges and take deltas of cumulative counters per queue database.
 | Key | Meaning |
 | --- | --- |
 | `queue_length` | Jobs in the review phase, including in-flight work and scheduled retries. Use `counts` for the design and redesign queues. |
+| `runnable` | Review jobs whose retry time has passed. Delayed retries are in `queue_length` but not here. |
+| `oldest_runnable_age_seconds` | Age since the oldest runnable job was last queued or updated, or `null` when none or when the job predates timestamps. Use it for the queue-congestion SLO. Counts, jobs and metrics come from one read snapshot. |
 | `review_rounds` | Completed review rounds recorded by v0.2 and later, including rounds in retried runs. Per-run evidence includes `rounds`. |
 | `forest_escalations` | Jobs converted to redesign after recurring classes. The triggering evidence includes `repeated_classes`. |
 | `merge_failures` | Candidate preparation failures grouped by `conflict`, `unrelated-histories`, `timeout`, or `merge-error`. A later retry preserves the earlier failure in this counter. |

@@ -51,7 +51,33 @@ def nonempty(value):
     return isinstance(value, str) and bool(value.strip())
 
 
+def salvage(raw):
+    """Protected findings in a response the loop rejected. They must still be resolved later."""
+    try:
+        payload = json.loads(raw)
+        items = payload.get("findings") if isinstance(payload, dict) else None
+    except (ValueError, RecursionError):
+        return []
+    kept = []
+    for item in items if isinstance(items, list) else []:
+        if (isinstance(item, dict) and item.get("risk") in BLOCKING and isinstance(item.get("id"), str)
+                and FINDING_ID.fullmatch(item["id"]) and nonempty(item.get("detail"))):
+            kept.append({key: item[key] for key in ("id", "risk", "detail")})
+            category = item.get("finding_class")
+            if isinstance(category, str) and len(category) <= 80 and FINDING_CLASS.fullmatch(category):
+                kept[-1]["finding_class"] = category
+    return kept
+
+
 def review_receipt(raw, request, prior):
+    try:
+        return complete_review(raw, request, prior)
+    except ValueError as error:
+        error.salvaged = salvage(raw)
+        raise
+
+
+def complete_review(raw, request, prior):
     payload = receipt(raw, request, "complete")
     items = payload.get("findings")
     resolved = payload.get("resolved")

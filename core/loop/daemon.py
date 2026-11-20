@@ -3,7 +3,9 @@ import os
 from pathlib import Path
 import signal
 import socket
+import stat
 import subprocess
+import sys
 from threading import Event
 import time
 
@@ -114,10 +116,25 @@ def ensure_state(state):
     return private_dir(state)
 
 
+UNISOLATED_WARNING = (
+    "WARNING: isolation = none. Reviewer, worker and check commands run with the files, network "
+    "and credentials of this account. Use a disposable host or container as the boundary."
+)
+
+
 def validate_execution(cfg):
     if not cfg["reviewer"] or not cfg["checks"]:
         raise ValueError("configure a reviewer and required checks in the trusted profile")
-    probe()
+    if cfg.get("execution", {}).get("isolation") == "none":
+        print(UNISOLATED_WARNING, file=sys.stderr)
+    else:
+        probe()
+    if cfg.get("trust") == "local":
+        if not cfg["lens_reviewers"].get("security"):
+            raise ValueError("configure a security reviewer (it may reuse the reviewer command)")
+        print("NOTICE: trust = \"local\". Evidence is unsigned: exit codes and review results come "
+              "from the commands this kit ran itself.", file=sys.stderr)
+        return
     validate_evidence(cfg["evidence"], cfg["checks"])
     from .evidence import OPENSSL
 
@@ -139,6 +156,10 @@ def start(cfg):
     args = module_command(ROOT, __package__, "--config", str(cfg["profile"]), "run")
     path = state / "daemon.log"
     fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+        os.close(fd)
+        raise ValueError(f"daemon log must be a private, user-owned file with one link: {path}")
     with os.fdopen(fd, "ab") as log:
         child = subprocess.Popen(args, cwd="/", stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                  start_new_session=True)

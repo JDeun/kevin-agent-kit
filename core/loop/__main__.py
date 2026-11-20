@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -110,6 +112,48 @@ Path("example.txt").write_text("correct" + chr(10))
     }
 
 
+def doctor(profile):
+    """Diagnose this machine before a profile or a daemon exists. Never raises."""
+    from ..agents import CLIS, version
+
+    from .sandbox import ISOLATION_HELP, isolation_status
+
+    checks, advice = [], []
+
+    def add(name, ok, detail, required=True):
+        checks.append({"name": name, "ok": bool(ok), "required": required, "detail": detail})
+
+    add("python", sys.version_info >= (3, 11), sys.version.split()[0])
+    git = shutil.which("git")
+    add("git", git, git or "git is not on PATH")
+    isolation = "bwrap"
+    trust = "signed"
+    try:
+        cfg = config(profile)
+        isolation = cfg["execution"]["isolation"]
+        trust = cfg["trust"]
+        add("profile", True, f"valid; trust={trust}, isolation={isolation}")
+        add("reviewer and checks", bool(cfg["reviewer"] and cfg["checks"]),
+            "configured" if cfg["reviewer"] and cfg["checks"] else "set reviewer and [loop.checks]")
+    except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+        add("profile", False, f"not usable yet: {str(error)[:200]}", required=False)
+        advice.append("create one with `init` (or `init --agent codex|claude` for real CLIs, no signing)")
+    available, detail = isolation_status()
+    add("bubblewrap isolation", available, detail, required=isolation == "bwrap")
+    if not available:
+        advice.append(ISOLATION_HELP)
+    if trust == "signed":
+        from .evidence import OPENSSL
+
+        add("openssl", os.access(OPENSSL, os.X_OK), str(OPENSSL))
+    for cli in CLIS:
+        found = version(cli)
+        add(f"{cli} cli", found, found or "not installed", required=False)
+    ok = all(item["ok"] for item in checks if item["required"])
+    mode = ("isolated" if isolation == "bwrap" else "unisolated") + f"/{trust}-evidence"
+    return {"ok": ok, "mode": mode, "checks": checks, "advice": advice}
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     modules = {
@@ -120,6 +164,7 @@ def main(argv=None):
         "fitness": "guards.fitness",
         "wiki": "wiki",
         "screenshot": "verify.screenshot",
+        "agent": "core.agents",
     }
     if argv and argv[0] in modules:
         command = module_command(ROOT, MODULE_PREFIX + modules[argv[0]], *argv[1:])
@@ -129,18 +174,22 @@ def main(argv=None):
     parser.add_argument("--version", action="version", version=meta["version"])
     parser.add_argument("--config", type=Path, help="user-owned execution profile")
     commands = parser.add_subparsers(dest="action", required=True)
-    for name in ("demo", "run", "start", "stop", "status", *modules):
+    for name in ("demo", "run", "start", "stop", "status", "doctor", *modules):
         commands.add_parser(name)
     setup = commands.add_parser("init", help="draft a profile for the current repository")
     setup.add_argument("--global", dest="global_rules", action="store_true")
     setup.add_argument("--dry-run", action="store_true")
     setup.add_argument("--uninstall", action="store_true")
+    setup.add_argument("--agent", choices=("codex", "claude"),
+                       help="draft a working unisolated, local-trust profile for that agent CLI")
     setup.add_argument("--adopt-rules-sha256", action="append", default=[], metavar="SHA256",
                        help="approve the exact bytes of a reviewed legacy global rules block")
     enqueue = commands.add_parser("enqueue")
     enqueue.add_argument("branch")
     enqueue.add_argument("sha")
     enqueue.add_argument("--kind", choices=TASK_KINDS, default="unclassified")
+    enqueue.add_argument("--inherit-from", type=int, metavar="JOB_ID",
+                         help="carry the protected findings of a forest-held job into this redesign")
     design = commands.add_parser("design-review", help="review a design-only source revision before implementation")
     design.add_argument("branch")
     design.add_argument("sha")
@@ -165,8 +214,12 @@ def main(argv=None):
                 for path in global_rules(dry_run=args.dry_run, uninstall=args.uninstall, adopt=args.adopt_rules_sha256):
                     print(path)
             else:
-                print(repository_profile(Path.cwd(), dry_run=args.dry_run))
+                print(repository_profile(Path.cwd(), dry_run=args.dry_run, agent=args.agent))
             return 0
+        if args.action == "doctor":
+            report = doctor(args.config)
+            print(json.dumps(report, indent=2))
+            return 0 if report["ok"] else 1
         if args.action == "demo":
             with tempfile.TemporaryDirectory(prefix="agent-demo-") as temp:
                 print(json.dumps(demo(Path(temp)), indent=2))
@@ -188,7 +241,7 @@ def main(argv=None):
                     if (not SHA.fullmatch(args.sha) or args.branch == cfg["target"]
                             or git.head(args.branch) != args.sha):
                         raise ValueError("enqueue requires the exact current SHA of a distinct source branch")
-                    store.enqueue(args.branch, args.sha, kind=args.kind)
+                    store.enqueue(args.branch, args.sha, kind=args.kind, inherits=args.inherit_from)
                 elif args.action == "design-review":
                     report = Engine(cfg, store).design_review(args.branch, args.sha, args.design)
                     print(json.dumps(report, indent=2))
@@ -221,7 +274,10 @@ def main(argv=None):
                             report["counts"]["candidate"] -= 1
                             report["counts"]["stale"] = report["counts"].get("stale", 0) + 1
                     report["counts"] = {phase: count for phase, count in report["counts"].items() if count}
-                    print(json.dumps({"running": running(state), **report}, indent=2))
+                    alive = running(state)
+                    waiting = report["counts"].get("review", 0)
+                    note = ("daemon is not running; queued jobs wait until `start`" if waiting and not alive else None)
+                    print(json.dumps({"running": alive, **({"note": note} if note else {}), **report}, indent=2))
     except (ValueError, OSError, sqlite3.Error, Busy, Retry) as error:
         print(f"{parser.prog}: {error or 'coordinator is already running'}", file=sys.stderr)
         return 1

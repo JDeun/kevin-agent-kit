@@ -20,16 +20,32 @@ class Retry(Exception):
     pass
 
 
+class CommandFailed(ValueError):
+    """A command ran and exited nonzero; the exit code is evidence."""
+
+    def __init__(self, code):
+        super().__init__(f"command exited with status {code}")
+        self.code = code
+
+
 class Cancelled(Exception):
     pass
 
 
 _RUN_MODULE = """\
+import os
 from pathlib import Path
 import runpy
+import stat
 import sys
 
 root, module = sys.argv[1:3]
+uid = os.getuid()
+for entry in (Path(root), *Path(root).parents):
+    info = entry.lstat()
+    sticky = bool(info.st_mode & stat.S_ISVTX) and str(entry) != root
+    if info.st_uid not in (0, uid) or (info.st_mode & 0o022 and not sticky):
+        raise SystemExit(f"untrusted kit path (owner or write access): {entry}")
 if not (Path(root) / module.partition(".")[0] / "__init__.py").is_file():
     raise SystemExit(f"kit module is missing from {root}: {module}")
 sys.path.insert(0, root)
@@ -147,7 +163,7 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None):
         if code == 75:
             raise Retry("command reported a temporary failure")
         if code:
-            raise ValueError(f"command exited with status {code}")
+            raise CommandFailed(code)
         output = stdout.read(1024 * 1024 + 1)
         if len(output) > 1024 * 1024:
             raise ValueError("command output exceeded 1 MiB")

@@ -4,6 +4,8 @@ kevin-agent-kit runs a local coordinator for a Git repository. The operator
 approves an executable profile outside the checkout. The coordinator prepares
 a candidate, and the project owner decides whether to apply and publish it.
 See the [signed candidate evidence decision](adr/signed-candidate-evidence.md).
+There is no merge train: the kit never updates the target branch. It exports a verified
+candidate bundle, and the owner fetches and merges it with the repository's normal workflow.
 
 ```mermaid
 flowchart TD

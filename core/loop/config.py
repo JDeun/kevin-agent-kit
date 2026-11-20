@@ -143,6 +143,8 @@ def config(path=None, *, control_only=False):
         raise ValueError("state must be outside the checkout and Git directory")
     if control_only:
         return {"state": state}
+    if data["trust"] not in ("signed", "local"):
+        raise ValueError('trust must be "signed" or "local"')
     if type(data["design_gate"]) is not bool:
         raise ValueError("design_gate must be a boolean")
     if type(data["repeat_class_rounds"]) is not int or data["repeat_class_rounds"] < 2:
@@ -165,8 +167,11 @@ def config(path=None, *, control_only=False):
         for name, command in data[key].items():
             if not NAME.fullmatch(name) or not strings(command, name):
                 raise ValueError(f"invalid {key} name or command")
-    if not isinstance(data["check_keys"], dict) or data["checks"].keys() != data["check_keys"].keys():
+    local = data["trust"] == "local"
+    if not local and (not isinstance(data["check_keys"], dict) or data["checks"].keys() != data["check_keys"].keys()):
         raise ValueError("each required check needs an approved public key")
+    if local and (data["check_keys"] or data["review_key"] or data["review_observer"] or data["evidence"]):
+        raise ValueError("trust = \"local\" does not use signing keys, a review observer or evidence approval")
     if data["evidence"] != {}:
         validate_evidence(data["evidence"], data["checks"])
     for role in ("reviewer", "worker"):
@@ -185,6 +190,9 @@ def config(path=None, *, control_only=False):
     for name, patterns in data["lenses"].items():
         if not NAME.fullmatch(name) or not (PACKAGE_ROOT / "reviews/lenses" / f"{name}.md").is_file():
             raise ValueError("lens must name an installed review document")
+        if name in ("general", "security", "architect", "sre"):
+            raise ValueError(f"[loop.lenses] cannot select {name}: general and security always run on "
+                             "implementation reviews, and architect and sre review designs only")
         strings(patterns, f"lenses.{name}")
     memory = {}
     for stage in ("review", "test"):
@@ -202,6 +210,9 @@ def config(path=None, *, control_only=False):
 
     forbidden = (repo, common, state.resolve())
     execution = execution_policy(data["execution"], forbidden=forbidden)
+    if local and execution["isolation"] != "none":
+        raise ValueError('trust = "local" runs adapters directly; also set isolation = "none" under '
+                         "[loop.execution] to acknowledge that they are not isolated")
     review_key = b"" if data["review_key"] == "" else public_key(outside_path(data["review_key"], forbidden))
     check_keys = {name: public_key(outside_path(key, forbidden)) for name, key in data["check_keys"].items()}
     if review_key and review_key in check_keys.values():
@@ -211,7 +222,7 @@ def config(path=None, *, control_only=False):
     review_tools = []
     adapters = [data["reviewer"], *data["lens_reviewers"].values(), data["review_observer"]]
     for argv in adapters:
-        if argv:
+        if argv and not local:
             tools = command_tools(argv, execution)
             tool = tools.get(argv[0].removeprefix("/tools/"))
             if not argv[0].startswith("/tools/") or not tool or not tool.executable:
@@ -220,6 +231,8 @@ def config(path=None, *, control_only=False):
                 raise ValueError("each lens and the review observer need distinct review adapters")
             review_tools.append(tool)
     for argv in data["checks"].values():
+        if local:
+            continue
         tools = command_tools(argv, execution)
         tool = tools.get(argv[0].removeprefix("/tools/"))
         if not argv[0].startswith("/tools/") or not tool or not tool.executable:

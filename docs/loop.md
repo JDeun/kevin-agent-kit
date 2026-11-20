@@ -1,10 +1,38 @@
 # Run the review queue
 
-The live loop requires Linux, Git, Python 3.11 or later, OpenSSL 3 at
+The isolated, signed loop requires Linux, Git, Python 3.11 or later, OpenSSL 3 at
 `/usr/bin/openssl`, and Bubblewrap at `/usr/bin/bwrap`. Bubblewrap must support user, mount, PID, and network
 namespaces and the `--disable-userns` option. Startup probes this boundary
 before starting any configured commands. The built-in `demo` uses only
 embedded fixtures and can run without Bubblewrap.
+
+Run `kevin-agent-kit doctor` before writing a profile. It reports Python, Git, OpenSSL,
+whether Bubblewrap can create its namespaces (and why not), which agent CLIs are
+installed, and whether the current profile loads. It exits nonzero when something the
+profile's mode requires is missing, and prints the alternative below when isolation fails.
+
+## Real agent CLIs without brokers (local trust)
+
+Containers often cannot run Bubblewrap, and `codex` or `claude` need network and
+credentials that the isolated mode withholds. `kevin-agent-kit init --agent codex` (or
+`claude`) writes a profile with `trust = "local"` and `isolation = "none"` under
+`[loop.execution]`. Both keys are required together, and only the trusted profile can set
+them. In this mode:
+
+- the reviewer, security lens and worker run through `kevin-agent-kit agent review|worker
+  --cli codex|claude`, which calls `codex exec` or `claude -p` with read-only or edit
+  permissions, extracts the model's JSON verdict from its output and builds the exact
+  receipt the loop requires. A missing verdict, an incomplete review or a rate limit fails
+  the command with exit status 3 or 75 (retry), so it is never read as a clean review;
+- required checks run in the candidate checkout with their real exit status;
+- every command's exit code, duration and output hash are stored under `runs`, and each check
+  under `checks` with `source = "local-unsigned"`; the candidate record carries
+  `trust = "local"`.
+
+The commands run with this account's files, network and credentials and the evidence is
+unsigned, because the kit produced it itself. Treat a local-trust candidate as the work of a
+trusted operator's own agents, not as independently attested. Use a disposable host or
+container as the boundary. The default `signed` trust is unchanged.
 
 ## Profile setup
 
@@ -253,6 +281,13 @@ propose a redesign. Later jobs on the branch enter `forest-held` until a fresh
 design-only approval recorded after the escalation matches their ancestry.
 Start the redesign from the current target. A new branch can carry a new
 design and implementation, with the original branch's hold preserved.
+Protected findings (safety, honesty, security) of the held job carry over: later jobs
+on the same branch inherit them automatically, and a redesign on a new branch names the
+held job with `enqueue BRANCH SHA --inherit-from JOB_ID`. The review then requires
+independent resolution evidence for each inherited finding, so a redesign cannot drop one
+silently. Repeat detection is scoped to the lens that raised the class. Re-running
+`enqueue --kind routine` on an unclassified SHA that is still in review or `design-needed`
+corrects the classification in place and records a `reclassified` evidence row.
 Inspect phases and counters with [status](observability.md).
 
 ## Queue operation and export

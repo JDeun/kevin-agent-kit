@@ -13,9 +13,9 @@ import stat
 import tempfile
 from uuid import uuid4
 
-from .config import ROOT, profile_dir, profile_name, project, repository, state_root
+from .config import MODULE_PREFIX, ROOT, profile_dir, profile_name, project, repository, state_root
 from .paths import directory, directory_at, identity, regular_at
-from .runtime import Busy, private_dir
+from .runtime import Busy, module_command, private_dir
 
 START = b"<!-- kevin-agent-kit:rules:start -->"
 END = b"<!-- kevin-agent-kit:rules:end -->"
@@ -298,7 +298,7 @@ def global_rules(*, dry_run=False, uninstall=False, adopt=()):
     return [path for path, *_ in changes]
 
 
-def repository_profile(cwd, *, dry_run=False):
+def repository_profile(cwd, *, dry_run=False, agent=None):
     repo, common, git = repository(cwd)
     target = git.run("symbolic-ref", "--short", "refs/remotes/origin/HEAD", allowed=(0, 1, 128)).stdout.strip()
     remote = target.removeprefix("origin/")
@@ -317,6 +317,48 @@ def repository_profile(cwd, *, dry_run=False):
     ):
         if (repo / file).is_file():
             examples.append(argv)
+    if agent:
+        lines = agent_profile(repo, target, examples, agent)
+    else:
+        lines = default_profile(repo, target, examples)
+    if dry_run:
+        if os.path.lexists(destination):
+            raise FileExistsError(f"profile already exists: {destination}")
+        return destination
+    private_dir(destination.parent.parent)
+    private_dir(destination.parent)
+    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".profile-") as temp:
+        staged = Path(temp) / destination.name
+        staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        staged.chmod(0o600)
+        destination.hardlink_to(staged)
+    return destination
+
+
+def agent_profile(repo, target, examples, agent):
+    """A working profile that drives a real agent CLI directly, without Bubblewrap or signing."""
+    def adapter(role):
+        return json.dumps(module_command(ROOT, MODULE_PREFIX + "core.agents", role, "--cli", agent))
+
+    checks = [f"tests = {json.dumps(examples[0])}"] if examples else [
+        '# tests = ["python3", "-m", "pytest", "-q"]  # add the command that proves a change works']
+    return [
+        f"# Profile for the {agent} CLI. Review it before starting the loop.",
+        '# trust = "local" and isolation = "none": adapters run with this account\'s files, network and',
+        "# credentials, and evidence is unsigned (exit codes and results the kit collected itself).",
+        "# Run the loop on a disposable host or in a container you accept as the boundary.",
+        "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
+        f"target = {json.dumps(target, ensure_ascii=False)}", 'trust = "local"',
+        "design_gate = false", f"reviewer = {adapter('review')}", f"worker = {adapter('worker')}",
+        '# Narrow this to the paths a repair may touch.', 'repair_paths = ["**/*"]', "",
+        "[loop.lens_reviewers]", f"security = {adapter('review')}", "",
+        "[loop.checks]", *checks, "",
+        "[loop.execution]", 'isolation = "none"',
+        "# API-key setups can forward variables by name:", '# env = { reviewer = ["OPENAI_API_KEY"] }',
+    ]
+
+
+def default_profile(repo, target, examples):
     lines = [
         "# Review this user-owned profile before starting the loop.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
@@ -334,15 +376,4 @@ def repository_profile(cwd, *, dry_run=False):
         "# [loop.evidence.observer]", '# bundle = "incremental"', "# retention_seconds = 0",
         "", "# [loop.evidence.checks.smoke]", '# bundle = "incremental"', "# retention_seconds = 0",
     ]
-    if dry_run:
-        if os.path.lexists(destination):
-            raise FileExistsError(f"profile already exists: {destination}")
-        return destination
-    private_dir(destination.parent.parent)
-    private_dir(destination.parent)
-    with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".profile-") as temp:
-        staged = Path(temp) / destination.name
-        staged.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        staged.chmod(0o600)
-        destination.hardlink_to(staged)
-    return destination
+    return lines

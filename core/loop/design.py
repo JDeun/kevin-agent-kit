@@ -27,7 +27,15 @@ def validate_document(git, blob):
         raise ValueError("design exceeds 64 KiB")
     source = git.run("cat-file", "blob", blob).stdout
     source.encode("utf-8")
+    # Headings inside fenced code are examples, not sections.
+    source = re.sub(r"(?ms)^[ ]{0,3}(`{3,}|~{3,}).*?^[ ]{0,3}\1[`~]*[ \t]*$", "", source)
+    # Guidance placeholders left from the template do not count as content.
+    source = re.sub(r"(?s)<!--.*?-->", "", source)
     sections = re.split(r"(?m)^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", source)
+    titles = [title.casefold() for title in sections[1::2]]
+    repeated = sorted({title for title in titles if titles.count(title) > 1 and title in SECTIONS})
+    if repeated:
+        raise ValueError(f"design sections appear more than once: {', '.join(repeated)}")
     bodies = {title.casefold(): body.strip() for title, body in zip(sections[1::2], sections[2::2])}
     missing = [title for title in SECTIONS if not bodies.get(title)]
     if missing:
