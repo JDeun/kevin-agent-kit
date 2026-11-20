@@ -1,0 +1,6 @@
+{
+  "name": "@PROJECT_NAME@",
+  "description": "Coordinate implementation, review and integration with human decisions.",
+  "version": "@PROJECT_VERSION@",
+  "author": {"name": "Project contributors"}
+}
