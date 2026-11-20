@@ -24,6 +24,14 @@ class Cancelled(Exception):
     pass
 
 
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError(f"directory must be private and user-owned: {path}")
+    return path
+
+
 @contextmanager
 def lock(path):
     with path.open("a", encoding="utf-8") as stream:
@@ -73,11 +81,6 @@ class MemoryGate:
         return bool(match and int(match[1]) * 1024 >= min_available)
 
 
-_CAPACITY = re.compile(
-    r"rate.limit|too many requests|temporarily unavailable|capacity|quota|usage limit|\b429\b",
-    re.I,
-)
-
 _SUPERVISOR = """
 import os
 import signal
@@ -116,25 +119,31 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None):
             finally:
                 os.close(write_fd)
             try:
-                code = wait_for_status(read_fd, cancel, timeout)
+                code = wait_for_status(read_fd, cancel, timeout, (stdout, stderr))
             finally:
                 stop_group(child)
         finally:
             os.close(read_fd)
         stdout.seek(0)
         stderr.seek(0)
-        output = stdout.read().decode("utf-8", errors="replace")
+        if code == 75:
+            raise Retry("command reported a temporary failure")
         if code:
-            error = stderr.read().decode("utf-8", errors="replace")
-            if code == 75 or _CAPACITY.search(error + "\n" + output):
-                raise Retry(f"{argv[0]} reported a temporary capacity error")
-            raise ValueError(f"{argv[0]} exited with status {code}: {error.strip()[-500:]}")
-        return output
+            raise ValueError(f"command exited with status {code}")
+        output = stdout.read(1024 * 1024 + 1)
+        if len(output) > 1024 * 1024:
+            raise ValueError("command output exceeded 1 MiB")
+        try:
+            return output.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise ValueError("command output was not UTF-8") from None
 
 
-def wait_for_status(fd, cancel, timeout):
+def wait_for_status(fd, cancel, timeout, outputs):
     deadline = time.monotonic() + timeout
     while not cancel.is_set():
+        if any(os.fstat(stream.fileno()).st_size > 1024 * 1024 for stream in outputs):
+            raise ValueError("command output exceeded 1 MiB")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise Retry("command timed out")

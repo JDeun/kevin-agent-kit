@@ -1,0 +1,12 @@
+{
+  "name": "kevin-agent-kit",
+  "owner": {"name": "JDeun"},
+  "metadata": {"description": "Local coding-agent coordination and review tools."},
+  "plugins": [
+    {
+      "name": "kevin-agent-kit",
+      "source": "./plugin",
+      "description": "Coordinate coding-agent review and prepare local integration candidates."
+    }
+  ]
+}

@@ -1,12 +1,13 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import os
 import re
 import sqlite3
+import stat
 import time
 
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-REQUEST = re.compile(r"NEED-REVIEW ([^\s]+) ([0-9a-f]+)\Z")
 
 
 def now():
@@ -14,25 +15,55 @@ def now():
 
 
 class Store:
-    def __init__(self, state):
-        state.mkdir(parents=True, exist_ok=True)
-        self.queue = state / "requests.log"
-        self.db = sqlite3.connect(state / "queue.sqlite3")
+    def __init__(self, state, identity, target):
+        path = state / "queue.sqlite3"
+        fd = os.open(path, os.O_CREAT | os.O_NOFOLLOW | os.O_RDWR | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ValueError("queue database must be private and user-owned")
+        finally:
+            os.close(fd)
+        self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY, branch TEXT NOT NULL, sha TEXT NOT NULL,
-                phase TEXT NOT NULL DEFAULT 'review', rounds INTEGER NOT NULL DEFAULT 0,
-                attempts INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
-                detail TEXT NOT NULL DEFAULT '', report TEXT NOT NULL DEFAULT '[]',
-                UNIQUE(branch, sha)
-            );
-            CREATE TABLE IF NOT EXISTS accept_records (
-                id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, recorded_at TEXT NOT NULL,
-                branch TEXT NOT NULL, sha TEXT NOT NULL, rounds INTEGER NOT NULL,
-                findings TEXT NOT NULL, disposition TEXT, source TEXT, decided_at TEXT
-            );
-        """)
+        try:
+            self.initialize(identity, target)
+        except BaseException:
+            self.db.close()
+            raise
+
+    def initialize(self, identity, target):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            names = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "jobs" in names and "project" not in names:
+                raise ValueError("legacy queue requires a new state directory")
+            self.db.execute("CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, target TEXT NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO project VALUES (?,?)", (identity, target))
+            if [tuple(row) for row in self.db.execute("SELECT * FROM project")] != [(identity, target)]:
+                raise ValueError("queue repository or target does not match the profile")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY, branch TEXT NOT NULL, sha TEXT NOT NULL,
+                    phase TEXT NOT NULL DEFAULT 'review', attempts INTEGER NOT NULL DEFAULT 0,
+                    next_at REAL NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '',
+                    UNIQUE(branch, sha)
+                )
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS evidence (
+                    id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs,
+                    phase TEXT NOT NULL, body TEXT NOT NULL
+                )
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS accept_records (
+                    id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs,
+                    recorded_at TEXT NOT NULL, branch TEXT NOT NULL, sha TEXT NOT NULL,
+                    rounds INTEGER NOT NULL, findings TEXT NOT NULL,
+                    disposition TEXT, source TEXT, decided_at TEXT
+                )
+            """)
 
     @contextmanager
     def connect(self):
@@ -42,63 +73,37 @@ class Store:
             self.db.close()
 
     def enqueue(self, branch, sha):
-        if not SHA.fullmatch(sha) or not REQUEST.fullmatch(f"NEED-REVIEW {branch} {sha}"):
-            raise ValueError("expected branch name and full lowercase commit SHA")
-        with self.queue.open("a", encoding="utf-8") as stream:
-            stream.write(f"NEED-REVIEW {branch} {sha}\n")
-
-    def ingest(self):
-        if not self.queue.exists():
-            return 0
-        rejected = 0
-        with self.queue.open(encoding="utf-8", errors="replace") as stream, self.db:
-            for line in stream:
-                if not line.endswith("\n"):
-                    break
-                match = REQUEST.fullmatch(line.rstrip("\r\n"))
-                if not match or not SHA.fullmatch(match[2]):
-                    rejected += 1
-                    continue
-                self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha) VALUES (?,?)", match.groups())
-        return rejected
+        if not SHA.fullmatch(sha):
+            raise ValueError("expected a full lowercase commit SHA")
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha) VALUES (?,?)", (branch, sha))
 
     def ready(self):
         return self.db.execute(
-            "SELECT * FROM jobs WHERE phase IN ('review','repair','train') AND next_at <= ? ORDER BY id",
-            (time.time(),),
+            "SELECT * FROM jobs WHERE phase='review' AND next_at <= ? ORDER BY id", (time.time(),),
         ).fetchall()
 
-    def update(self, job, phase, *, detail="", attempts=0, next_at=0, rounds=None, report=None):
+    def update(self, job, phase, *, detail="", attempts=0, next_at=0, evidence=None):
         with self.db:
-            self._update(job, phase, detail, attempts, next_at, rounds, report)
+            self.db.execute("UPDATE jobs SET phase=?,detail=?,attempts=?,next_at=? WHERE id=?",
+                            (phase, detail, attempts, next_at, job["id"]))
+            if evidence is not None:
+                self.db.execute("INSERT INTO evidence (job_id,phase,body) VALUES (?,?,?)",
+                                (job["id"], phase, json.dumps(evidence)))
+            if phase == "waiting":
+                self.db.execute(
+                    "INSERT INTO accept_records (job_id,recorded_at,branch,sha,rounds,findings) VALUES (?,?,?,?,?,?)",
+                    (job["id"], now(), job["branch"], job["sha"], evidence["rounds"], json.dumps(evidence["findings"])),
+                )
 
-    def _update(self, job, phase, detail, attempts, next_at, rounds, report):
-        self.db.execute(
-            """UPDATE jobs SET phase=?, detail=?, attempts=?, next_at=?,
-               rounds=coalesce(?, rounds), report=coalesce(?, report) WHERE id=?""",
-            (phase, detail, attempts, next_at, rounds,
-             json.dumps(report, ensure_ascii=True) if report is not None else None, job["id"]),
-        )
-
-    def successor(self, job, phase, head):
+    def retry(self, job_id):
         with self.db:
-            self._update(job, phase, "", 0, 0, None, None)
-            self.db.execute(
-                """INSERT INTO jobs(branch,sha,rounds,report) VALUES (?,?,?,?)
-                   ON CONFLICT(branch,sha) DO UPDATE SET rounds=max(rounds,excluded.rounds),
-                   report=CASE WHEN jobs.report='[]' THEN excluded.report ELSE jobs.report END
-                   WHERE phase='review'""",
-                (job["branch"], head, job["rounds"], job["report"]),
+            changed = self.db.execute(
+                "UPDATE jobs SET phase='review',attempts=0,next_at=0,detail='' "
+                "WHERE id=? AND phase IN ('blocked','candidate','stale')", (job_id,),
             )
-
-    def accept_record(self, job, rounds, report):
-        with self.db:
-            self._update(job, "waiting", "human decision needed", 0, 0, rounds, report)
-            self.db.execute(
-                """INSERT INTO accept_records (job_id,recorded_at,branch,sha,rounds,findings)
-                   VALUES (?,?,?,?,?,?)""",
-                (job["id"], now(), job["branch"], job["sha"], rounds, json.dumps(report)),
-            )
+            if changed.rowcount != 1:
+                raise ValueError("retry requires a blocked, candidate or stale job")
 
     def decide(self, record, disposition, source):
         if not source.strip():
@@ -112,16 +117,48 @@ class Store:
             if not changed:
                 raise ValueError("no undecided accept record with that ID")
             changed = self.db.execute(
-                """UPDATE jobs SET phase=?,detail='',rounds=0 WHERE id=? AND phase='waiting'""",
-                ("repair" if disposition == "revise" else "deferred", changed["job_id"]),
+                "UPDATE jobs SET phase=?,detail='',attempts=0,next_at=0 WHERE id=? AND phase='waiting'",
+                ("review" if disposition == "revise" else "deferred", changed["job_id"]),
             )
             if changed.rowcount != 1:
                 raise ValueError("job is no longer awaiting a decision")
 
+    def candidate(self, job_id):
+        row = self.db.execute(
+            """SELECT e.body FROM evidence e JOIN jobs j ON j.id=e.job_id
+               WHERE j.id=? AND j.phase='candidate' AND e.phase='candidate' ORDER BY e.id DESC LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("job has no ready candidate")
+        return json.loads(row["body"])
+
+    def protected(self, job_id):
+        # A retry rebuilds from the approved source, so prior repair resolutions
+        # must be re-checked against the rebuilt candidate.
+        protected = {}
+        for row in self.db.execute(
+            "SELECT body FROM evidence WHERE job_id=? ORDER BY id", (job_id,),
+        ):
+            evidence = json.loads(row["body"])
+            for review in evidence["reviews"]:
+                lens = review["request"]["lens"]
+                for finding in review["findings"]:
+                    if finding["risk"] != "other":
+                        protected[lens, finding["id"]] = {**finding, "lens": lens}
+        return list(protected.values())
+
     def status(self):
-        rows = [dict(row) for row in self.db.execute(
-            "SELECT id,branch,sha,phase,rounds,attempts,next_at,detail FROM jobs ORDER BY id"
-        )]
+        rows = []
+        for row in self.db.execute("""
+            SELECT j.*, e.body FROM jobs j LEFT JOIN evidence e ON e.id =
+                (SELECT max(id) FROM evidence WHERE job_id=j.id) ORDER BY j.id
+        """):
+            job = dict(row)
+            body = job.pop("body")
+            if body is not None:
+                job["evidence"] = json.loads(body)
+            rows.append(job)
         counts = {}
         for row in rows:
             counts[row["phase"]] = counts.get(row["phase"], 0) + 1

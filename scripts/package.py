@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -13,24 +14,42 @@ from core.loop.config import NAME, project
 
 RUNTIME = ("core", "reviews", "guards", "verify")
 DOCUMENTS = ("reviews/persona/README.md", "verify/README.md")
-ENTRIES = ("project.toml", "LICENSE", "README.md", "AGENTS.md", "docs", "agents", "plugin")
+ENTRIES = (
+    "project.toml", "LICENSE", "README.md", "CHANGELOG.md", "AGENTS.md", "docs", "agents",
+    "plugin", "rules", ".claude-plugin",
+)
 
 
-def copy_tree(source, target, render):
-    if source.is_symlink():
-        raise ValueError(f"symlinks are outside the package inputs: {source}")
-    if source.is_dir():
-        target.mkdir(parents=True, exist_ok=True)
-        for item in sorted(source.iterdir()):
-            if item.name not in {"__pycache__", "node_modules", ".pytest_cache", ".venv"}:
-                copy_tree(item, target / render(item.name), render)
-        return
+def copy_file(source, target, render):
+    if source.resolve() != source or not source.is_file():
+        raise ValueError(f"package input must be a regular file without symlinks: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
     if source.suffix in (".md", ".json"):
         content = source.read_text(encoding="utf-8")
         target.write_text(render(content), encoding="utf-8")
     else:
         shutil.copy2(source, target)
+
+
+def tracked_inputs():
+    checkout = subprocess.check_output(
+        ["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"], text=True,
+    ).rstrip("\n")
+    if Path(checkout).resolve() != ROOT:
+        raise ValueError("build from a Git checkout of the kit")
+    records = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "--stage", "-z"])
+    for record in records.split(b"\0"):
+        if not record:
+            continue
+        fields, path = record.split(b"\t", 1)
+        mode, _, stage = fields.split()
+        relative = Path(os.fsdecode(path))
+        entry = relative.parts[0]
+        if entry not in (*RUNTIME, *ENTRIES):
+            continue
+        if mode not in {b"100644", b"100755"} or stage != b"0":
+            raise ValueError(f"package input must be a tracked regular file: {relative}")
+        yield relative, entry in RUNTIME
 
 
 def build(destination):
@@ -40,7 +59,7 @@ def build(destination):
     # Render the upstream brand in source docs and plugin templates, keeping its URL.
     manifest = json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
     upstream = Path(manifest["repository"]).name.removesuffix(".git")
-    names = {upstream: name, manifest["name"]: module}
+    names = {upstream: name, manifest["name"]: name}
     alternatives = "|".join(re.escape(value) for value in names)
     brand = re.compile(rf"(?<![\w-])(?:{alternatives})(?![\w-]|\.git)")
 
@@ -60,11 +79,12 @@ def build(destination):
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".build-") as temp:
         stage = Path(temp) / "product"
         stage.mkdir()
-        for entry in (*ENTRIES, *DOCUMENTS):
-            copy_tree(ROOT / entry, stage / entry, render)
         package = stage / module
-        for entry in RUNTIME:
-            copy_tree(ROOT / entry, package / entry, render)
+        for path, runtime in tracked_inputs():
+            prefix = package if runtime else stage
+            copy_file(ROOT / path, prefix.joinpath(*(render(part) for part in path.parts)), render)
+            if path.as_posix() in DOCUMENTS:
+                copy_file(ROOT / path, stage / path, render)
         (package / "__init__.py").touch()
         (package / "__main__.py").write_text(
             "from .core.loop.__main__ import main\n\nraise SystemExit(main())\n", encoding="utf-8")
@@ -140,7 +160,7 @@ def main():
             print(install(args.prefix.resolve()))
         else:
             print(rename(args.name))
-    except (OSError, ValueError, KeyError) as error:
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"{error}\n")
 
 

@@ -295,3 +295,76 @@ def test_readback_failure_identifies_the_created_comment(fake_api, body_file):
     assert "read-back" in result.stderr
     assert "issues/comments/13" in result.stderr
     assert not result.stdout
+
+
+@pytest.mark.parametrize("conclusion, missing, moved", [
+    ("success", False, False), ("neutral", False, False), ("skipped", False, False),
+    ("success", True, False), ("success", False, True),
+])
+def test_github_pipeline_gate_requires_fresh_exact_named_checks(fake_api, conclusion, missing, moved):
+    head, base = "a" * 40, "b" * 40
+    pull_path = "repos/demo/widgets/pulls/7"
+    target_path = "repos/demo/widgets/git/ref/heads/main"
+    suite_path = "repos/demo/widgets/check-suites/12"
+    pull = {"head": {"sha": head}, "base": {"ref": "main", "sha": base, "repo": {"full_name": "demo/widgets"}}}
+    app = {"slug": "github-actions"}
+    suite = dict(id=12, head_sha=head, status="completed", conclusion="success", app=app)
+    check = dict(id=34, name="unit", head_sha=head, status="completed", conclusion=conclusion,
+                 app=app, check_suite={"id": 12})
+    requests = [
+        request("github", "GET", pull_path, pull),
+        request("github", "GET", target_path, {"object": {"sha": base}}),
+        request("github", "GET", suite_path, suite),
+        request("github", "GET", suite_path + "/check-runs?filter=latest", [{"check_runs": [] if missing else [check]}],
+                options=["--paginate", "--slurp"]),
+    ]
+    if conclusion == "success" and not missing:
+        updated = {**pull, "head": {"sha": "c" * 40}} if moved else pull
+        requests.append(request("github", "GET", pull_path, updated))
+        if not moved:
+            requests.append(request("github", "GET", target_path, {"object": {"sha": base}}))
+    result = fake_api(
+        *arguments("github"), "pipeline-gate", "--number", 7, "--sha", head, "--target", "main",
+        "--base-sha", base, "--run-id", 12, "--source", "github-actions", "--require", "unit",
+        requests=requests,
+    )
+    if conclusion == "success" and not missing and not moved:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["checks"] == {"unit": 34}
+    else:
+        assert result.returncode == 1
+        assert not result.stdout
+
+
+@pytest.mark.parametrize("pipeline_sha", ["a" * 40, "c" * 40])
+def test_gitlab_pipeline_gate_cross_checks_provider_run_sha(fake_api, pipeline_sha):
+    head, base = "a" * 40, "b" * 40
+    root = "projects/demo%2Fteam%2Fwidgets"
+    change = {
+        "sha": head, "target_branch": "main", "target_project_id": 5,
+        "head_pipeline": {"id": 12, "sha": pipeline_sha, "project_id": 5},
+    }
+    before = [
+        request("gitlab", "GET", root + "/merge_requests/7", change),
+        request("gitlab", "GET", root + "/repository/branches/main", {"commit": {"id": base}}),
+    ]
+    requests = [
+        *before,
+        request("gitlab", "GET", root + "/pipelines/12",
+                dict(id=12, sha=head, source="merge_request_event", status="success")),
+        request("gitlab", "GET", root + "/pipelines/12/jobs?per_page=100&page=1&include_retried=false", [
+            dict(id=10, name="unit", status="success", commit={"id": head}, pipeline={"id": 12}),
+        ]),
+        *before,
+    ] if pipeline_sha == head else before[:1]
+    result = fake_api(
+        *arguments("gitlab"), "pipeline-gate", "--number", 7, "--sha", head, "--target", "main",
+        "--base-sha", base, "--run-id", 12, "--source", "merge_request_event", "--require", "unit",
+        requests=requests,
+    )
+    if pipeline_sha == head:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["checks"] == {"unit": 10}
+    else:
+        assert result.returncode == 1
+        assert not result.stdout

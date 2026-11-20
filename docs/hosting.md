@@ -30,3 +30,23 @@ python3 -m core.adapters gitlab --repo team/tools/widgets pipeline-status --numb
 ```
 
 The result includes the change `number`, commit `sha`, and `status`. GitHub combines the head commit's reported check runs and commit statuses into `failed`, `pending`, `unknown`, or `success`, in that order of precedence. A commit with no checks or statuses reports `unknown`. The result covers the checks visible to the CLI account on that repository and commit. GitLab returns the merge request's head pipeline status and `pipeline_id`, or `unknown` with a null `pipeline_id` when the merge request has no head pipeline. A successful status lookup exits zero even when the checks or pipeline failed. [GitHub check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference) · [GitHub combined status](https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-specific-reference) · [GitLab merge requests](https://docs.gitlab.com/api/merge_requests/#get-single-merge-request)
+
+## Gate the exact published result
+
+Use `pipeline-gate` for an approval decision. Obtain the exact source SHA
+and the current target SHA independently. Provide the approved source and
+run ID, and repeat `--require` for each named mandatory check.
+
+```sh
+kevin-agent-kit hosting github --repo team/widgets pipeline-gate --number 42 \
+  --sha "$candidate_sha" --target main --base-sha "$base_sha" \
+  --run-id "$suite_id" --source github-actions --require unit --require integration
+```
+
+GitHub expects a check suite ID and app slug. GitLab expects the head
+pipeline ID and pipeline source, such as `merge_request_event`. The gate
+requires one successful result per required name and re-reads the change
+and target afterward. Missing, ambiguous, neutral, and skipped checks fail
+the gate. Configure the named checks and source using your trusted hosting
+policy. [GitHub check runs](https://docs.github.com/en/rest/checks/runs) ·
+[GitLab pipelines](https://docs.gitlab.com/api/pipelines/) · [GitLab jobs](https://docs.gitlab.com/api/jobs/)

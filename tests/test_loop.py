@@ -1,29 +1,40 @@
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
-
-from core.loop.__main__ import demo
-from core.loop.runtime import MemoryGate
-from core.loop.review import findings, lenses
+from threading import Event
+import time
 
 import pytest
 
+from core.loop.__main__ import demo
+from core.loop.config import config, repo_id
+from core.loop.daemon import ensure_state
+from core.loop.engine import Engine, export_candidate
+from core.loop.git import Git
+from core.loop.review import lenses
+from core.loop.runtime import MemoryGate, run
+from core.loop.setup import repository_profile
+from core.loop.store import Store
 
-def test_demo_repairs_and_merges(tmp_path):
+
+def test_demo_prepares_exact_candidate_after_repair(tmp_path):
     report = demo(tmp_path)
-    assert report["counts"] == {"merged": 1, "superseded": 1}
+    assert report["counts"] == {"candidate": 1}
     assert report["result"] == "correct"
-    assert report["reviewed"] != report["initial"]
+    evidence = report["jobs"][0]["evidence"]
+    assert evidence["head"] == report["initial"]
+    assert evidence["candidate"] == report["candidate"]
+    assert len(evidence["reviews"]) == 4
+    assert all(check["request"]["candidate"] == report["candidate"] for check in evidence["checks"])
 
 
-def test_lenses_and_malformed_response():
+def test_lenses_always_include_independent_security_review():
     assert lenses(["store/migrations/1.sql", "auth/session.py"],
                   {"db": ["**/*.sql"], "security": ["auth/**"]}) == (
-                      "general", "db", "security")
-    with pytest.raises(ValueError):
-        findings('{"findings":[{"risk":"unrecognized","detail":"x"}]}')
-    with pytest.raises(ValueError):
-        findings('{"findings":[],"count":1}')
+                      "general", "security", "db")
+    assert lenses([], {}) == ("general", "security")
 
 
 def test_cgroup_and_fallback(tmp_path):
@@ -42,218 +53,252 @@ def test_cgroup_and_fallback(tmp_path):
     assert not gate.allows(max_anon=1, min_available=2049)
 
 
-def wait_for(engine, predicate):
-    import time
-
-    end = time.monotonic() + 8
-    while time.monotonic() < end:
-        engine.tick()
-        status = engine.store.status()
-        if predicate(status):
-            return status
-        time.sleep(0.02)
-    pytest.fail(f"coordinator did not reach expected phase: {status}")
-
-
 @pytest.fixture
-def queue(tmp_path):
-    from core.loop.config import config
-    from core.loop.git import Git
-
+def queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     repo = tmp_path / "repository"
     repo.mkdir()
-    state = tmp_path / "state"
-    git = Git(repo, state)
-    git.run("init", "--quiet", "--initial-branch=main")
-    git.run("config", "user.name", "Fixture")
-    git.run("config", "user.email", "")
-    git.run("config", "commit.gpgsign", "false")
+    git = Git(repo)
+    git.run("init", "--quiet", "--template=", "--initial-branch=main")
     git.run("commit", "--quiet", "--allow-empty", "-m", "base")
     git.run("switch", "-c", "feature")
-    git.run("commit", "--quiet", "--allow-empty", "-m", "feature")
-    git.run("switch", "--detach", "main")
-    cfg = config()
-    cfg.update(repo=repo, state=state, poll_seconds=0.05, timeout_seconds=5,
-               max_rounds=1, retry_initial_seconds=0.05)
+    (repo / "file.txt").write_text("feature\n")
+    git.run("add", "file.txt")
+    git.run("commit", "--quiet", "-m", "feature")
+    git.run("switch", "main")
+    profile = repository_profile(repo)
+    cfg = config(profile)
+    ensure_state(cfg["state"])
+    cfg.update(profile=None, reviewer=["review-fixture"], worker=["worker-fixture"],
+               checks={"required": ["verify-fixture"]}, attestors={"required": ["attest-fixture"]},
+               max_rounds=2, repair_paths=["file.txt"],
+               retry_initial_seconds=0.05, retry_limit=2)
     return git, cfg
 
 
-def python_command(code):
-    return [sys.executable, "-c", code]
+def engine_run(cfg, branch, sha, runner, *, retry=False):
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store, Engine(cfg, store, runner=runner) as engine:
+        if retry:
+            store.retry(1)
+        else:
+            store.enqueue(branch, sha)
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            engine.tick()
+            status = store.status()
+            if status["jobs"] and status["jobs"][0]["phase"] != "review":
+                return status
+            time.sleep(0.02)
+        pytest.fail(f"coordinator did not reach terminal phase: {status}")
 
 
-def test_accept_record_only_after_protected_findings_close(queue):
-    from core.loop.engine import Engine
-    from core.loop.store import Store
+def review_response(stdin, findings=(), resolved=None):
+    request = json.loads(stdin.splitlines()[-1])["request"]
+    return json.dumps(dict(request=request, status="complete", tool_version="fixture",
+                           reviewed_paths=request["paths"], diagnostics=[], findings=list(findings),
+                           resolved=resolved or {}))
 
+
+def passed(stdin):
+    data = json.loads(stdin)
+    assert data["observation"] == {"exit_status": 0, "stdout": "fixture check actually ran"}
+    return json.dumps(dict(request=data["request"], status="passed", executed=True, tool_version="fixture"))
+
+
+def clean_run(argv, cwd, cancel, timeout, *, role, stdin, **_):
+    if role == "reviewer":
+        return review_response(stdin)
+    if role == "verify":
+        assert stdin is None
+        return "fixture check actually ran"
+    assert cwd is None
+    return passed(stdin)
+
+
+def test_queue_never_updates_shared_branches_and_bundle_needs_explicit_export(queue, tmp_path):
     git, cfg = queue
-    script = """
-import json
-import pathlib
-import sys
-repaired = pathlib.Path("repair").exists()
-risk = "other" if repaired else "security"
-if repaired:
-    assert "Repair this." in sys.stdin.read()
-print(json.dumps({"findings":[{"risk": risk, "detail": "Repair this."}]}))
-"""
-    cfg["reviewer"] = python_command(script)
-    script = """
-import pathlib
-import subprocess
-pathlib.Path("repair").touch()
-subprocess.run(["git", "add", "repair"], check=True)
-subprocess.run(["git", "commit", "-qm", "repair"], check=True)
-"""
-    cfg["worker"] = python_command(script)
-    starting_base = git.head("main")
-    starting_head = git.head("feature")
-    with Store(cfg["state"]).connect() as store, Engine(cfg, store) as engine:
-        store.enqueue("feature", starting_head)
-        status = wait_for(engine, lambda x: x["counts"].get("waiting"))
-        assert status["counts"] == {"superseded": 1, "waiting": 1}
-        record, = status["accept_records"]
-        assert record["rounds"] == 2
-        assert record["sha"] == git.head("feature") != starting_head
-        assert record["findings"][0]["risk"] == "other"
-        store.decide(record["id"], "defer", "Release owner")
-        assert store.status()["counts"]["deferred"] == 1
-        assert store.status()["accept_records"][0]["source"] == "Release owner"
-        assert git.head("main") == starting_base
-
-
-@pytest.mark.parametrize("moving_branch", ["main", "feature"])
-def test_train_checks_fresh_exact_candidate(queue, tmp_path, moving_branch):
-    from core.loop.engine import Engine
-    from core.loop.store import Store
-
-    git, cfg = queue
-    marker = tmp_path / "attempts"
-    cfg["reviewer"] = python_command('print(\'{"findings": []}\')')
-    cfg["verify"] = python_command(f"""
-import os
-from pathlib import Path
-import subprocess
-def git(*args):
-    return subprocess.check_output(["git", *args], text=True).strip()
-candidate = os.environ["AGENT_CANDIDATE"]
-assert git("rev-parse", "HEAD") == candidate
-marker = Path({str(marker)!r})
-if not marker.exists():
-    ref = {("refs/heads/" + moving_branch)!r}
-    parent = git("rev-parse", ref)
-    updated = git("commit-tree", parent + "^{{tree}}", "-p", parent, "-m", "advance")
-    git("update-ref", ref, updated, parent)
-with marker.open("a") as stream:
-    print(candidate, file=stream)
-""")
-    initial = git.head("feature")
-    with Store(cfg["state"]).connect() as store, Engine(cfg, store) as engine:
-        store.enqueue("feature", initial)
-        status = wait_for(engine, lambda x: x["counts"].get("merged"))
-    discarded, integrated = marker.read_text().splitlines()
-    assert discarded != integrated == git.head("main")
-    if moving_branch == "feature":
-        assert status["counts"] == {"merged": 1, "stale": 1}
-        assert next(job for job in status["jobs"] if job["phase"] == "merged")["sha"] != initial
-    else:
-        assert status["counts"] == {"merged": 1}
-
-
-def test_capacity_retry_uses_same_job(queue, tmp_path):
-    from core.loop.engine import Engine
-    from core.loop.store import Store
-
-    _, cfg = queue
-    marker = tmp_path / "reviewed"
-    cfg["reviewer"] = python_command(f"""
-from pathlib import Path
-import sys
-marker = Path({str(marker)!r})
-if not marker.exists():
-    marker.touch()
-    print("rate limit", file=sys.stderr)
-    raise SystemExit(75)
-print('{{"findings":[]}}')
-""")
-    cfg["verify"] = python_command("pass")
-    with Store(cfg["state"]).connect() as store, Engine(cfg, store) as engine:
-        sha = engine.git.head("feature")
-        store.enqueue("feature", sha)
-        store.enqueue("feature", sha)
-        status = wait_for(engine, lambda x: any(job["attempts"] for job in x["jobs"]))
-        assert status["jobs"][0]["attempts"] == 1
-        assert wait_for(engine, lambda x: x["counts"].get("merged"))["counts"] == {"merged": 1}
-
-
-def test_detached_daemon_starts_and_stops(tmp_path):
-    import tempfile
-    import time
-    from pathlib import Path
-
-    with tempfile.TemporaryDirectory(prefix="kit-daemon-") as directory:
-        path = Path(directory)
-        config_path = path / "config.toml"
-        config_path.write_text('[loop]\nstate = "state"\npoll_seconds = 1\n')
-        command = [sys.executable, "-m", "core.loop", "--config", str(config_path)]
-        subprocess.run([*command, "start"], check=True, timeout=8)
-        try:
-            report = json.loads(subprocess.check_output([*command, "status"], timeout=5))
-            assert report["running"] is True
-        finally:
-            subprocess.run([*command, "stop"], check=True, timeout=5)
-        for _ in range(50):
-            report = json.loads(subprocess.check_output([*command, "status"], timeout=5))
-            if not report["running"]:
-                break
-            time.sleep(0.05)
-        assert report["running"] is False
-
-
-def test_reviewer_cannot_leave_checkout_at_another_commit(queue):
-    from core.loop.engine import Engine
-    from core.loop.store import Store
-
-    git, cfg = queue
-    cfg["reviewer"] = python_command("""
-import subprocess
-subprocess.run(["git", "switch", "--detach", "main"], check=True)
-print('{"findings":[]}')
-""")
-    base = git.head("main")
-    cfg["verify"] = python_command("pass")
-    with Store(cfg["state"]).connect() as store, Engine(cfg, store) as engine:
-        store.enqueue("feature", git.head("feature"))
-        status = wait_for(engine, lambda x: x["counts"].get("blocked") or x["counts"].get("merged"))
-    assert status["counts"] == {"blocked": 1}
-    assert "reviewer moved" in status["jobs"][0]["detail"]
+    source, base = git.head("feature"), git.head("main")
+    result = engine_run(cfg, "feature", source, clean_run)
+    assert result["counts"] == {"candidate": 1}
+    evidence = result["jobs"][0]["evidence"]
+    bundle = tmp_path / "approved.bundle"
+    export_candidate(cfg, evidence, bundle)
+    result = git.run("bundle", "unbundle", str(bundle)).stdout.strip()
+    assert result == f"{evidence['candidate']} refs/heads/kevin-candidate"
     assert git.head("main") == base
+    assert git.head("feature") == source
+    assert git.run("symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    with pytest.raises(FileExistsError):
+        export_candidate(cfg, evidence, bundle)
 
 
-def test_symbolic_target_does_not_move_another_branch(queue):
-    from core.loop.engine import Engine
-    from core.loop.store import Store
-
+@pytest.mark.parametrize("moved", ["main", "feature", "policy", "expired"])
+def test_candidate_export_invalidated_by_changed_authority(queue, tmp_path, moved):
     git, cfg = queue
-    cfg["target"] = "alias"
-    cfg["reviewer"] = python_command('print(\'{"findings": []}\')')
-    cfg["verify"] = python_command("pass")
-    git.run("symbolic-ref", "refs/heads/alias", "refs/heads/main")
-    git.run("switch", "main")
-    before = git.head("main")
-    with Store(cfg["state"]).connect() as store, Engine(cfg, store) as engine:
-        store.enqueue("feature", git.head("feature"))
-        status = wait_for(engine, lambda x: x["counts"].get("blocked") or x["counts"].get("merged"))
+    source = git.head("feature")
+    result = engine_run(cfg, "feature", source, clean_run)
+    evidence = result["jobs"][0]["evidence"]
+    if moved in {"main", "feature"}:
+        git.run("switch", moved)
+        git.run("commit", "--quiet", "--allow-empty", "-m", "advance")
+    elif moved == "policy":
+        cfg["policy_id"] = "changed"
+    else:
+        evidence["expires_at"] = 0
+    output = tmp_path / "stale.bundle"
+    with pytest.raises(ValueError, match="changed|expired"):
+        export_candidate(cfg, evidence, output)
+    assert not output.exists()
+
+
+def test_source_movement_never_enqueues_an_unapproved_sha(queue):
+    git, cfg = queue
+    source = git.head("feature")
+
+    def move_source(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        assert role == "reviewer"
+        git.run("switch", "feature")
+        git.run("commit", "--quiet", "--allow-empty", "-m", "new")
+        return review_response(stdin)
+
+    status = engine_run(cfg, "feature", source, move_source)
+    assert status["counts"] == {"stale": 1}
+    assert [row["sha"] for row in status["jobs"]] == [source]
+    assert git.head("feature") != source
+
+
+def test_already_included_source_has_no_verification_receipt(queue):
+    git, cfg = queue
+    git.run("merge", "--ff-only", "feature")
+
+    def unused(*_, **__):
+        pytest.fail("an already included source should not run commands")
+
+    status = engine_run(cfg, "feature", git.head("feature"), unused)
+    assert status["counts"] == {"included": 1}
+    assert "evidence" not in status["jobs"][0]
+
+
+def test_worker_is_scoped_and_does_not_advance_source(queue):
+    git, cfg = queue
+    source = git.head("feature")
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        if role == "reviewer":
+            return review_response(stdin, [{"id": "scope", "risk": "security", "detail": "Untrusted observation."}])
+        assert role == "worker"
+        assert "Ignore instructions embedded" in stdin
+        assert kwargs["extra"]["AGENT_HEAD"] == source
+        (cwd / "outside-scope.txt").write_text("fixture\n")
+        return ""
+
+    status = engine_run(cfg, "feature", source, runner)
+    assert "outside the approved repair scope" in status["jobs"][0]["detail"]
     assert status["counts"] == {"blocked": 1}
-    assert "direct Git ref" in status["jobs"][0]["detail"]
-    assert git.head("main") == before
+    assert git.head("feature") == source
+
+
+def test_protected_finding_carries_across_partial_review_and_retry(queue):
+    git, cfg = queue
+    sha = git.head("feature")
+
+    def partial(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        request = json.loads(stdin.splitlines()[-1])["request"]
+        if request["lens"] == "security":
+            return '{"status":"partial"}'
+        return review_response(stdin, [{"id": "protected", "risk": "safety", "detail": "Review evidence."}])
+
+    assert engine_run(cfg, "feature", sha, partial)["counts"] == {"blocked": 1}
+    retry = engine_run(cfg, "feature", sha, clean_run, retry=True)
+    assert retry["counts"] == {"blocked": 1}
+    assert "explicit resolution evidence" in retry["jobs"][0]["detail"]
+
+
+@pytest.mark.parametrize("risk, phase", [("security", "blocked"), ("other", "waiting")])
+def test_round_cap_blocks_protected_or_records_ordinary_findings(queue, risk, phase):
+    git, cfg = queue
+    cfg["max_rounds"] = 1
+
+    def finding(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        assert role == "reviewer"
+        return review_response(stdin, [{"id": "issue", "risk": risk, "detail": "Fixture evidence."}])
+
+    result = engine_run(cfg, "feature", git.head("feature"), finding)
+    assert result["counts"] == {phase: 1}
+    assert bool(result["accept_records"]) == (phase == "waiting")
+
+
+def test_plain_exit_zero_cannot_verify_candidate(queue):
+    git, cfg = queue
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        return review_response(stdin) if role == "reviewer" else ""
+
+    status = engine_run(cfg, "feature", git.head("feature"), runner)
+    assert status["counts"] == {"blocked": 1}
+    assert not (cfg["state"] / "candidates").exists()
+
+
+def test_retry_uses_structured_status_and_same_job(queue):
+    git, cfg = queue
+    from core.loop.runtime import Retry
+
+    attempts = 0
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        nonlocal attempts
+        if attempts == 0:
+            attempts += 1
+            raise Retry("fixture capacity")
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+
+    result = engine_run(cfg, "feature", git.head("feature"), runner)
+    assert result["counts"] == {"candidate": 1}
+    with pytest.raises(ValueError, match="status 1"):
+        run([sys.executable, "-c", "import sys; sys.exit('quota 429')"], Path.cwd(), Event(), 3)
+
+
+def test_daemon_private_socket_acknowledges_readiness_and_stop(queue):
+    _, cfg = queue
+    from core.loop.daemon import contact, running, stop
+
+    profile = next(Path(os.environ["XDG_CONFIG_HOME"]).rglob("*.toml"))
+    command = [
+        sys.executable, "-c",
+        "from pathlib import Path; import sys; from core.loop.config import config;"
+        "from core.loop.daemon import serve; serve(config(Path(sys.argv[1])))",
+        str(profile),
+    ]
+    child = subprocess.Popen(command, start_new_session=True)
+    try:
+        for _ in range(100):
+            try:
+                assert contact(cfg["state"], b"ping") == config(profile)["policy_id"]
+                break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            pytest.fail("daemon did not acknowledge readiness")
+        assert running(cfg["state"])
+        stop(cfg["state"])
+        assert child.wait(timeout=6) == 0
+        assert not running(cfg["state"])
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=8)
+
+
+def test_private_queue_rejects_different_repository_identity(queue):
+    _, cfg = queue
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect():
+        pass
+    with pytest.raises(ValueError, match="repository or target"):
+        Store(cfg["state"], "other-repo", cfg["target"])
 
 
 def test_command_cleans_up_only_its_process_group(tmp_path):
-    from threading import Event
-
-    from core.loop.runtime import run
-
     server = """
 from pathlib import Path
 import signal
@@ -274,11 +319,33 @@ subprocess.Popen([sys.executable, "-c", {server!r}])
 while not Path("ready").exists():
     time.sleep(0.01)
 """
-    outsider = subprocess.Popen(python_command("import time; time.sleep(30)"), start_new_session=True)
+    outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
     try:
-        assert run(python_command(parent), tmp_path, Event(), 5) == ""
+        assert run([sys.executable, "-c", parent], tmp_path, Event(), 5) == ""
         assert (tmp_path / "stopped").exists()
         assert outsider.poll() is None
     finally:
         outsider.terminate()
         outsider.wait(timeout=5)
+
+
+def test_repaired_candidate_is_materialized_without_worker_scratch(queue):
+    git, cfg = queue
+    git.run("switch", "feature")
+    (git.repo / ".gitignore").write_text("scratch.txt\n")
+    git.run("add", ".gitignore")
+    git.run("commit", "--quiet", "-m", "ignore scratch")
+    sha = git.head("feature")
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        if role == "worker":
+            (cwd / "file.txt").write_text("fixed\n")
+            (cwd / "scratch.txt").write_text("local worker scratch\n")
+            return ""
+        if cwd is not None:
+            assert not (cwd / "scratch.txt").exists()
+        if role == "reviewer" and (cwd / "file.txt").read_text() != "fixed\n":
+            return review_response(stdin, [{"id": "fix-text", "risk": "other", "detail": "Fix the text."}])
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+
+    assert engine_run(cfg, "feature", sha, runner)["counts"] == {"candidate": 1}

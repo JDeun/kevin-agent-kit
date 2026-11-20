@@ -172,3 +172,28 @@ def test_migration_guard_uses_updated_target_even_for_same_named_addition(tmp_pa
 
     assert result.returncode == 1
     assert "013_next.sql" in result.stderr and "target maximum 13" in result.stderr
+
+
+def test_immutable_migrations_reject_edits_and_deletions(tmp_path):
+    repo = tmp_path
+    git(repo, "init", "-q")
+    git(repo, "config", "user.name", "Example Tester")
+    git(repo, "config", "user.email", "tester@example.org")
+    directory = repo / "migrations"
+    directory.mkdir()
+    edited = directory / "001_existing.sql"
+    removed = directory / "002_existing.sql"
+    edited.write_text("-- original\n")
+    removed.touch()
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "target")
+    target = git(repo, "rev-parse", "HEAD")
+    edited.write_text("-- changed\n")
+    removed.unlink()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "modify")
+    args = ("ordinal", "check-migrations", "--repo", repo, "--target", target)
+    assert ledgers(*args).returncode == 0
+    result = ledgers(*args, "--immutable")
+    assert result.returncode == 1
+    assert edited.name in result.stderr and removed.name in result.stderr

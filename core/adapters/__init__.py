@@ -1,6 +1,7 @@
 """File-based GitHub and GitLab change request operations."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import subprocess
@@ -86,6 +87,7 @@ class HostingAdapter:
         ):
             raise AdapterError("repository must be an owner and repository path")
         self.provider = provider
+        self.repo = repo
         self.cli = "gh" if github else "glab"
         self.host = ("github.com" if github else "gitlab.com") if host is None else host
         if not _HOSTNAME.fullmatch(self.host):
@@ -195,6 +197,120 @@ class HostingAdapter:
             raise AdapterError("expected a commit SHA for the pull request head")
         return {"number": number, "sha": sha, "status": self._github_status(sha)}
 
+    def pipeline_gate(self, number, *, sha, target, base_sha, run_id, source, require):
+        """Require named, successful checks from an exact provider run."""
+        _positive_id(run_id, "run ID")
+        if not (_SHA.fullmatch(sha) and _SHA.fullmatch(base_sha)) or not target:
+            raise AdapterError("gate requires exact head and base SHAs and a target branch")
+        if not source or not require or len(require) != len(set(require)) or not all(item.strip() for item in require):
+            raise AdapterError("gate requires a source and distinct mandatory check names")
+        path = f"{self.changes}/{_positive_id(number, 'number')}"
+
+        def check_change():
+            change = _object(self._api("GET", path), path)
+            if self.provider == "github":
+                head = _object(change.get("head"), "pull request head")
+                base = _object(change.get("base"), "pull request base")
+                repo = _object(base.get("repo"), "pull request target repository")
+                if (head.get("sha"), base.get("ref"), base.get("sha"), repo.get("full_name", "")) != (
+                    sha, target, base_sha, self.repo,
+                ):
+                    raise AdapterError("pull request head, target or base changed")
+                ref = f"{self.api_root}/git/ref/heads/{quote(target, safe='/')}"
+                branch = _object(self._api("GET", ref), "target branch")
+                if _object(branch.get("object"), "target commit").get("sha") != base_sha:
+                    raise AdapterError("target base changed")
+            else:
+                pipeline = _object(change.get("head_pipeline"), "merge request head pipeline")
+                if ((change.get("sha"), change.get("target_branch")) != (sha, target)
+                        or (pipeline.get("id"), pipeline.get("sha"), pipeline.get("project_id"))
+                        != (run_id, sha, change.get("target_project_id"))
+                        or type(change.get("target_project_id")) is not int):
+                    raise AdapterError("merge request head, target or pipeline changed")
+                ref = f"{self.api_root}/repository/branches/{quote(target, safe='')}"
+                branch = _object(self._api("GET", ref), "target branch")
+                if _object(branch.get("commit"), "target commit").get("id") != base_sha:
+                    raise AdapterError("target base changed")
+
+        check_change()
+        if self.provider == "github":
+            checks = self._github_gate(sha, source, run_id, require)
+        else:
+            checks = self._gitlab_gate(sha, source, run_id, require)
+        check_change()
+        return {
+            "status": "passed", "provider": self.provider, "host": self.host, "repo": self.repo,
+            "number": number, "sha": sha, "target": target, "base_sha": base_sha,
+            "source": source, "run_id": run_id, "checks": checks,
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _github_gate(self, sha, source, run_id, required):
+        path = f"{self.api_root}/check-suites/{run_id}"
+        suite = _object(self._api("GET", path), "check suite")
+        if (suite.get("id"), suite.get("head_sha"), suite.get("status"), suite.get("conclusion"),
+                _object(suite.get("app"), "check suite app").get("slug")) != (
+                run_id, sha, "completed", "success", source,
+        ):
+            raise AdapterError("check suite did not pass for the exact head and app")
+        pages = self._api("GET", f"{path}/check-runs?filter=latest", options=("--paginate", "--slurp"))
+        if not isinstance(pages, list):
+            raise AdapterError("invalid check run pages")
+        records = []
+        for page in pages:
+            runs = _object(page, "check run page").get("check_runs")
+            if not isinstance(runs, list):
+                raise AdapterError("invalid check run listing")
+            records.extend(runs)
+
+        def passed(check):
+            return (check.get("head_sha") == sha and check.get("status") == "completed"
+                    and check.get("conclusion") == "success"
+                    and _object(check.get("app"), "check app").get("slug") == source
+                    and _object(check.get("check_suite"), "check suite").get("id") == run_id)
+
+        return self._required_checks(records, required, passed)
+
+    def _gitlab_gate(self, sha, source, run_id, required):
+        path = f"{self.api_root}/pipelines/{run_id}"
+        pipeline = _object(self._api("GET", path), "pipeline")
+        if (pipeline.get("id"), pipeline.get("sha"), pipeline.get("source"), pipeline.get("status")) != (
+            run_id, sha, source, "success",
+        ):
+            raise AdapterError("pipeline did not pass for the exact head and source")
+        records = []
+        for page in range(1, 101):
+            jobs = self._api("GET", f"{path}/jobs?per_page=100&page={page}&include_retried=false")
+            if not isinstance(jobs, list):
+                raise AdapterError("invalid pipeline job listing")
+            records.extend(jobs)
+            if len(jobs) < 100:
+                break
+        else:
+            raise AdapterError("pipeline job pagination limit exceeded")
+
+        def passed(job):
+            return (job.get("status") == "success"
+                    and _object(job.get("commit"), "job commit").get("id") == sha
+                    and _object(job.get("pipeline"), "job pipeline").get("id") == run_id)
+
+        return self._required_checks(records, required, passed)
+
+    @staticmethod
+    def _required_checks(records, required, passed):
+        matches = {name: [] for name in required}
+        for value in records:
+            check = _object(value, "CI check")
+            name = check.get("name")
+            if isinstance(name, str) and name in matches:
+                matches[name].append(check)
+        result = {}
+        for name, values in matches.items():
+            if len(values) != 1 or not passed(values[0]):
+                raise AdapterError(f"required check did not pass unambiguously: {name}")
+            result[name] = _positive_id(values[0].get("id"), "check ID")
+        return result
+
     def _github_status(self, sha: str) -> str:
         commit = f"{self.api_root}/commits/{sha}"
         combined = _object(self._api("GET", f"{commit}/status"), "combined commit status")
@@ -222,7 +338,7 @@ class HostingAdapter:
             for value in runs:
                 run = _object(value, "check run")
                 state, conclusion = run.get("status"), run.get("conclusion")
-                if state == "completed" and conclusion in ("success", "neutral", "skipped"):
+                if state == "completed" and conclusion == "success":
                     statuses.add("success")
                 elif state == "completed" and conclusion in (
                     "failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure",

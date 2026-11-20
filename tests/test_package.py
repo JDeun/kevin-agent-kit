@@ -18,6 +18,10 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     source = tmp_path / "source"
     shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(
         ".git", "dist", "__pycache__", ".pytest_cache", ".agent-queue"))
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "add", "--", "."], cwd=source, check=True)
+    (source / "plugin/not-for-release.txt").write_text("private fixture")
+    (source / "core/not-for-release.py").write_text("private fixture")
     before = (source / "project.toml").read_bytes()
     assert invoke(source, "rename", "../escape", check=False).returncode == 1
     assert (source / "project.toml").read_bytes() == before
@@ -32,8 +36,15 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     result = tmp_path / "artifact"
     invoke(source, "build", result)
     manifest = json.loads((result / "plugin/.claude-plugin/plugin.json").read_text())
-    assert manifest["name"] == "different_kit"
-    assert "`different_kit:dispatch`" in (result / "plugin/commands/run-dispatch.md").read_text()
+    assert manifest["name"] == "different-kit"
+    assert manifest["version"] == "0.1.0"
+    market = json.loads((result / ".claude-plugin/marketplace.json").read_text())
+    assert market["name"] == market["plugins"][0]["name"] == "different-kit"
+    assert market["plugins"][0]["source"] == "./plugin"
+    assert "`different-kit:dispatch`" in (result / "plugin/commands/run-dispatch.md").read_text()
+    assert not (result / "plugin/not-for-release.txt").exists()
+    assert not (result / "different_kit/core/not-for-release.py").exists()
+    assert (result / "rules/secrets.md").is_file()
     assert "@PROJECT_NAME@" not in (result / "README.md").read_text()
     assert (result / "README.md").read_text().startswith("# different-kit\n")
     assert (result / "docs/ko/README.md").read_text().startswith("# different-kit\n")

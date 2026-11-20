@@ -1,6 +1,9 @@
-import re
-import tomllib
+import hashlib
+import os
 from pathlib import Path
+import re
+import stat
+import tomllib
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PREFIX = __package__.removesuffix("core.loop")
@@ -16,38 +19,156 @@ def project(root=ROOT):
     return metadata
 
 
-def config(path=None):
-    with (ROOT / "project.toml").open("rb") as stream:
-        data = tomllib.load(stream)["loop"]
-    if path:
-        with path.open("rb") as stream:
-            data.update(tomllib.load(stream)["loop"])
-    base = path.resolve().parent if path else Path.cwd()
-    for key in ("repo", "state"):
-        data[key] = (base / data[key]).resolve()
-    for key in ("max_rounds", "max_jobs", "poll_seconds", "timeout_seconds",
-                "retry_initial_seconds", "retry_limit", "retry_max_seconds"):
+def xdg(variable, default):
+    value = Path(os.environ.get(variable) or (Path.home() / default))
+    if not value.is_absolute():
+        return Path.home() / default
+    return value
+
+
+def state_root():
+    return xdg("XDG_STATE_HOME", ".local/state") / project()["name"]
+
+
+def profile_dir():
+    return xdg("XDG_CONFIG_HOME", ".config") / project()["name"] / "profiles"
+
+
+def repository(path):
+    from .git import Git
+
+    git = Git(path)
+    root = Path(git.run("rev-parse", "--show-toplevel").stdout.rstrip("\n")).resolve()
+    common = git.common()
+    if common.name == ".git":
+        root = common.parent
+    return root, common, Git(root)
+
+
+def fingerprint(*parts):
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(len(part).to_bytes(8, "big"))
+        digest.update(part)
+    return digest.hexdigest()
+
+
+def repo_id(common):
+    info = common.stat()
+    return fingerprint(os.fsencode(common), str((info.st_dev, info.st_ino)).encode())
+
+
+def profile_name(repo, common):
+    return f"{re.sub(r'[^a-zA-Z0-9_-]', '-', repo.name)[:48]}-{repo_id(common)[:16]}.toml"
+
+
+def trusted_profile(path):
+    from .git import Conflict, Git
+
+    directory = profile_dir()
+    path = Path(os.path.abspath(path))
+    if path.parent != directory or path.suffix != ".toml":
+        raise ValueError(f"executable settings must be in trusted profiles under {directory}")
+    for entry in (directory.parent, directory, path):
+        info = entry.lstat()
+        kind = stat.S_ISREG if entry == path else stat.S_ISDIR
+        if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError(f"untrusted profile path: {entry}")
+    try:
+        Git(directory.resolve()).run("rev-parse", "--git-dir")
+    except Conflict:
+        pass
+    else:
+        raise ValueError("trusted profiles must be outside Git checkouts")
+    return path
+
+
+def strings(value, key):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item or "\x00" in item for item in value):
+        raise ValueError(f"{key} must be an array of nonempty strings")
+    return value
+
+
+def policy_id(raw, tools):
+    code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
+    lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
+    rules = sorted((ROOT / "rules").glob("*.md"))
+    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules, *tools)))
+
+
+def config(path=None, *, control_only=False):
+    raw = (ROOT / "project.toml").read_bytes()
+    data = tomllib.loads(raw.decode())["loop"]
+    if path is None:
+        repo, common, _ = repository(Path.cwd())
+        path = profile_dir() / profile_name(repo, common)
+    path = trusted_profile(path)
+    overrides = path.read_bytes()
+    settings = tomllib.loads(overrides.decode()).get("loop")
+    if not isinstance(settings, dict) or settings.keys() - data.keys():
+        raise ValueError("invalid or unsupported [loop] profile settings")
+    if not isinstance(settings.get("repo"), str) or not Path(settings["repo"]).is_absolute():
+        raise ValueError("profile repo must be an absolute checkout path")
+    data.update(settings)
+    repo, common, git = repository(Path(data["repo"]))
+    if path.resolve().is_relative_to(repo) or path.resolve().is_relative_to(common):
+        raise ValueError("trusted profiles must be outside the checkout and Git directory")
+    if not isinstance(data["target"], str):
+        raise ValueError("target must be a branch name")
+    git.ref(data["target"])
+    identity = repo_id(common)
+    state = state_root() / "projects" / fingerprint(identity.encode(), data["target"].encode())[:24]
+    if state.resolve().is_relative_to(repo) or state.resolve().is_relative_to(common):
+        raise ValueError("state must be outside the checkout and Git directory")
+    if control_only:
+        return {"state": state}
+    for key in ("max_rounds", "max_jobs", "poll_seconds", "timeout_seconds", "retry_initial_seconds",
+                "retry_limit", "retry_max_seconds", "evidence_ttl_seconds"):
         if type(data[key]) is not int or data[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
-    for role in ("reviewer", "worker", "verify"):
-        command = data[role]
-        if not isinstance(command, list) or any(not isinstance(x, str) or not x for x in command):
-            raise ValueError(f"{role} must be an argv array")
-        if role == "verify":
-            continue
+    for key in ("reviewer", "worker", "repair_paths", "models"):
+        strings(data[key], key)
+    for key in ("checks", "attestors", "lens_reviewers"):
+        if not isinstance(data[key], dict):
+            raise ValueError(f"{key} must be a table of named argv arrays")
+        for name, command in data[key].items():
+            if not NAME.fullmatch(name) or not strings(command, name):
+                raise ValueError(f"invalid {key} name or command")
+    if data["checks"].keys() != data["attestors"].keys():
+        raise ValueError("each required check needs an independent attestor")
+    for role in ("reviewer", "worker"):
         order = data["models"]
-        model = data[f"{role}_model"]
-        ceiling = data["max_model"]
-        if not command or model not in order or ceiling not in order:
-            raise ValueError(f"{role} needs a command and a model listed in models")
-        if len(set(order)) != len(order) or order.index(model) > order.index(ceiling):
-            raise ValueError(f"{role} model exceeds max_model or the model order is ambiguous")
-        data[role] = [model if item == "{model}" else item for item in command]
+        model, ceiling = data[f"{role}_model"], data["max_model"]
+        if model not in order or ceiling not in order or len(set(order)) != len(order) or order.index(model) > order.index(ceiling):
+            raise ValueError(f"{role} has an invalid model or model ceiling")
+        data[role] = [model if item == "{model}" else item for item in data[role]]
+    for lens, command in data["lens_reviewers"].items():
+        if not (PACKAGE_ROOT / "reviews/lenses" / f"{lens}.md").is_file():
+            raise ValueError("lens reviewer must name an installed lens")
+        data["lens_reviewers"][lens] = [data["reviewer_model"] if item == "{model}" else item for item in command]
+    for section, expected in (("memory", dict), ("lenses", dict)):
+        if not isinstance(data[section], expected):
+            raise ValueError(f"{section} must be a table")
+    for name, patterns in data["lenses"].items():
+        if not NAME.fullmatch(name) or not (PACKAGE_ROOT / "reviews/lenses" / f"{name}.md").is_file():
+            raise ValueError("lens must name an installed review document")
+        strings(patterns, f"lenses.{name}")
+    memory = {}
     for stage in ("review", "test"):
         limits = data["memory"].get(stage, {})
+        if not isinstance(limits, dict):
+            raise ValueError("memory stage limits must be a table")
+        memory[stage] = {}
         for key in ("max_anon_mib", "min_available_mib"):
-            limits.setdefault(key, 0)
-            if type(limits[key]) is not int or limits[key] < 0:
+            value = limits.get(key, 0)
+            if type(value) is not int or value < 0:
                 raise ValueError(f"memory.{stage}.{key} must be a nonnegative integer")
-        data["memory"][stage] = limits
+            memory[stage][key] = value
+    from .sandbox import execution_policy
+
+    execution = execution_policy(data["execution"], forbidden=(repo, common, state.resolve()))
+    data.update(
+        repo=repo, state=state, repo_id=identity, profile=path, execution=execution, memory=memory,
+        policy_id=policy_id(raw + overrides, execution["tools"].values()),
+    )
     return data

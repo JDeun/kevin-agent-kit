@@ -1,9 +1,9 @@
 # Architecture
 
 kevin-agent-kit runs a local coordinator for a Git repository. The operator
-configures the agent commands and the verification command. The coordinator
-moves reviewed work through the loop while the project owner decides which
-design to build, when to release, and when to clean up shared resources.
+approves an executable profile outside the checkout. The coordinator prepares
+a candidate, and the project owner decides whether to apply and publish it.
+See the [candidate-only integration decision](adr/isolated-candidate-preparation.md).
 
 ```mermaid
 flowchart TD
@@ -14,47 +14,33 @@ flowchart TD
     Adversarial --> Summary
     Summary --> Choice{"Human design choice"}
     Choice --> Branch["Branch and exact head"]
-    Branch --> Queue["Local queue"]
-    Queue --> Review["Independent review"]
-    Review -->|Repair needed| Worker["Worker in a disposable worktree"]
-    Worker --> Queue
-    Review -->|Other findings at round cap| Record["Accept record"]
-    Record --> Disposition{"Human disposition"}
-    Disposition -->|Revise| Worker
-    Disposition -->|Defer| Deferred["Close without a merge"]
-    Review -->|Clean| Candidate["Local merge candidate"]
-    Candidate --> Verify["Verify the exact candidate commit"]
-    Verify -->|Pass and target still matches| Target["Update local target"]
-    Target --> Release{"Human shipping decision"}
+    Branch --> Queue["Private local queue"]
+    Queue --> Snapshot["Candidate from pinned source and target"]
+    Snapshot --> Review["Independent review per lens"]
+    Review -->|Repair within approved scope| Worker["Worker in a private checkout"]
+    Worker --> Review
+    Review -->|Protected finding at cap| Blocked["Block and retain evidence"]
+    Review -->|Ordinary finding at cap| Record["Human decision record"]
+    Record -->|Revise| Queue
+    Review -->|Complete and clean| Verify["Required checks and independent attestations"]
+    Verify -->|Current evidence| Bundle["Exportable candidate bundle"]
+    Bundle --> Release{"Repository owner approval"}
 ```
 
-## Review and repair
+## Execution and state
 
-A queue entry pins a local branch and its commit. The reviewer receives a
-lens prompt on stdin and returns a JSON findings report. When repair is needed, a worker gets a
-Markdown brief in a disposable detached worktree and commits the correction
-there. Keep the source branch free of checkouts during repair so the loop
-can advance it safely. Each new head returns to review.
+Each agent or check runs under a role with its own filesystem, process, and
+network namespace. The coordinator owns the state directory and imports only
+the approved Git objects into private repositories. Approved scoped repairs
+remain in the candidate history. Review and verification of a repair use a
+clean checkout of its committed content.
 
-High-risk findings continue through repair beyond the configured round cap.
-A lane with only other findings at the cap records the findings and waits
-for a human disposition. Revise sends the lane back to a worker. Defer
-closes it without merging. Inspect the evidence with `accept-record` and
-record the disposition with `decide`. See [operating the loop](loop.md) for
-configuration and the command contracts.
+The coordinator records the repository, target, source head, merge base,
+candidate, policy, and exact execution evidence. A ref or policy change
+invalidates the previous result. A human can inspect the evidence and export
+the candidate bundle while it is current.
 
-## Verification and shipping
-
-The merge train prepares a candidate against the current local target and
-runs the configured verification command in the candidate worktree. A
-remote CI wrapper can gate that command by waiting for results for the
-exact candidate SHA. The loop uses a compare-and-swap ref update so a
-verification result cannot advance a target that has moved. Keep the target
-branch free of checkouts. The coordinator checkout can stay on a separate
-branch.
-
-The target update is local. Follow the project's shipping process when
-publishing a release. Use the [hosting adapters](hosting.md) for PR or MR
-operations and the [verification guide](../verify/README.md) to attach
-running-app evidence. Follow the [worker rules](../agents/worker-rules.md)
-and record human decisions and resource ownership in the [ledgers](ledgers.md).
+See [operating the loop](loop.md) for profiles and command contracts. Follow the
+[worker rules](../agents/worker-rules.md) and use the [ledgers](ledgers.md) for
+decisions and resource ownership. The [hosting adapters](hosting.md) and
+[screenshot guide](../verify/README.md) cover publishing evidence.

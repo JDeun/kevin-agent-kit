@@ -14,7 +14,9 @@ python3 -m core.ledgers decision record --id default-export \
 python3 -m core.ledgers decision show --id default-export
 ```
 
-The default file is `decisions.jsonl`. Use `--ledger` to select a different file. IDs are unique within each file. Give a superseding decision a new ID and update the test to refer to it.
+The default file is `decisions.jsonl` under the kit's XDG state directory in
+`ledgers/`. Use `--ledger` to select a different file. IDs are unique within
+each file. Give a superseding decision a new ID and update the test to refer to it.
 
 ### Pin behavior in pytest or Vitest
 
@@ -56,7 +58,10 @@ python3 -m core.ledgers ordinal reserve \
   --ledger /var/tmp/example-ordinals.jsonl --resource migrations --after 12
 ```
 
-Each ledger uses a sibling file ending in `.lock`. Keep that file in place while writers are active. Separate checkouts with separate ledger files allocate independently.
+The default ordinal ledger is `ledgers/resources.jsonl` under the kit's XDG
+state directory. Each ledger uses a sibling file ending in `.lock`. Keep
+that file in place while writers are active. Separate ledger files allocate
+independently.
 
 ### Check migrations in CI
 
@@ -69,3 +74,7 @@ python3 -m core.ledgers ordinal check-migrations \
 ```
 
 The check reads tracked files from the Git commits. By default it examines `*.sql` under the migration directory, including subdirectories. Use `--pattern` for another filename glob. Use a positive numeric prefix followed by `_`, `-`, or a period, as in `013_add_index.sql`. Leading zeros are allowed. The check requires unique numbers across each tree and requires files introduced since the merge base to exceed the current target's maximum. Exit code 1 signals a migration violation. Exit code 2 signals invalid input or unavailable Git history.
+
+Use `--immutable` for projects where applied migrations must stay fixed.
+Run it against the candidate built on the current target to detect changed,
+deleted, or renamed migrations from that target.

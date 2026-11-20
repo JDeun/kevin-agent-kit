@@ -1,20 +1,77 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
+from threading import Event
 import hashlib
 import json
-from threading import Event
+import shutil
+import tempfile
 import time
+from uuid import uuid4
 
-from .git import Changed, Conflict, Git, job_env
-from .review import BLOCKING, brief, findings, lenses, prompt
-from .runtime import Busy, Cancelled, MemoryGate, Retry, lock, run
+from .config import config, repo_id
+from .git import Conflict, Git
+from .review import BLOCKING, brief, lenses, prompt, review_receipt, verification
+from .runtime import Cancelled, MemoryGate, Retry, private_dir
+from .sandbox import execute, redact
+from .store import now
+
+
+class SourceChanged(Conflict):
+    pass
+
+
+class InterruptedAttempt(Exception):
+    def __init__(self, cause, evidence):
+        self.cause = cause
+        self.evidence = evidence
+
+
+def check_inputs(cfg, evidence):
+    git = Git(cfg["repo"])
+    if repo_id(git.common()) != evidence["repo_id"]:
+        raise Conflict("repository identity changed")
+    if git.head(evidence["branch"]) != evidence["head"]:
+        raise SourceChanged("enqueued source changed; explicitly enqueue the new SHA")
+    if git.head(cfg["target"]) != evidence["base"]:
+        raise Conflict("target changed; retry for a fresh candidate")
+    if evidence["policy"] != cfg["policy_id"]:
+        raise Conflict("execution policy changed; restart and retry")
+
+
+def check_candidate(cfg, evidence):
+    check_inputs(cfg, evidence)
+    if cfg.get("profile") and config(cfg["profile"])["policy_id"] != evidence["policy"]:
+        raise Conflict("execution policy changed; restart and retry")
+    if evidence["expires_at"] <= time.time():
+        raise Conflict("candidate evidence expired; retry the job")
+
+
+def export_candidate(cfg, evidence, destination):
+    check_candidate(cfg, evidence)
+    path = cfg["state"] / "candidates" / f"{evidence['run']}.bundle"
+    with path.open("rb") as source:
+        if hashlib.file_digest(source, "sha256").hexdigest() != evidence["bundle_sha256"]:
+            raise Conflict("candidate bundle does not match the evidence")
+        source.seek(0)
+        # Prepare the file before exposing the requested output path. A hard link
+        # publishes it atomically and fails if the user already has that path.
+        with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".candidate-") as directory:
+            staged = Path(directory) / "candidate.bundle"
+            with staged.open("xb") as target:
+                staged.chmod(0o600)
+                shutil.copyfileobj(source, target)
+            check_candidate(cfg, evidence)
+            destination.hardlink_to(staged)
 
 
 class Engine:
-    def __init__(self, cfg, store, cancel=None):
+    def __init__(self, cfg, store, cancel=None, *, runner=execute):
         self.cfg = cfg
         self.store = store
-        self.git = Git(cfg["repo"], cfg["state"])
+        self.git = Git(cfg["repo"])
         self.cancel = cancel or Event()
+        self.runner = runner
         self.memory = MemoryGate()
         self.executor = ThreadPoolExecutor(max_workers=cfg["max_jobs"])
         self.active = {}
@@ -26,148 +83,172 @@ class Engine:
         self.cancel.set()
         self.executor.shutdown(wait=True)
 
-    def command(self, role, path, job, *, stdin=None, **env):
-        return run(
-            self.cfg[role], path, self.cancel, self.cfg["timeout_seconds"],
-            prompt=stdin, env=job_env(self.cfg, job, **env),
-        )
+    def authority(self, evidence):
+        check_inputs(self.cfg, evidence)
+        if self.cfg.get("profile") and config(self.cfg["profile"])["policy_id"] != evidence["policy"]:
+            raise Conflict("execution policy changed; restart and retry")
+        if self.cancel.is_set():
+            raise Cancelled
 
-    def review(self, job, base):
-        items = []
-        prior = [item for item in json.loads(job["report"]) if item["risk"] in BLOCKING]
-        selected = dict.fromkeys((*lenses(self.git.paths(base, job["sha"]), self.cfg["lenses"]),
-                                  *(item["lens"] for item in prior)))
-        with self.git.checkout(job["sha"]) as path:
-            for lens in selected:
-                previous = [item for item in prior if item["lens"] == lens]
-                message = prompt(base, job["branch"], job["sha"], lens, previous)
-                output = self.command(
-                    "reviewer", path, job, stdin=message, AGENT_LENS=lens,
-                    AGENT_MODEL=self.cfg["reviewer_model"],
-                )
-                self.git.clean(path)
-                if self.git.resolve("HEAD", cwd=path) != job["sha"]:
-                    raise Conflict("reviewer moved the requested checkout")
-                items.extend({**item, "lens": lens} for item in findings(output))
+    def command(self, role, argv, work, evidence, *, stdin, baseline=None):
+        self.authority(evidence)
+        limit = self.cfg["memory"]["test" if role in {"verify", "attest"} else "review"]
+        if not self.memory.allows(limit["max_anon_mib"] * 2**20, limit["min_available_mib"] * 2**20):
+            raise Retry("stage memory limit")
+        extra = {
+            "AGENT_BASE": evidence["base"], "AGENT_HEAD": evidence["head"],
+            "AGENT_CANDIDATE": evidence["candidate"], "AGENT_TARGET": evidence["target"],
+            "AGENT_BRANCH": evidence["branch"],
+        }
+        if role in {"reviewer", "worker"}:
+            extra["AGENT_MODEL"] = self.cfg[f"{role}_model"]
+        return self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
+                           policy=self.cfg["execution"], stdin=stdin, extra=extra, checks=baseline)
+
+    def review(self, work, evidence, paths, prior, history, rounds):
+        items = list(prior)
+        selected = dict.fromkeys((*lenses(paths, self.cfg["lenses"]), *(item["lens"] for item in prior)))
+        for lens in selected:
+            previous = [item for item in prior if item["lens"] == lens]
+            request = {**evidence, "lens": lens, "paths": paths, "invocation": uuid4().hex}
+            try:
+                argv = self.cfg["lens_reviewers"].get(lens, self.cfg["reviewer"])
+                output = self.command("reviewer", argv, work, evidence,
+                                      stdin=prompt(request, previous))
+                review = review_receipt(output, request, previous)
+            except (OSError, ValueError, Retry) as cause:
+                report = {**evidence, "reviews": history, "findings": items, "rounds": rounds}
+                raise InterruptedAttempt(cause, report) from cause
+            env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
+            review["tool_version"] = redact(review["tool_version"], env_names)
+            review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
+            for item in review["findings"]:
+                item["detail"] = redact(item["detail"], env_names)
+            review["collected_at"] = now()
+            history.append(review)
+            items = [item for item in items if item["lens"] != lens]
+            items.extend({**item, "lens": lens} for item in review["findings"])
         return items
 
-    def repair(self, job):
-        self.git.unoccupied(job["branch"])
-        text = brief(job["branch"], job["sha"], json.loads(job["report"]), self.cfg["max_model"])
-        with self.git.checkout(job["sha"]) as path:
-            self.command("worker", path, job, stdin=text, AGENT_MODEL=self.cfg["worker_model"])
-            self.git.clean(path)
-            result = self.git.resolve("HEAD", cwd=path)
-            if result == job["sha"] or not self.git.ancestor(job["sha"], result):
-                raise Conflict("worker must commit a descendant of the reviewed head")
-        if self.cancel.is_set():
-            raise Cancelled
-        self.git.publish(job["branch"], result, job["sha"])
-        return result
+    def step(self, job, prior):
+        base = self.git.head(self.cfg["target"])
+        branch, head = job["branch"], job["sha"]
+        if branch == self.cfg["target"] or not base:
+            raise Conflict("source and existing target must be distinct branches")
+        if self.git.head(branch) != head:
+            return "stale", "enqueued source changed; explicitly enqueue the new SHA", None
+        if self.git.ancestor(head, base):
+            return "included", "source is already included in target", None
+        merge_base = self.git.run("merge-base", base, head).stdout.strip()
+        with self.git.snapshot(self.cfg["state"], base, head) as (git, root), ExitStack() as repairs:
+            baseline = root / "baseline"
+            baseline.mkdir()
+            git.run("checkout", "--quiet", "--detach", base)
+            git.run("checkout-index", "--all", f"--prefix={baseline}/")
+            candidate = git.candidate(base, head)
+            evidence = {
+                "repo_id": self.cfg["repo_id"], "target": self.cfg["target"], "base": base,
+                "head": head, "branch": branch, "merge_base": merge_base, "candidate": candidate,
+                "policy": self.cfg["policy_id"], "run": uuid4().hex,
+            }
+            history = []
+            for rounds in range(1, self.cfg["max_rounds"] + 1):
+                paths = sorted(git.paths(base, evidence["candidate"]))
+                items = self.review(git.repo, evidence, paths, prior, history, rounds)
+                prior = [item for item in items if item["risk"] in BLOCKING]
+                report = {**evidence, "reviews": history, "rounds": rounds, "findings": items}
+                if not items:
+                    break
+                if rounds == self.cfg["max_rounds"] or not (self.cfg["worker"] and self.cfg["repair_paths"]):
+                    self.authority(evidence)
+                    if prior:
+                        return "blocked", "protected findings require resolution", report
+                    return "waiting", "human decision needed", report
+                try:
+                    self.command("worker", self.cfg["worker"], git.repo, evidence,
+                                 stdin=brief(evidence, items, self.cfg["repair_paths"]))
+                    repaired = git.repair(self.cfg["repair_paths"])
+                    with ExitStack() as next_checkout:
+                        git, _ = next_checkout.enter_context(git.snapshot(self.cfg["state"], base, repaired))
+                        git.run("checkout", "--quiet", "--detach", repaired)
+                        repairs.close()
+                        repairs.enter_context(next_checkout.pop_all())
+                    evidence["candidate"] = repaired
+                except (OSError, ValueError, Retry) as cause:
+                    raise InterruptedAttempt(cause, report) from cause
 
-    def train(self, job, base):
-        if self.git.ancestor(job["sha"], base):
-            return "merged", "reviewed head is already in target"
-        self.git.unoccupied(self.cfg["target"])
-        if not self.cfg["verify"]:
-            raise Conflict("configure an integration verifier before advancing the target")
-        with self.git.checkout(base) as path:
-            sha = self.git.candidate(path, job["sha"])
-            self.command("verify", path, job, AGENT_CANDIDATE=sha, AGENT_BASE=base)
-            self.git.clean(path)
-            if self.git.resolve("HEAD", cwd=path) != sha:
-                raise Conflict("verifier moved the merge candidate checkout")
-        if self.cancel.is_set():
-            raise Cancelled
-        try:
-            self.git.publish(self.cfg["target"], sha, base, verify=(job["branch"], job["sha"]))
-        except Changed:
-            current = self.git.head(job["branch"])
-            if current != job["sha"]:
-                return "stale", current
-            raise Busy("target advanced during verification") from None
-        return "merged", sha
-
-    def step(self, job):
-        common = self.git.common()
-        key = hashlib.sha256(job["branch"].encode()).hexdigest()
-        try:
-            with lock(common / f"agent-branch-{key}.lock"):
-                if job["branch"] == self.cfg["target"]:
-                    raise Conflict("source and target must be distinct")
-                current = self.git.head(job["branch"])
-                if current != job["sha"]:
-                    return "stale", current
-                base = self.git.head(self.cfg["target"])
-                if not base:
-                    raise Conflict("target branch does not exist")
-                if job["phase"] == "review":
-                    result = self.review(job, base)
-                    current = self.git.head(job["branch"])
-                    if current != job["sha"]:
-                        return "stale", current
-                    return "reviewed", result
-                if job["phase"] == "repair":
-                    return "superseded", self.repair(job)
-                with lock(common / "agent-train.lock"):
-                    return self.train(job, base)
-        except Changed:
-            return "stale", self.git.head(job["branch"])
+            receipts = []
+            for name, argv in sorted(self.cfg["checks"].items()):
+                request = {**evidence, "check": name, "invocation": uuid4().hex}
+                try:
+                    output = self.command("verify", argv, git.repo, evidence, stdin=None, baseline=baseline)
+                    observation = {"exit_status": 0, "stdout": output}
+                    attestation = self.command(
+                        "attest", self.cfg["attestors"][name], None, evidence,
+                        stdin=json.dumps({"request": request, "observation": observation}, ensure_ascii=True),
+                    )
+                    receipts.append({
+                        **verification(attestation, request), "collected_at": now(),
+                        "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                    })
+                except (OSError, ValueError, Retry) as cause:
+                    raise InterruptedAttempt(cause, {**report, "checks": receipts}) from cause
+            if not receipts:
+                raise Conflict("configure mandatory checks before preparing candidates")
+            self.authority(evidence)
+            directory = private_dir(self.cfg["state"] / "candidates")
+            bundle = directory / f"{evidence['run']}.bundle"
+            staged = root / "candidate.bundle"
+            git.bundle(staged, evidence["candidate"])
+            staged.chmod(0o600)
+            with staged.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            self.authority(evidence)
+            staged.replace(bundle)
+            return "candidate", "awaiting repository owner", {
+                **report, "checks": receipts, "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
+                "bundle_sha256": digest,
+            }
 
     def collect(self, job, future):
         try:
-            phase, result = future.result()
+            phase, detail, evidence = future.result()
         except Cancelled:
             return
-        except Busy as error:
-            self.store.update(job, job["phase"], detail=str(error) or "work key is held",
-                              attempts=job["attempts"], next_at=time.time() + self.cfg["poll_seconds"])
+        except InterruptedAttempt as error:
+            self.record_failure(job, error.cause, error.evidence)
             return
-        except Retry as error:
+        except Exception as error:
+            self.record_failure(job, error, None)
+            return
+        self.store.update(job, phase, detail=detail, evidence=evidence)
+
+    def record_failure(self, job, error, evidence):
+        if isinstance(error, Retry):
             attempts = job["attempts"] + 1
             delay = min(self.cfg["retry_max_seconds"],
                         self.cfg["retry_initial_seconds"] * 2 ** min(attempts - 1, 30))
-            if attempts >= self.cfg["retry_limit"]:
-                self.store.update(job, "blocked", detail=str(error), attempts=attempts)
+            if attempts < self.cfg["retry_limit"]:
+                self.store.update(job, "review", detail=str(error), attempts=attempts,
+                                  next_at=time.time() + delay, evidence=evidence)
             else:
-                self.store.update(job, job["phase"], detail=str(error), attempts=attempts,
-                                  next_at=time.time() + delay)
+                self.store.update(job, "blocked", detail=str(error), attempts=attempts, evidence=evidence)
             return
-        except Exception as error:
-            self.store.update(job, "blocked", detail=f"{type(error).__name__}: {error}")
-            return
-        if phase == "reviewed":
-            rounds = job["rounds"] + bool(result)
-            if not result:
-                self.store.update(job, "train", report=result)
-            elif rounds >= self.cfg["max_rounds"] and not any(
-                finding["risk"] in BLOCKING for finding in result
-            ):
-                self.store.accept_record(job, rounds, result)
-            else:
-                self.store.update(job, "repair", rounds=rounds, report=result)
-        elif phase == "superseded" or (phase == "stale" and result):
-            self.store.successor(job, phase, result)
-        else:
-            self.store.update(job, phase, detail=result or "")
+        phase = "stale" if isinstance(error, SourceChanged) else "blocked"
+        detail = str(error) if isinstance(error, ValueError) else type(error).__name__
+        self.store.update(job, phase, detail=detail[:500], evidence=evidence)
 
     def tick(self):
         for job_id, (job, future) in list(self.active.items()):
             if future.done():
                 del self.active[job_id]
                 self.collect(job, future)
-        self.store.ingest()
         active_branches = {job["branch"] for job, _ in self.active.values()}
-        train_busy = any(job["phase"] == "train" for job, _ in self.active.values())
         for job in self.store.ready():
             if self.cancel.is_set() or len(self.active) >= self.cfg["max_jobs"]:
                 break
-            if job["branch"] in active_branches or (job["phase"] == "train" and train_busy):
+            if job["branch"] in active_branches:
                 continue
-            profile = self.cfg["memory"]["review" if job["phase"] == "review" else "test"]
-            if not self.memory.allows(profile["max_anon_mib"] * 2**20,
-                                      profile["min_available_mib"] * 2**20):
-                continue
-            self.active[job["id"]] = job, self.executor.submit(self.step, job)
+            prior = self.store.protected(job["id"])
+            self.active[job["id"]] = job, self.executor.submit(self.step, job, prior)
             active_branches.add(job["branch"])
-            train_busy |= job["phase"] == "train"

@@ -2,8 +2,8 @@
 
 - Use the assigned repository, branch, and worktree. Check the expected base
   and head before editing and inspect the diff before committing. Stage
-  files by path and include only work from the assignment. For a detached
-  repair worktree, commit there and report its new HEAD to the coordinator.
+  files by path and include only work from the assignment. In a loop-managed
+  repair checkout, edit the approved paths so the coordinator can commit.
 - Push only the designated branch and only when authorized. Use
   fast-forward pushes. Force pushes, rebases, stashes, and history rewrites
   are outside worker scope. Leave updates to other branches and protected
@@ -20,9 +20,9 @@
 - Record decisions in the decision ledger with the alternatives, rationale,
   evidence, decision owner, and any remaining gate. Bring reviewers the
   change scope, exact base and head, verification output, and known open
-  issues. For a branch you own, enqueue the new head as
-  `NEED-REVIEW BRANCH FULL_SHA`. The coordinator queues detached repair
-  commits after it advances the source branch.
+  issues. For a branch you own, enqueue the exact current SHA with
+  `kevin-agent-kit enqueue BRANCH FULL_SHA`. The coordinator includes approved
+  repairs in the candidate bundle.
 - Reserve shared ordinals and ports through the resource ledger before using
   them. Run the migration check against the current target for numbered changes.
 - Use the project's configured `max_model` for assignments that need the

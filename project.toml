@@ -3,8 +3,7 @@ name = "kevin-agent-kit"
 version = "0.1.0"
 
 [loop]
-repo = "."
-state = ".agent-queue"
+repo = ""
 target = "main"
 max_rounds = 5
 max_jobs = 2
@@ -13,13 +12,22 @@ timeout_seconds = 900
 retry_initial_seconds = 15
 retry_limit = 6
 retry_max_seconds = 300
-max_model = "gpt-5.4"
-models = ["gpt-5.4-mini", "gpt-5.4"]
-reviewer_model = "gpt-5.4"
-worker_model = "gpt-5.4-mini"
-reviewer = ["codex", "exec", "--model", "{model}", "--sandbox", "read-only", "-"]
-worker = ["codex", "exec", "--model", "{model}", "--sandbox", "workspace-write", "-"]
-verify = []
+evidence_ttl_seconds = 3600
+max_model = "default"
+models = ["default"]
+reviewer_model = "default"
+worker_model = "default"
+reviewer = []
+worker = []
+repair_paths = []
+
+[loop.checks]
+
+[loop.attestors]
+
+[loop.lens_reviewers]
+
+[loop.execution]
 
 [loop.memory.review]
 max_anon_mib = 0
@@ -30,5 +38,4 @@ max_anon_mib = 0
 min_available_mib = 0
 
 [loop.lenses]
-security = ["**/auth/**", "**/security/**", "**/*permissions*", "**/.github/workflows/**"]
 db = ["**/migrations/**", "**/*.sql"]

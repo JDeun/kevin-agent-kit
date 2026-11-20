@@ -33,6 +33,15 @@ def main(argv: list[str] | None = None) -> int:
         if name != "pipeline-status":
             operation.add_argument("--body-file", type=Path, required=True)
 
+    gate = operations.add_parser("pipeline-gate", allow_abbrev=False, help="require exact successful CI evidence")
+    gate.add_argument("--number", required=True, type=int)
+    gate.add_argument("--sha", required=True)
+    gate.add_argument("--target", required=True)
+    gate.add_argument("--base-sha", required=True)
+    gate.add_argument("--run-id", required=True, type=int, help="GitHub check suite or GitLab pipeline ID")
+    gate.add_argument("--source", required=True, help="GitHub app slug or GitLab pipeline source")
+    gate.add_argument("--require", required=True, action="append", metavar="CHECK")
+
     args = vars(parser.parse_args(argv))
     provider = args.pop("provider")
     repo = args.pop("repo")
@@ -45,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
             "update-body": adapter.update_body,
             "comment": adapter.comment,
             "pipeline-status": adapter.pipeline_status,
+            "pipeline-gate": adapter.pipeline_gate,
         }[operation]
         result = method(**args)
     except AdapterError as error:

@@ -4,30 +4,34 @@ Use this workflow when a person needs to choose between plausible designs.
 Write a brief with the goal, constraints, audience, and the concrete output
 each alternative should provide.
 
-Configure independently invocable agent commands as argv arrays. Every
-invocation receives a UTF-8 prompt on stdin, runs with a fresh temporary
-working directory, and returns the artifact on stdout. Use commands on
-`PATH` or absolute paths. Run trusted commands with the runtime's own
-permissions and credentials. The working directory separates the files
-created by each invocation.
+Save a private persona profile under the kit's XDG configuration
+`profiles/` directory. Each command receives a UTF-8 prompt on stdin,
+runs in a fresh Bubblewrap sandbox, and returns its artifact on stdout.
+Use approved wrappers mounted under `/tools`. For model calls use a scoped
+broker and add its socket to `[execution.sockets]` under `persona`. See the
+[loop's execution setup](../../docs/loop.md).
 
 ```toml
 [alternatives]
-compact = ["claude", "-p", "--model", "sonnet", "--tools", ""]
-guided = ["claude", "-p", "--model", "opus", "--tools", ""]
+compact = ["/tools/persona-agent", "compact"]
+guided = ["/tools/persona-agent", "guided"]
 
 [personas]
 compact = "A returning operator checking status between other tasks"
 guided = "A first-time contributor completing setup without assistance"
 
 [review]
-use = ["claude", "-p", "--model", "sonnet", "--tools", ""]
-adversarial = ["claude", "-p", "--model", "opus", "--tools", ""]
-synthesis = ["claude", "-p", "--model", "sonnet", "--tools", ""]
+use = ["/tools/persona-agent", "use"]
+adversarial = ["/tools/persona-agent", "adversarial"]
+synthesis = ["/tools/persona-agent", "synthesis"]
+
+[execution.tools]
+persona-agent = "/home/example/kit-tools/persona-agent"
 ```
 
 ```sh
-python3 -m reviews.persona --config ./personas.toml \
+kevin-agent-kit persona-review \
+  --config "${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/personas.toml" \
   --brief ./brief.md --output ./persona-evidence
 ```
 

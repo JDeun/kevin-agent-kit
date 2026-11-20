@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import signal
@@ -9,19 +10,51 @@ import time
 
 from .config import ROOT
 from .engine import Engine
-from .runtime import Busy, lock
+from .runtime import Busy, lock, private_dir
+from .sandbox import probe
 from .store import Store
 
 
-def listen_address(state):
-    return str(state / "control.sock")
+@contextmanager
+def address(state):
+    fd = os.open(state, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield f"/proc/self/fd/{fd}/control.sock"
+    finally:
+        os.close(fd)
+
+
+def contact(state, message):
+    with address(state) as path, socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(1)
+        client.connect(path)
+        client.sendall(message + b"\n")
+        with client.makefile("rb") as response:
+            return response.readline(128).strip().decode("ascii")
 
 
 def notify(state):
-    with socket.socket(socket.AF_UNIX) as client:
-        client.settimeout(1)
-        client.connect(listen_address(state))
-        client.sendall(b"stop\n")
+    if contact(state, b"stop") != "ok":
+        raise ValueError("daemon did not acknowledge stop")
+
+
+def stop(state):
+    if not state.is_dir():
+        return
+    ensure_state(state)
+    if not running(state):
+        return
+    try:
+        notify(state)
+    except OSError:
+        if running(state):
+            raise
+        return
+    deadline = time.monotonic() + 100
+    while running(state):
+        if time.monotonic() >= deadline:
+            raise ValueError("daemon acknowledged stop and has not exited")
+        time.sleep(0.05)
 
 
 def running(state):
@@ -36,20 +69,21 @@ def running(state):
 
 def serve(cfg):
     state = cfg["state"]
-    state.mkdir(parents=True, exist_ok=True)
     cancel = Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: cancel.set())
-    address = Path(listen_address(state))
-    with lock(state / "daemon.lock"), socket.socket(socket.AF_UNIX) as server:
-        address.unlink(missing_ok=True)
-        server.bind(str(address))
+    control = state / "control.sock"
+    with (lock(state / "daemon.lock"), address(state) as path,
+          socket.socket(socket.AF_UNIX) as server):
+        if control.is_socket():
+            control.unlink()
+        server.bind(path)
         try:
-            address.chmod(0o600)
+            control.chmod(0o600)
             server.listen()
             server.settimeout(min(1, cfg["poll_seconds"]))
             next_tick = 0
-            with Store(state).connect() as store, Engine(cfg, store, cancel) as engine:
+            with Store(state, cfg["repo_id"], cfg["target"]).connect() as store, Engine(cfg, store, cancel) as engine:
                 while not cancel.is_set():
                     if time.monotonic() >= next_tick:
                         engine.tick()
@@ -62,33 +96,56 @@ def serve(cfg):
                         client.settimeout(0.5)
                         try:
                             with client.makefile("rb") as request:
-                                if request.readline(32) == b"stop\n":
-                                    cancel.set()
-                        except TimeoutError:
+                                operation = request.readline(32)
+                            if operation == b"stop\n":
+                                cancel.set()
+                                client.sendall(b"ok\n")
+                            elif operation == b"ping\n":
+                                client.sendall(cfg["policy_id"].encode() + b"\n")
+                        except (TimeoutError, ConnectionError):
                             continue
         finally:
-            address.unlink(missing_ok=True)
+            control.unlink(missing_ok=True)
 
 
-def start(cfg, config_path):
+def ensure_state(state):
+    root = state.parent.parent
+    private_dir(root)
+    private_dir(state.parent)
+    return private_dir(state)
+
+
+def validate_execution(cfg):
+    if not cfg["reviewer"] or not cfg["checks"]:
+        raise ValueError("configure a reviewer and required checks in the trusted profile")
+    probe()
+
+
+def start(cfg):
     state = cfg["state"]
-    state.mkdir(parents=True, exist_ok=True)
     if running(state):
+        if contact(state, b"ping") != cfg["policy_id"]:
+            raise ValueError("daemon uses a different policy; stop and restart it")
         return
-    args = [sys.executable, "-P", "-m", __package__]
-    if config_path:
-        args += ["--config", str(config_path.resolve())]
+    validate_execution(cfg)
+    args = [sys.executable, "-P", "-m", __package__, "--config", str(cfg["profile"]), "run"]
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
-    with (state / "daemon.log").open("ab") as log:
-        child = subprocess.Popen(
-            [*args, "run"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-            start_new_session=True, env=env,
-        )
+    path = state / "daemon.log"
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "ab") as log:
+        child = subprocess.Popen(args, cwd="/", stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True, env=env)
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
-        if Path(listen_address(state)).is_socket() and running(state):
-            return
+        try:
+            if contact(state, b"ping") == cfg["policy_id"]:
+                return
+        except OSError:
+            pass
         if child.poll() is not None:
             break
         time.sleep(0.05)
-    raise ValueError(f"daemon did not start, see {state / 'daemon.log'}")
+    if child.poll() is None:
+        child.terminate()
+        child.wait(timeout=5)
+    raise ValueError(f"daemon did not start, see {path}")

@@ -44,7 +44,8 @@ def ordinals(paths: list[str], label: str) -> tuple[dict[str, int], list[str]]:
     return ids, issues
 
 
-def check_migrations(repo: Path, target: str, head: str, directory: str, pattern: str) -> list[str]:
+def check_migrations(repo: Path, target: str, head: str, directory: str, pattern: str,
+                     *, immutable: bool = False) -> list[str]:
     scope = PurePosixPath(directory)
     if scope.is_absolute() or ".." in scope.parts:
         raise ValueError("Migration directory must be relative to the repository")
@@ -60,4 +61,11 @@ def check_migrations(repo: Path, target: str, head: str, directory: str, pattern
         for path, ordinal in head_ids.items()
         if path not in inherited and ordinal <= target_max
     ]
-    return target_issues + head_issues + too_low
+    changed = []
+    if immutable:
+        paths = git(repo, "diff", "--name-only", "--no-renames", "-z", target_commit, head_commit, "--")
+        changed = [
+            f"head: applied migration {name!r} was modified or deleted"
+            for name in map(os.fsdecode, paths.split(b"\0")) if name in target_ids
+        ]
+    return target_issues + head_issues + too_low + changed

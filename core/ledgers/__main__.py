@@ -6,6 +6,8 @@ from pathlib import Path
 from .migrations import check_migrations
 from .pins import get_decision
 from .store import iso_date, nonempty, transact
+from ..loop.config import state_root
+from ..loop.runtime import private_dir
 
 
 def record_decision(args: argparse.Namespace) -> int:
@@ -48,7 +50,8 @@ def reserve(args: argparse.Namespace) -> int:
 
 
 def run_migration_check(args: argparse.Namespace) -> int:
-    issues = check_migrations(args.repo, args.target, args.head, args.directory, args.pattern)
+    issues = check_migrations(args.repo, args.target, args.head, args.directory, args.pattern,
+                              immutable=args.immutable)
     for issue in issues:
         print(issue, file=sys.stderr)
     return int(bool(issues))
@@ -60,7 +63,7 @@ def main() -> int:
     decision = groups.add_parser("decision").add_subparsers(dest="action", required=True)
     for name, handler in (("record", record_decision), ("show", show_decision)):
         command = decision.add_parser(name)
-        command.add_argument("--ledger", type=Path, default=Path("decisions.jsonl"))
+        command.add_argument("--ledger", type=Path)
         command.add_argument("--id", required=True)
         if name == "record":
             for field in ("date", "decided-by", "source", "summary"):
@@ -69,7 +72,7 @@ def main() -> int:
 
     ordinal = groups.add_parser("ordinal").add_subparsers(dest="action", required=True)
     command = ordinal.add_parser("reserve", help="allocate the next number for a resource")
-    command.add_argument("--ledger", type=Path, required=True)
+    command.add_argument("--ledger", type=Path)
     command.add_argument("--resource", required=True)
     command.add_argument("--after", type=int, default=0)
     command.set_defaults(handler=reserve)
@@ -80,10 +83,14 @@ def main() -> int:
     command.add_argument("--head", default="HEAD")
     command.add_argument("--directory", default="migrations")
     command.add_argument("--pattern", default="*.sql")
+    command.add_argument("--immutable", action="store_true", help="reject changes to target migrations")
     command.set_defaults(handler=run_migration_check)
 
     args = parser.parse_args()
     try:
+        if hasattr(args, "ledger") and args.ledger is None:
+            directory = private_dir(private_dir(state_root()) / "ledgers")
+            args.ledger = directory / ("decisions.jsonl" if args.group == "decision" else "resources.jsonl")
         return args.handler(args)
     except (OSError, ValueError) as error:
         parser.exit(2, f"{error}\n")
