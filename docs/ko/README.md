@@ -1,6 +1,7 @@
 # kevin-agent-kit
 
-여러 코딩 에이전트의 구현, 리뷰, 통합을 로컬에서 조율하는 하네스입니다.
+여러 코딩 에이전트의 구현과 리뷰를 로컬에서 조율해 검증된 후보 번들을 만드는 하네스입니다.
+키트는 병합하지 않습니다. 후보의 적용은 저장소 소유자가 합니다.
 
 > one human holds the decision gate; an agent fleet does the rest
 
@@ -16,14 +17,18 @@
 
 Git을 설치하고, 배포 CLI가 사용할 Python 3.11 이상을 `/usr/bin/python3`에 준비합니다.
 실행기는 Python 격리 모드를 사용합니다. 설치한 명령의 선택 의존성은 시스템 Python에서
-불러올 수 있어야 합니다. 실제 저장소에서 루프를 실행하려면
+불러올 수 있어야 합니다. 격리·서명 증거 방식의 루프에는
 OpenSSL과 Bubblewrap의 비특권 네임스페이스를 사용할 수 있는 Linux가 필요합니다.
+`kevin-agent-kit doctor`로 이 컴퓨터가 지원하는지 먼저 확인하고, Bubblewrap이 없으면(컨테이너 등)
+2단계의 비격리 실제 CLI 모드를 사용합니다. 다른 계정이 쓸 수 있거나 심볼릭 링크인
+설치 경로는 거부됩니다.
 신뢰할 수 있는 키트 체크아웃에서 설치합니다. 기본 설치 경로는 `~/.local`입니다.
 
 ```sh
 ./scripts/install.sh
 export PATH="$HOME/.local/bin:$PATH"
 kevin-agent-kit --version
+kevin-agent-kit doctor
 kevin-agent-kit demo
 kevin-agent-kit init --global --dry-run
 kevin-agent-kit init --global
@@ -59,6 +64,14 @@ Claude Code에서 마켓플레이스를 추가하고, 플러그인을 설치할 
 대상 브랜치와 검증 명령 후보를 확인합니다. 렌즈별 리뷰 어댑터와 독립 검토·필수
 검증의 서명 출처를 설정하고 어댑터별 번들 범위와 보존 기간을 승인합니다.
 자동 수정에는 작업자 명령과 수정 경로를 승인합니다.
+
+서명·브로커 없이 실제 `codex` 또는 `claude` CLI를 작업자와 리뷰어로 쓰려면
+`kevin-agent-kit init --agent codex`(또는 `claude`)를 실행합니다. 생성된 프로필은
+`trust = "local"`, `isolation = "none"`이며 CLI가 이 계정의 파일·네트워크·자격 증명을
+그대로 쓰므로 일회용 호스트나 컨테이너에서 실행하세요. 키트는 각 명령의 종료 코드와
+리뷰 결과를 기록하고 필수 검증을 후보 체크아웃에서 직접 실행합니다. 이 증거는 서명되지
+않습니다. 독립 증명이 필요하면 격리·서명 방식을 사용합니다.
+
 설정은 `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`에 생성됩니다.
 [프로필과 래퍼 설정](../loop.md)
 
@@ -97,7 +110,8 @@ kevin-agent-kit init --global --uninstall
 `/plugin uninstall kevin-agent-kit@kevin-agent-kit`으로 제거합니다.
 
 키트 체크아웃에서는 `python3 -m core.loop`를 쓸 수 있습니다.
-`./scripts/build.sh`로 설치 파일을 만들고, `./scripts/rename.sh NEW`로 빌드할
+빌드는 커밋된 `HEAD` 트리를 패키징하며 작업 트리가 다르면 거부합니다
+(개발용 `--allow-dirty`). `./scripts/build.sh`로 설치 파일을 만들고, `./scripts/rename.sh NEW`로 빌드할
 CLI와 플러그인 이름을 바꿀 수 있습니다. Python 모듈 이름은 밑줄을 사용합니다.
 [아키텍처](../architecture.md) · [호스팅 어댑터](../hosting.md) · [알려진 이슈](../known-issues.md)
 

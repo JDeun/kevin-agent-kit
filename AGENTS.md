@@ -15,7 +15,8 @@ for running-app screenshots.
 ## Where to look
 
 - [Architecture](docs/architecture.md) describes the coordinator, branch queue,
-  and local merge train.
+  and candidate bundle export. The kit does not merge; the repository owner applies
+  a candidate.
 - [Hosting](docs/hosting.md) describes GitHub and GitLab adapters.
 - [Guards](docs/guards.md) describes the command and change checks.
 - [Ledgers](docs/ledgers.md) describes how choices and resources are recorded.

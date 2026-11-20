@@ -1,12 +1,13 @@
 [project]
 name = "kevin-agent-kit"
-version = "0.3.0"
+version = "0.3.1"
 
 [loop]
 repo = ""
 target = "main"
 max_rounds = 5
 design_gate = true
+trust = "signed"
 repeat_class_rounds = 2
 wiki_landing = true
 wiki_dir = "docs/research"
