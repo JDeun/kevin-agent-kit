@@ -1,0 +1,34 @@
+[project]
+name = "oss-kit"
+version = "0.1.0"
+
+[loop]
+repo = "."
+state = ".agent-queue"
+target = "main"
+max_rounds = 5
+max_jobs = 2
+poll_seconds = 2
+timeout_seconds = 900
+retry_initial_seconds = 15
+retry_limit = 6
+retry_max_seconds = 300
+max_model = "gpt-5.4"
+models = ["gpt-5.4-mini", "gpt-5.4"]
+reviewer_model = "gpt-5.4"
+worker_model = "gpt-5.4-mini"
+reviewer = ["codex", "exec", "--model", "{model}", "--sandbox", "read-only", "-"]
+worker = ["codex", "exec", "--model", "{model}", "--sandbox", "workspace-write", "-"]
+verify = []
+
+[loop.memory.review]
+max_anon_mib = 0
+min_available_mib = 0
+
+[loop.memory.test]
+max_anon_mib = 0
+min_available_mib = 0
+
+[loop.lenses]
+security = ["**/auth/**", "**/security/**", "**/*permissions*", "**/.github/workflows/**"]
+db = ["**/migrations/**", "**/*.sql"]

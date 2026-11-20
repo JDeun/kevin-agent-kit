@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.agent-queue/
+dist/
+node_modules/
