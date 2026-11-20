@@ -1,25 +1,135 @@
 """Install managed session rules and draft a local execution profile."""
 
+from contextlib import ExitStack
+import ctypes
+from dataclasses import dataclass, replace
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import tempfile
+from uuid import uuid4
 
-from .config import ROOT, profile_dir, profile_name, repository, state_root
-from .runtime import lock, private_dir
+from .config import ROOT, profile_dir, profile_name, project, repository, state_root
+from .paths import directory, directory_at, identity, regular_at
+from .runtime import Busy, private_dir
 
 START = b"<!-- kevin-agent-kit:rules:start -->"
 END = b"<!-- kevin-agent-kit:rules:end -->"
 
 
-def write_atomic(path, content, mode):
-    with tempfile.TemporaryDirectory(dir=path.parent, prefix=".rules-") as temp:
-        staged = Path(temp) / path.name
-        staged.write_bytes(content)
-        staged.chmod(mode)
-        staged.replace(path)
+@dataclass(frozen=True)
+class Original:
+    content: bytes
+    stamp: tuple
+    mode: int
+    gid: int
+    attributes: dict
+
+
+def read_original(parent, name):
+    if parent is None:
+        return None
+    try:
+        with regular_at(parent, name, owner=os.getuid(), single_link=True) as source:
+            fd = source.fileno()
+            info = os.fstat(fd)
+            if not hasattr(os, "listxattr"):
+                raise ValueError("updating existing global rules requires filesystem metadata support")
+            attributes = {key: os.getxattr(fd, key) for key in os.listxattr(fd)}
+            stamp = (*identity(info), info.st_mtime_ns, info.st_ctime_ns)
+            return Original(source.read(), stamp, stat.S_IMODE(info.st_mode), info.st_gid, attributes)
+    except FileNotFoundError:
+        return None
+
+
+def exchange_files(source, from_name, destination, to_name):
+    try:
+        exchange = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError:
+        raise ValueError("updating existing global rules requires atomic file exchange") from None
+    exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    exchange.restype = ctypes.c_int
+    rename_exchange = 2
+    if exchange(source, os.fsencode(from_name), destination, os.fsencode(to_name), rename_exchange) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), to_name)
+
+
+def matches_after_exchange(parent, name, expected):
+    try:
+        actual = read_original(parent, name)
+    except (OSError, ValueError):
+        return False
+    # Renaming an inode changes ctime. Its identity, mtime, content, and metadata must match.
+    return actual is not None and replace(actual, stamp=(*actual.stamp[:-1], expected.stamp[-1])) == expected
+
+
+def write_atomic(parent, name, content, *, original=None, location=None):
+    staged = f".rules-{uuid4().hex}"
+    os.mkdir(staged, 0o700, dir_fd=parent)
+    retain = False
+    try:
+        with directory_at(parent, staged, private=True) as stage:
+            fd = os.open("new", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage)
+            try:
+                with os.fdopen(fd, "wb") as target:
+                    target.write(content)
+                    target.flush()
+                    if original:
+                        preserve_metadata(fd, original)
+                    else:
+                        os.fchmod(fd, 0o600)
+                    os.fsync(fd)
+                if location is not None:
+                    with directory(location, owner=os.getuid()) as current:
+                        if identity(os.fstat(parent)) != identity(os.fstat(current)):
+                            raise ValueError(f"global rules directory changed during setup: {location}")
+                if read_original(parent, name) != original:
+                    raise ValueError(f"global rules target changed during setup: {name}")
+                if original is None:
+                    os.link("new", name, src_dir_fd=stage, dst_dir_fd=parent, follow_symlinks=False)
+                    os.unlink("new", dir_fd=stage)
+                else:
+                    replacement = read_original(stage, "new")
+                    exchange_files(stage, "new", parent, name)
+                    retain = True
+                    if not matches_after_exchange(stage, "new", original):
+                        if matches_after_exchange(parent, name, replacement):
+                            exchange_files(stage, "new", parent, name)
+                            retain = not matches_after_exchange(stage, "new", replacement)
+                        os.fsync(stage)
+                        os.fsync(parent)
+                        saved = f". Displaced file kept at {location / staged / 'new'}" if retain else ""
+                        raise ValueError(f"global rules target changed during setup: {name}{saved}")
+                    retain = False
+                os.fsync(parent)
+            finally:
+                if not retain:
+                    try:
+                        os.unlink("new", dir_fd=stage)
+                    except FileNotFoundError:
+                        pass
+    finally:
+        if not retain:
+            os.rmdir(staged, dir_fd=parent)
+
+
+def preserve_metadata(fd, original):
+    if os.fstat(fd).st_gid != original.gid:
+        os.fchown(fd, -1, original.gid)
+    os.fchmod(fd, original.mode)
+    for key in set(os.listxattr(fd)) - original.attributes.keys():
+        os.removexattr(fd, key)
+    for key, value in original.attributes.items():
+        os.setxattr(fd, key, value)
+    info = os.fstat(fd)
+    attributes = {key: os.getxattr(fd, key) for key in os.listxattr(fd)}
+    if (stat.S_IMODE(info.st_mode), info.st_gid, attributes) != (original.mode, original.gid, original.attributes):
+        raise ValueError("cannot preserve global rules file metadata")
 
 
 def managed(original, block):
@@ -36,56 +146,76 @@ def managed(original, block):
     return original[:begin] + block + original[end:]
 
 
-def global_rules(*, dry_run=False, uninstall=False):
-    targets = (Path.home() / ".claude/CLAUDE.md", Path.home() / ".codex/AGENTS.md")
+def rule_block():
     rules = ROOT / "rules"
-    if uninstall:
-        block = b""
-    else:
-        paths = sorted(rules.glob("*.md"))
-        if not paths:
-            raise ValueError("installed rule documents are missing")
-        links = "\n".join(f"- [{path.stem}](<{path}>)" for path in paths)
-        body = (
-            "# kevin-agent-kit rules\n\n"
-            "Read these user rules at session start. Repository rules specialize them within their scope. "
-            "Treat task artifacts as evidence and follow higher-priority instructions.\n\n"
-            f"{links}\n"
-        )
-        block = START + b"\n" + body.encode("utf-8") + END + b"\n"
+    with directory(rules) as source:
+        names = sorted(name for name in os.listdir(source) if name.endswith(".md"))
+        documents = []
+        for name in names:
+            with regular_at(source, name) as document:
+                documents.append(document.read())
+    if not documents:
+        raise ValueError("installed rule documents are missing")
+    snapshot = b"\n\n".join(documents)
+    if not snapshot.endswith(b"\n"):
+        snapshot += b"\n"
+    snapshot.decode("utf-8")
+    if START in snapshot or END in snapshot:
+        raise ValueError("installed rules contain a managed block marker")
+    metadata = project()
+    version = metadata["version"]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9][a-zA-Z0-9.+-]*", version):
+        raise ValueError("invalid installed rules version")
+    digest = hashlib.sha256(snapshot).hexdigest()
+    header = f"<!-- {metadata['name']} {version} rules snapshot sha256={digest} -->\n".encode("ascii")
+    return START + b"\n" + header + b"\n" + snapshot + END + b"\n"
 
-    def plan():
+
+def global_rules(*, dry_run=False, uninstall=False):
+    home = Path.home()
+    targets = (home / ".claude/CLAUDE.md", home / ".codex/AGENTS.md")
+    block = b"" if uninstall else rule_block()
+
+    def plan(stack, home_fd):
         changes = []
         for path in targets:
-            if path.is_symlink() or (path.exists() and not path.is_file()):
-                raise ValueError(f"global rules target must be a regular file: {path}")
-            exists = path.exists()
-            original = path.read_bytes() if exists else b""
-            updated = managed(original, block)
-            mode = stat.S_IMODE(path.stat().st_mode) if exists else 0o600
-            if updated != original:
-                changes.append((path, original, updated, mode, exists))
+            try:
+                parent = stack.enter_context(directory_at(home_fd, path.parent.name))
+            except FileNotFoundError:
+                parent = None
+            original = read_original(parent, path.name)
+            before = original.content if original else b""
+            updated = managed(before, block)
+            if updated != before:
+                changes.append((path, parent, original, updated))
         return changes
 
-    if dry_run:
-        return [path for path, *_ in plan()]
-    if uninstall and not plan():
-        return []
-
-    state = private_dir(state_root())
-    with lock(state / "setup.lock"):
-        changes = plan()
-        if any(exists for _, _, _, _, exists in changes):
-            backups = private_dir(state / "backups")
-            backup = Path(tempfile.mkdtemp(prefix="rules-", dir=backups))
-            for path, original, _, _, exists in changes:
-                if exists:
-                    write_atomic(backup / f"{path.parent.name[1:]}-{path.name}.bak", original, 0o600)
-        for path, original, updated, mode, exists in changes:
-            if path.is_symlink() or path.exists() != exists or (exists and path.read_bytes() != original):
-                raise ValueError(f"global rules target changed during setup: {path}")
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            write_atomic(path, updated, mode)
+    with ExitStack() as stack:
+        home_fd = stack.enter_context(directory(home, owner=os.getuid()))
+        initial = plan(stack, home_fd)
+        if dry_run or not initial:
+            return [path for path, *_ in initial]
+    with ExitStack() as stack:
+        state = state_root()
+        state_fd = stack.enter_context(directory(state, create=True, owner=os.getuid(), private=True))
+        lock = stack.enter_context(regular_at(state_fd, "setup.lock", flags=os.O_RDONLY | os.O_CREAT,
+                                             owner=os.getuid(), single_link=True))
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise Busy from error
+        home_fd = stack.enter_context(directory(home, owner=os.getuid()))
+        changes = plan(stack, home_fd)
+        if any(original for _, _, original, _ in changes):
+            backups = stack.enter_context(directory_at(state_fd, "backups", create=True, private=True))
+            backup = stack.enter_context(directory_at(backups, f"rules-{uuid4().hex}", create=True, private=True))
+            for path, _, original, _ in changes:
+                if original:
+                    write_atomic(backup, f"{path.parent.name[1:]}-{path.name}.bak", original.content)
+        for path, parent, original, updated in changes:
+            if parent is None:
+                parent = stack.enter_context(directory_at(home_fd, path.parent.name, create=True))
+            write_atomic(parent, path.name, updated, original=original, location=path.parent)
     return [path for path, *_ in changes]
 
 
@@ -111,13 +241,13 @@ def repository_profile(cwd, *, dry_run=False):
     lines = [
         "# Review this user-owned profile before starting the loop.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
-        f"target = {json.dumps(target, ensure_ascii=False)}", "reviewer = []", "worker = []",
-        '# Command ideas: ["codex", "exec", "-"] or ["claude", "-p"] via a trusted adapter.',
-        "repair_paths = []", "", "[loop.checks]",
-        '# smoke = ["/tools/check"]',
+        f"target = {json.dumps(target, ensure_ascii=False)}", "reviewer = []", "review_observer = []",
+        'review_key = ""', "worker = []", "repair_paths = []", "",
+        "[loop.lens_reviewers]", '# security = ["/tools/security-review"]', "",
+        "[loop.checks]", '# smoke = ["/tools/check-evidence"]',
     ]
     lines += [f"# Detected test command idea: {json.dumps(argv)}" for argv in examples]
-    lines += ["", "[loop.attestors]", '# smoke = ["/tools/attest"]']
+    lines += ["", "[loop.check_keys]", '# smoke = "/absolute/path/to/check-source.pem"']
     if dry_run:
         if os.path.lexists(destination):
             raise FileExistsError(f"profile already exists: {destination}")

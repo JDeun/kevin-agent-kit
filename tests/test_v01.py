@@ -21,7 +21,7 @@ def test_global_install_preserves_bytes_and_backs_up(tmp_path, monkeypatch):
     installed = [target.read_bytes() for target in targets]
     global_rules()
     assert [target.read_bytes() for target in targets] == installed
-    assert all(blob.startswith(original) and b"rules/" in blob for blob in installed)
+    assert all(blob.startswith(original) and b"rules snapshot sha256=" in blob for blob in installed)
     assert len(list((tmp_path / "state").rglob("*.bak"))) == 2
     global_rules(uninstall=True)
     assert all(target.read_bytes() == original for target in targets)
@@ -130,16 +130,15 @@ def test_review_requires_complete_coverage_and_explicit_protected_resolution():
 
 
 def test_verification_requires_fresh_executed_check_receipt():
-    from core.loop.review import verification
-    import json
+    from core.loop.review import verified_check
 
     request = {"check": "required", "candidate": "current", "run": "fresh"}
-    good = dict(request=request, status="passed", executed=True, tool_version="fixture-1")
-    assert verification(json.dumps(good), request)["executed"]
-    for bad in ("", "{}", json.dumps({**good, "executed": False}),
-                json.dumps({**good, "request": {**request, "run": "previous"}})):
+    good = dict(request=request, status="passed", executed=True, tool_version="fixture-1", execution_id="run-1")
+    assert verified_check(good, request)["executed"]
+    for bad in ({}, {**good, "executed": False}, {**good, "execution_id": ""},
+                {**good, "request": {**request, "run": "previous"}}):
         with pytest.raises(ValueError):
-            verification(bad, request)
+            verified_check(bad, request)
 
 
 def test_sandbox_has_no_host_home_mount_or_verify_credentials(tmp_path, monkeypatch):
@@ -155,14 +154,14 @@ def test_sandbox_has_no_host_home_mount_or_verify_credentials(tmp_path, monkeypa
     policy = execution_policy({"env": {"reviewer": ["KEVIN_TEST_TOKEN"]}})
     review, reviewer_env = command_line(["python3"], workspace, "reviewer", policy)
     worker, worker_env = command_line(["python3"], workspace, "worker", policy)
-    verify, verify_env = command_line(["python3"], workspace, "verify", policy, checks=tmp_path / "baseline")
+    verify, verify_env = command_line(["python3"], None, "verify", policy, bundle=tmp_path / "candidate.bundle")
     assert review[review.index("/workspace") - 2] == "--ro-bind"
     assert worker[worker.index("/workspace") - 2] == "--bind"
     assert worker[worker.index("/workspace/.git") - 2] == "--ro-bind"
     assert review[review.index("--chdir") + 1] == "/home/agent"
     assert worker[worker.index("--chdir") + 1] == "/home/agent"
-    assert verify[verify.index("--chdir") + 1] == "/workspace"
-    assert verify[verify.index("/baseline") - 2] == "--ro-bind"
+    assert "/workspace" not in verify
+    assert verify[verify.index("/candidate.bundle") - 2] == "--ro-bind"
     assert "--unshare-all" in verify and "--share-net" not in verify
     assert all(str(private) not in args for args in (review, worker, verify))
     assert reviewer_env["KEVIN_TEST_TOKEN"] == "fixture"
@@ -213,4 +212,4 @@ assert Path('/workspace/.git').is_dir()
 print('isolated')
 """
     assert execute(["python3", "-I", "-c", script, str(marker)], workspace, Event(), 5,
-                   role="verify", policy=execution_policy({})).strip() == "isolated"
+                   role="reviewer", policy=execution_policy({})).strip() == "isolated"

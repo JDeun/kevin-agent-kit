@@ -146,6 +146,9 @@ class Store:
                 for finding in review["findings"]:
                     if finding["risk"] != "other":
                         protected[lens, finding["id"]] = {**finding, "lens": lens}
+            for finding in evidence["findings"]:
+                if finding["risk"] != "other":
+                    protected[finding["lens"], finding["id"]] = finding
         return list(protected.values())
 
     def status(self):

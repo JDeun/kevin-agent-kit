@@ -14,8 +14,8 @@ issues in isolated worktrees, and gathers verification evidence.
 
 ### 1. Install the CLI and user rules
 
-Install Git and Python 3.11 or later. The live loop also needs Linux with
-working unprivileged Bubblewrap namespaces. Use a trusted checkout of this
+Install Git and Python 3.11 or later. The live loop also needs OpenSSL and
+Linux with working unprivileged Bubblewrap namespaces. Use a trusted checkout of this
 kit. The installer defaults to `~/.local`.
 
 ```sh
@@ -29,7 +29,12 @@ kevin-agent-kit init --global
 
 Persist the `PATH` setting in the shell that launches Claude Code. The demo
 uses bundled fixtures and a temporary Git repository. The global installer
-adds a managed rules block to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
+copies the installed rule text into a managed block in `~/.claude/CLAUDE.md`
+and `~/.codex/AGENTS.md`. Each block records the kit version and content hash.
+Rerun the installer to update the snapshot when you approve a new version.
+The home and client paths must be owned by the current user, with no symlinks
+or group or other write access. Updating existing files requires Linux
+filesystem support for atomic exchange and metadata preservation.
 It backs up each existing file it changes under the kit's XDG state directory.
 Start a new session to load the rules.
 
@@ -48,7 +53,8 @@ See the [Claude Code marketplace guide](https://code.claude.com/docs/en/plugin-m
 
 In the repository you want the loop to review, run `kevin-agent-kit init`.
 Open the printed TOML path and review the detected target and test command
-suggestions. Configure a trusted reviewer wrapper and required check wrappers.
+suggestions. Configure dedicated review adapters and signed evidence sources
+for independent review and required checks.
 Repair is optional and needs both a worker command and an approved path scope.
 The profile lives under `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`.
 See [profile and wrapper setup](docs/loop.md).

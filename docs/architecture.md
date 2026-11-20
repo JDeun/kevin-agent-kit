@@ -3,7 +3,7 @@
 kevin-agent-kit runs a local coordinator for a Git repository. The operator
 approves an executable profile outside the checkout. The coordinator prepares
 a candidate, and the project owner decides whether to apply and publish it.
-See the [candidate-only integration decision](adr/isolated-candidate-preparation.md).
+See the [signed candidate evidence decision](adr/signed-candidate-evidence.md).
 
 ```mermaid
 flowchart TD
@@ -22,7 +22,7 @@ flowchart TD
     Review -->|Protected finding at cap| Blocked["Block and retain evidence"]
     Review -->|Ordinary finding at cap| Record["Human decision record"]
     Record -->|Revise| Queue
-    Review -->|Complete and clean| Verify["Required checks and independent attestations"]
+    Review -->|Signed coverage and clean review| Verify["Required checks from signed sources"]
     Verify -->|Current evidence| Bundle["Exportable candidate bundle"]
     Bundle --> Release{"Repository owner approval"}
 ```

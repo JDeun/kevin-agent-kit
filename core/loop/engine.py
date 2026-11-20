@@ -10,8 +10,9 @@ import time
 from uuid import uuid4
 
 from .config import config, repo_id
+from .evidence import canonical, signed_receipt, source_id
 from .git import Conflict, Git
-from .review import BLOCKING, brief, lenses, prompt, review_receipt, verification
+from .review import BLOCKING, brief, lenses, observed_review, prompt, review_receipt, verified_check
 from .runtime import Cancelled, MemoryGate, Retry, private_dir
 from .sandbox import execute, redact
 from .store import now
@@ -66,12 +67,13 @@ def export_candidate(cfg, evidence, destination):
 
 
 class Engine:
-    def __init__(self, cfg, store, cancel=None, *, runner=execute):
+    def __init__(self, cfg, store, cancel=None, *, runner=execute, authenticate=signed_receipt):
         self.cfg = cfg
         self.store = store
         self.git = Git(cfg["repo"])
         self.cancel = cancel or Event()
         self.runner = runner
+        self.authenticate = authenticate
         self.memory = MemoryGate()
         self.executor = ThreadPoolExecutor(max_workers=cfg["max_jobs"])
         self.active = {}
@@ -90,9 +92,9 @@ class Engine:
         if self.cancel.is_set():
             raise Cancelled
 
-    def command(self, role, argv, work, evidence, *, stdin, baseline=None):
+    def command(self, role, argv, work, evidence, *, stdin, bundle=None):
         self.authority(evidence)
-        limit = self.cfg["memory"]["test" if role in {"verify", "attest"} else "review"]
+        limit = self.cfg["memory"]["test" if role == "verify" else "review"]
         if not self.memory.allows(limit["max_anon_mib"] * 2**20, limit["min_available_mib"] * 2**20):
             raise Retry("stage memory limit")
         extra = {
@@ -103,27 +105,43 @@ class Engine:
         if role in {"reviewer", "worker"}:
             extra["AGENT_MODEL"] = self.cfg[f"{role}_model"]
         return self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
-                           policy=self.cfg["execution"], stdin=stdin, extra=extra, checks=baseline)
+                           policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
 
-    def review(self, work, evidence, paths, prior, history, rounds):
+    def review(self, work, bundle, evidence, paths, prior, history, rounds):
         items = list(prior)
         selected = dict.fromkeys((*lenses(paths, self.cfg["lenses"]), *(item["lens"] for item in prior)))
         for lens in selected:
             previous = [item for item in prior if item["lens"] == lens]
-            request = {**evidence, "lens": lens, "paths": paths, "invocation": uuid4().hex}
+            request = {**evidence, "kind": "review", "lens": lens, "paths": paths, "invocation": uuid4().hex}
+            review = None
             try:
-                argv = self.cfg["lens_reviewers"].get(lens, self.cfg["reviewer"])
-                output = self.command("reviewer", argv, work, evidence,
-                                      stdin=prompt(request, previous))
+                argv = self.cfg["reviewer"] if lens == "general" else self.cfg["lens_reviewers"].get(lens)
+                if not argv:
+                    raise ValueError(f"configure a dedicated review adapter for the {lens} lens")
+                output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous))
                 review = review_receipt(output, request, previous)
+                env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
+                review["tool_version"] = redact(review["tool_version"], env_names)
+                review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
+                for item in review["findings"]:
+                    item["detail"] = redact(item["detail"], env_names)
+                review_input = {"review": review, "prior_protected": previous}
+                observation = {**request, "kind": "review-observation", "invocation": uuid4().hex,
+                               "review_input_sha256": hashlib.sha256(canonical(review_input)).hexdigest()}
+                key = self.cfg["review_key"]
+                output = self.command(
+                    "review-observer", self.cfg["review_observer"], None, evidence, bundle=bundle,
+                    stdin=json.dumps({"request": observation, **review_input}, ensure_ascii=True),
+                )
+                observed = observed_review(self.authenticate(output, key), observation, review["resolved"])
+                review["observation"] = {**observed, "source": source_id(key)}
             except (OSError, ValueError, Retry) as cause:
+                if review is not None:
+                    known = {item["id"] for item in items if item["lens"] == lens}
+                    items.extend({**item, "lens": lens} for item in review["findings"]
+                                 if item["risk"] in BLOCKING and item["id"] not in known)
                 report = {**evidence, "reviews": history, "findings": items, "rounds": rounds}
                 raise InterruptedAttempt(cause, report) from cause
-            env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
-            review["tool_version"] = redact(review["tool_version"], env_names)
-            review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
-            for item in review["findings"]:
-                item["detail"] = redact(item["detail"], env_names)
             review["collected_at"] = now()
             history.append(review)
             items = [item for item in items if item["lens"] != lens]
@@ -141,10 +159,6 @@ class Engine:
             return "included", "source is already included in target", None
         merge_base = self.git.run("merge-base", base, head).stdout.strip()
         with self.git.snapshot(self.cfg["state"], base, head) as (git, root), ExitStack() as repairs:
-            baseline = root / "baseline"
-            baseline.mkdir()
-            git.run("checkout", "--quiet", "--detach", base)
-            git.run("checkout-index", "--all", f"--prefix={baseline}/")
             candidate = git.candidate(base, head)
             evidence = {
                 "repo_id": self.cfg["repo_id"], "target": self.cfg["target"], "base": base,
@@ -152,9 +166,16 @@ class Engine:
                 "policy": self.cfg["policy_id"], "run": uuid4().hex,
             }
             history = []
+            staged = root / "candidate.bundle"
             for rounds in range(1, self.cfg["max_rounds"] + 1):
+                staged.unlink(missing_ok=True)
+                git.bundle(staged, evidence["candidate"])
+                staged.chmod(0o400)
+                with staged.open("rb") as stream:
+                    evidence["bundle_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                evidence["diff_sha256"] = git.diff_digest(base, evidence["candidate"])
                 paths = sorted(git.paths(base, evidence["candidate"]))
-                items = self.review(git.repo, evidence, paths, prior, history, rounds)
+                items = self.review(git.repo, staged, evidence, paths, prior, history, rounds)
                 prior = [item for item in items if item["risk"] in BLOCKING]
                 report = {**evidence, "reviews": history, "rounds": rounds, "findings": items}
                 if not items:
@@ -179,17 +200,14 @@ class Engine:
 
             receipts = []
             for name, argv in sorted(self.cfg["checks"].items()):
-                request = {**evidence, "check": name, "invocation": uuid4().hex}
+                request = {**evidence, "kind": "required-check", "check": name, "invocation": uuid4().hex}
                 try:
-                    output = self.command("verify", argv, git.repo, evidence, stdin=None, baseline=baseline)
-                    observation = {"exit_status": 0, "stdout": output}
-                    attestation = self.command(
-                        "attest", self.cfg["attestors"][name], None, evidence,
-                        stdin=json.dumps({"request": request, "observation": observation}, ensure_ascii=True),
-                    )
+                    output = self.command("verify", argv, None, evidence, bundle=staged,
+                                          stdin=json.dumps({"request": request}, ensure_ascii=True))
+                    key = self.cfg["check_keys"][name]
                     receipts.append({
-                        **verification(attestation, request), "collected_at": now(),
-                        "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                        **verified_check(self.authenticate(output, key), request),
+                        "collected_at": now(), "source": source_id(key),
                     })
                 except (OSError, ValueError, Retry) as cause:
                     raise InterruptedAttempt(cause, {**report, "checks": receipts}) from cause
@@ -198,16 +216,13 @@ class Engine:
             self.authority(evidence)
             directory = private_dir(self.cfg["state"] / "candidates")
             bundle = directory / f"{evidence['run']}.bundle"
-            staged = root / "candidate.bundle"
-            git.bundle(staged, evidence["candidate"])
-            staged.chmod(0o600)
             with staged.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                if hashlib.file_digest(stream, "sha256").hexdigest() != evidence["bundle_sha256"]:
+                    raise Conflict("candidate bundle changed during evidence collection")
             self.authority(evidence)
             staged.replace(bundle)
             return "candidate", "awaiting repository owner", {
                 **report, "checks": receipts, "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
-                "bundle_sha256": digest,
             }
 
     def collect(self, job, future):

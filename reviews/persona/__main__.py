@@ -10,12 +10,12 @@ from threading import Event
 import tomllib
 
 if __package__ == "reviews.persona":
-    from core.loop.config import repository, trusted_profile
+    from core.loop.config import read_profile, repository
     from core.loop.review import rules
     from core.loop.runtime import Retry
     from core.loop.sandbox import execute, execution_policy, redact
 else:
-    from ...core.loop.config import repository, trusted_profile
+    from ...core.loop.config import read_profile, repository
     from ...core.loop.review import rules
     from ...core.loop.runtime import Retry
     from ...core.loop.sandbox import execute, execution_policy, redact
@@ -43,8 +43,8 @@ def _command(value, label):
 
 
 def _load_config(config_path):
-    with trusted_profile(config_path).open("rb") as config_file:
-        config = tomllib.load(config_file)
+    _, contents = read_profile(config_path)
+    config = tomllib.loads(contents.decode("utf-8"))
     alternatives = config.get("alternatives")
     if not isinstance(alternatives, dict) or len(alternatives) < 2:
         raise ValueError("configure at least two commands under [alternatives]")

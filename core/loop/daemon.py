@@ -119,6 +119,14 @@ def validate_execution(cfg):
     if not cfg["reviewer"] or not cfg["checks"]:
         raise ValueError("configure a reviewer and required checks in the trusted profile")
     probe()
+    from .evidence import OPENSSL
+
+    if not cfg["lens_reviewers"].get("security") or not cfg["review_observer"] or not cfg["review_key"]:
+        raise ValueError("configure a dedicated security reviewer and an independent signed review observer")
+    if not {"review-observer", "verify"} <= cfg["execution"]["sockets"].keys():
+        raise ValueError("configure distinct broker sockets for review observation and required checks")
+    if not os.access(OPENSSL, os.X_OK):
+        raise ValueError("OpenSSL is required to verify signed evidence")
 
 
 def start(cfg):

@@ -1,7 +1,7 @@
 # Run the review queue
 
-The live loop requires Linux, Git, Python 3.11 or later, and Bubblewrap at
-`/usr/bin/bwrap`. Bubblewrap must support user, mount, PID, and network
+The live loop requires Linux, Git, Python 3.11 or later, OpenSSL 3 at
+`/usr/bin/openssl`, and Bubblewrap at `/usr/bin/bwrap`. Bubblewrap must support user, mount, PID, and network
 namespaces and the `--disable-userns` option. Startup probes this boundary
 before starting any configured commands. The built-in `demo` uses only
 embedded fixtures and can run without Bubblewrap.
@@ -23,32 +23,45 @@ user-owned regular files outside the repository, and substitute your paths.
 repo = "/home/example/projects/widgets"
 target = "main"
 reviewer = ["/tools/review"]
+review_observer = ["/tools/observe-review"]
+review_key = "/home/example/kit-keys/review-source.pem"
 worker = ["/tools/repair"]
 repair_paths = ["src/**", "tests/unit/test_widget.py"]
 
 [loop.lens_reviewers]
 security = ["/tools/security-review"]
+db = ["/tools/db-review"]
 
 [loop.checks]
-unit = ["/tools/run-unit"]
+unit = ["/tools/check-evidence"]
 
-[loop.attestors]
-unit = ["/tools/attest-unit"]
+[loop.check_keys]
+unit = "/home/example/kit-keys/check-source.pem"
 
 [loop.execution.tools]
 review = "/home/example/kit-tools/review"
 security-review = "/home/example/kit-tools/security-review"
+db-review = "/home/example/kit-tools/db-review"
+observe-review = "/home/example/kit-tools/observe-review"
 repair = "/home/example/kit-tools/repair"
-run-unit = "/home/example/kit-tools/run-unit"
-attest-unit = "/home/example/kit-tools/attest-unit"
+check-evidence = "/home/example/kit-tools/check-evidence"
+
+[loop.execution.sockets]
+review-observer = "/home/example/kit-brokers/review-evidence.sock"
+verify = "/home/example/kit-brokers/check-evidence.sock"
 ```
 
 Reviewers and workers run in separate invocations. Put executable wrappers
 or binaries in `[loop.execution.tools]` and address them under `/tools`.
+Only a registered executable or an exact `/tools/NAME` argument makes a tool
+file visible to that invocation. Pass required helper paths explicitly. Keep
+tool files outside the checkout, state, and shared system mounts in directories
+protected from other users' writes. Symlinks and hard links are rejected. The
+sandbox checks the approved file identity and bytes and mounts a read-only copy.
 Use `/usr/bin` for system interpreters. The default environment gives each
 invocation a fresh `HOME` and private temporary paths. The sandbox mounts
-the checkout at `/workspace` and the kit rules at `/rules`. Reviewers and
-checks have read-only access to the checkout. A worker can edit the checkout
+the kit rules at `/rules` and the agent checkout at `/workspace`. Reviewers
+have read-only access to the checkout. A worker can edit the checkout
 and has read-only access to its isolated Git metadata. Reviewer and worker
 commands start from a fresh home directory. Use `AGENT_WORKSPACE` to address
 the checkout as data and keep client project instruction, hook, plugin, and
@@ -76,23 +89,27 @@ role. For example, set `reviewer = "/absolute/path/to/model.sock"` in
 The broker holds the provider credentials and enforces request and data
 limits. Provide the broker and client adapter for your setup. Keep any
 optional `[loop.execution.env]` arrays role-specific, such as
-`reviewer = ["MODEL_PROFILE"]`. Unlisted host environment variables and
-host home credentials are unavailable. Checks and attestors receive no
-credential forwarding or broker socket.
+`reviewer = ["MODEL_PROFILE"]`. Keep provider credentials in the broker
+and limit its capabilities to the named role. Evidence adapters get their own
+separate broker sockets through `AGENT_EVIDENCE_SOCKET` and run with a
+fresh environment.
 
 ## Review receipts
 
-The general and security lenses always run in independent processes.
-Additional installed lenses can be selected by path rules. Assign a
-different trusted reviewer to a lens through `[loop.lens_reviewers]`.
+The general and security lenses always use separate registered adapters.
+Additional installed lenses selected by path rules also need dedicated
+adapters. Set `reviewer` for the general lens and use
+`[loop.lens_reviewers]` for each other lens.
 Use the scope, stable finding IDs, and JSON output contract printed in the
 review prompt. The final prompt line is a JSON input object containing the
-exact request and prior protected findings. The wrapper checks that the
-reviewer finished and covered the supplied scope. It returns one receipt
-binding the exact request, ordered paths, tool version, diagnostics,
-findings, and explicit resolution evidence for any closed protected IDs.
-A partial response, skipped check, open protection finding, or missing
-evidence blocks candidate export.
+exact request and prior protected findings. The primary adapter returns one
+receipt binding the exact request, ordered paths, tool version, diagnostics,
+findings, and evidence for proposed protected closures. The separate review
+observer checks scope and completion using its source's own run telemetry
+and the exact diff. For each proposed closure, it obtains a separately
+attributable review and records concrete resolution evidence signed by the
+observer's source. The coordinator requires that independent evidence
+before closing the finding.
 
 Wrap model calls so model errors and truncated output remain failures.
 Read repository material, prior findings, and persona artifacts as data.
@@ -100,25 +117,62 @@ Tool permissions and allowed destinations come from the profile and broker.
 Use exit code 75 for a temporary condition. Capacity retries and timeouts
 use capped backoff. Other nonzero exits block the job.
 
-## Required checks and attestors
+## Signed evidence sources
 
-For each named check, configure one check command and one attestor. The check
-runs with the exact candidate and with a read-only snapshot of the target
-at `/baseline`. Supply mandatory tests from the trusted wrapper or baseline,
-and compare the tested head with `AGENT_CANDIDATE`. Use candidate-owned tests
-as supplementary evidence. For test commands that let candidate code run,
-keep the wrapper outside their address space and collect actual test counts and
-results before reporting a pass.
+The observer and check adapters receive a fresh `request` on stdin and a
+read-only Git bundle at `AGENT_CANDIDATE_BUNDLE`. Each adapter sends the
+bundle and request to its configured evidence broker. The request binds
+the repository, base, source, candidate, bundle digest, policy, named
+operation, and fresh invocation. Verify the bundle digest and check the
+exact candidate commit at the source before starting its work.
 
-The check runs with closed stdin. After a zero exit, the coordinator starts
-the attestor in a separate sandbox without the candidate or baseline mount.
-The attestor reads a JSON object with the coordinator's fresh `request`
-and an `observation` containing the exit status and observed stdout. Treat
-stdout as untrusted data. Validate the actual named check output, then
-return a JSON object with the exact `request`, `status: "passed"`,
-`executed: true`, and a nonempty `tool_version`. The coordinator stores
-the attestation, collection time, and observed output digest. A check's
-output alone cannot supply the attestation.
+For required checks, run the approved check policy in a separate execution
+environment. Observe execution and results from a trusted supervisor or CI
+control plane. Keep the check definition, run telemetry, and signing key
+outside candidate-writable storage and candidate processes. Use repository
+tests as supplementary evidence when they can alter reporting in their own
+process. The source issues a receipt only for a fresh, successful execution
+of the requested check on the exact candidate. It includes the original
+`request`, `status: "passed"`, `executed: true`, the source's
+`execution_id`, and a nonempty `tool_version`.
+
+The observer receives `request`, `review`, and `prior_protected` on
+stdin. Verify `request.review_input_sha256` against the canonical JSON
+object containing `review` and `prior_protected`.
+Collect the observed paths and hash of the complete patch reviewed by the
+primary adapter. Compute the patch in an isolated Git repository using the
+requested base and candidate.
+
+```sh
+GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+  git -c core.quotePath=false diff --binary --full-index --no-renames --no-ext-diff --no-textconv \
+  --no-color --src-prefix=a/ --dst-prefix=b/ --ignore-submodules=none \
+  --submodule=short "$base" "$candidate" --
+```
+
+A completed observer receipt includes the original `request`, a `status`
+of `complete`, `tool_version`, its own `execution_id`, `reviewed_paths`
+in request order, `coverage_sha256`, an empty `diagnostics` array, the
+independent `reviewer_id`, and `resolved` with evidence for each proposed
+protected closure. A partial review or a closure lacking independent
+evidence blocks export. Authenticate the independent reviewer at the source
+before signing.
+
+Both adapters return a JSON envelope with `payload` and `signature`.
+Sign the payload with Ed25519 and encode the signature in standard Base64.
+Serialize as ASCII JSON with sorted keys, escaped Unicode, compact
+separators, and no trailing line break.
+Python sources can use `json.dumps(payload, ensure_ascii=True, sort_keys=True,
+separators=(",", ":"), allow_nan=False).encode("ascii")`. Install only each
+source's PEM public key in the trusted profile. Keep the observer signing key
+separate from the check signing keys and keep all private keys at their
+respective sources. The coordinator validates the signatures, requests, and
+receipt fields before authorizing export. It records the public key fingerprint
+and external execution ID with the evidence.
+
+Replace legacy `[loop.attestors]` configurations with signed check sources
+in `[loop.checks]` and keys in `[loop.check_keys]`. The local demo uses
+embedded fixture sources.
 
 ## Queue operation and export
 

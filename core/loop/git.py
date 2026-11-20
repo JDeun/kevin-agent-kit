@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -56,8 +57,16 @@ class Git:
         return Path(result.stdout.rstrip("\n")).resolve()
 
     def paths(self, *revs):
-        changed = self.run("diff", "--name-only", "--no-renames", "-z", *revs, "--").stdout
+        changed = self.run("diff", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", *revs, "--").stdout
         return changed.rstrip("\0").split("\0") if changed else []
+
+    def diff_digest(self, base, candidate):
+        with tempfile.TemporaryFile() as patch:
+            self.run("diff", "--binary", "--full-index", "--no-renames", "--no-ext-diff",
+                     "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/",
+                     "--ignore-submodules=none", "--submodule=short", base, candidate, "--", stdout=patch)
+            patch.seek(0)
+            return hashlib.file_digest(patch, "sha256").hexdigest()
 
     def ancestor(self, base, head):
         result = self.run("merge-base", "--is-ancestor", base, head, allowed=(0, 1))

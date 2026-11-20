@@ -18,12 +18,14 @@ models = ["default"]
 reviewer_model = "default"
 worker_model = "default"
 reviewer = []
+review_observer = []
+review_key = ""
 worker = []
 repair_paths = []
 
 [loop.checks]
 
-[loop.attestors]
+[loop.check_keys]
 
 [loop.lens_reviewers]
 

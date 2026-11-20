@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,38 +49,42 @@ import sys
 assert "Use the expected text." in sys.stdin.read()
 Path("example.txt").write_text("correct" + chr(10))
 """
-    verify = """
-import os
-from pathlib import Path
-import subprocess
-assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() == os.environ["AGENT_CANDIDATE"]
-assert Path("example.txt").read_text().strip() == "correct"
-print("example checked")
-"""
-    attest = """
-import json
-import sys
-data = json.load(sys.stdin)
-request = data["request"]
-assert data["observation"] == {"exit_status": 0, "stdout": "example checked" + chr(10)}
-print(json.dumps(dict(request=request, status="passed", tool_version="demo", executed=True)))
-"""
-
-    def demo_runner(argv, cwd, cancel, timeout, *, stdin, extra, **_):
+    def demo_runner(argv, cwd, cancel, timeout, *, role, stdin, extra, bundle, **_):
+        if role in {"verify", "review-observer"}:
+            request = json.loads(stdin)["request"]
+            with bundle.open("rb") as stream:
+                assert hashlib.file_digest(stream, "sha256").hexdigest() == request["bundle_sha256"]
+            with tempfile.TemporaryDirectory(dir=root) as temp:
+                checked = Git(Path(temp))
+                checked.run("init", "--quiet", "--template=")
+                checked.run("bundle", "unbundle", str(bundle))
+                sha = request["candidate"]
+                result = dict(request=request, tool_version="demo", execution_id=request["invocation"])
+                if role == "verify":
+                    assert checked.run("show", f"{sha}:example.txt").stdout.strip() == "correct"
+                    return json.dumps(dict(result, status="passed", executed=True))
+                paths = sorted(checked.paths(request["base"], sha))
+                digest = checked.diff_digest(request["base"], sha)
+                return json.dumps(dict(result, status="complete", reviewed_paths=paths, diagnostics=[],
+                                       coverage_sha256=digest, reviewer_id="demo-observer", resolved={}))
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", **extra}
         return run(argv, cwd, cancel, timeout, prompt=stdin, env=env)
 
+    review_command = [sys.executable, "-I", "-c", reviewer]
     cfg = dict(
         repo=repo, state=state, target="main", repo_id=repo_id(git.common()), policy_id="demo",
-        reviewer=[sys.executable, "-I", "-c", reviewer], reviewer_model="demo",
+        reviewer=review_command, reviewer_model="demo", review_observer=["observe-fixture"],
+        review_key=b"demo-review-source", check_keys={"example": b"demo-check-source"},
         worker=[sys.executable, "-I", "-c", worker], worker_model="demo",
-        checks={"example": [sys.executable, "-I", "-c", verify]}, repair_paths=["example.txt"],
-        attestors={"example": [sys.executable, "-I", "-c", attest]},
-        lenses={}, lens_reviewers={}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
+        checks={"example": ["check-fixture"]}, repair_paths=["example.txt"],
+        lenses={}, lens_reviewers={"security": review_command}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
         evidence_ttl_seconds=60, retry_limit=1, retry_initial_seconds=1, retry_max_seconds=1,
         memory={stage: {"max_anon_mib": 0, "min_available_mib": 0} for stage in ("review", "test")},
     )
-    with Store(state, cfg["repo_id"], cfg["target"]).connect() as store, Engine(cfg, store, runner=demo_runner) as engine:
+    # The standalone demo uses only its in-process fixture sources.
+    with Store(state, cfg["repo_id"], cfg["target"]).connect() as store, Engine(
+        cfg, store, runner=demo_runner, authenticate=lambda raw, _: json.loads(raw),
+    ) as engine:
         store.enqueue("change", initial)
         store.enqueue("change", initial)
         deadline = time.monotonic() + 15

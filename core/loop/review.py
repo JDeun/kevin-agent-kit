@@ -29,6 +29,10 @@ def receipt(raw, request, status):
         payload = json.loads(raw)
     except (ValueError, RecursionError):
         raise ValueError("runner must return one JSON receipt") from None
+    return exact_receipt(payload, request, status)
+
+
+def exact_receipt(payload, request, status):
     if (not isinstance(payload, dict) or payload.get("request") != request
             or payload.get("status") != status
             or not nonempty(payload.get("tool_version"))):
@@ -71,11 +75,34 @@ def findings(raw, request, prior):
     return review_receipt(raw, request, prior)["findings"]
 
 
-def verification(raw, request):
-    payload = receipt(raw, request, "passed")
+def execution_id(payload):
+    value = payload.get("execution_id")
+    if not isinstance(value, str) or not FINDING_ID.fullmatch(value):
+        raise ValueError("signed evidence requires an external execution ID")
+    return value
+
+
+def verified_check(payload, request):
+    exact_receipt(payload, request, "passed")
     if payload.get("executed") is not True:
         raise ValueError("required check did not attest to execution")
-    return {"request": request, "status": "passed", "executed": True, "tool_version": payload["tool_version"]}
+    return {"request": request, "status": "passed", "executed": True, "tool_version": payload["tool_version"],
+            "execution_id": execution_id(payload)}
+
+
+def observed_review(payload, request, closed):
+    exact_receipt(payload, request, "complete")
+    reviewer_id = payload.get("reviewer_id")
+    resolved = payload.get("resolved")
+    if (payload.get("reviewed_paths") != request["paths"] or payload.get("diagnostics") != []
+            or payload.get("coverage_sha256") != request["diff_sha256"]
+            or not isinstance(reviewer_id, str) or not FINDING_ID.fullmatch(reviewer_id)
+            or not isinstance(resolved, dict) or set(resolved) != set(closed)
+            or any(not nonempty(value) for value in resolved.values())):
+        raise ValueError("independent review coverage or protected resolution evidence is incomplete")
+    return {"request": request, "status": "complete", "tool_version": payload["tool_version"],
+            "reviewed_paths": payload["reviewed_paths"], "reviewer_id": reviewer_id, "resolved": resolved,
+            "execution_id": execution_id(payload), "coverage_sha256": payload["coverage_sha256"]}
 
 
 def rules():

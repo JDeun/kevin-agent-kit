@@ -1,6 +1,7 @@
 ---
-status: accepted
+status: superseded
 date: 2026-11-20
+superseded-by: signed-candidate-evidence
 ---
 
 # Prepare isolated candidates for human integration

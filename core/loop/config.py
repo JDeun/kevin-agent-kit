@@ -5,6 +5,8 @@ import re
 import stat
 import tomllib
 
+from .paths import directory, regular_at
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PREFIX = __package__.removesuffix("core.loop")
 ROOT = PACKAGE_ROOT.parent if MODULE_PREFIX else PACKAGE_ROOT
@@ -62,25 +64,26 @@ def profile_name(repo, common):
     return f"{re.sub(r'[^a-zA-Z0-9_-]', '-', repo.name)[:48]}-{repo_id(common)[:16]}.toml"
 
 
-def trusted_profile(path):
+def read_profile(path):
     from .git import Conflict, Git
 
-    directory = profile_dir()
+    folder = profile_dir()
     path = Path(os.path.abspath(path))
-    if path.parent != directory or path.suffix != ".toml":
-        raise ValueError(f"executable settings must be in trusted profiles under {directory}")
-    for entry in (directory.parent, directory, path):
+    if path.parent != folder or path.suffix != ".toml":
+        raise ValueError(f"executable settings must be in trusted profiles under {folder}")
+    for entry in (folder.parent, folder, path):
         info = entry.lstat()
         kind = stat.S_ISREG if entry == path else stat.S_ISDIR
         if not kind(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
             raise ValueError(f"untrusted profile path: {entry}")
     try:
-        Git(directory.resolve()).run("rev-parse", "--git-dir")
+        Git(folder.resolve()).run("rev-parse", "--git-dir")
     except Conflict:
         pass
     else:
         raise ValueError("trusted profiles must be outside Git checkouts")
-    return path
+    with directory(folder, owner=os.getuid()) as parent, regular_at(parent, path.name, owner=os.getuid()) as stream:
+        return path, stream.read()
 
 
 def strings(value, key):
@@ -89,11 +92,13 @@ def strings(value, key):
     return value
 
 
-def policy_id(raw, tools):
+def policy_id(raw, execution, keys):
     code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
     lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
     rules = sorted((ROOT / "rules").glob("*.md"))
-    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules, *tools)))
+    tools = [repr(tool).encode("utf-8", errors="surrogateescape") for tool in execution["tools"].values()]
+    sockets = [repr(socket).encode("utf-8", errors="surrogateescape") for socket in execution["sockets"].values()]
+    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules)), *tools, *sockets, *keys)
 
 
 def config(path=None, *, control_only=False):
@@ -102,11 +107,15 @@ def config(path=None, *, control_only=False):
     if path is None:
         repo, common, _ = repository(Path.cwd())
         path = profile_dir() / profile_name(repo, common)
-    path = trusted_profile(path)
-    overrides = path.read_bytes()
+    path, overrides = read_profile(path)
     settings = tomllib.loads(overrides.decode()).get("loop")
-    if not isinstance(settings, dict) or settings.keys() - data.keys():
+    if not isinstance(settings, dict):
         raise ValueError("invalid or unsupported [loop] profile settings")
+    if not control_only:
+        if "attestors" in settings:
+            raise ValueError("replace legacy attestors with signed sources in check_keys and checks")
+        if settings.keys() - data.keys():
+            raise ValueError("invalid or unsupported [loop] profile settings")
     if not isinstance(settings.get("repo"), str) or not Path(settings["repo"]).is_absolute():
         raise ValueError("profile repo must be an absolute checkout path")
     data.update(settings)
@@ -126,16 +135,16 @@ def config(path=None, *, control_only=False):
                 "retry_limit", "retry_max_seconds", "evidence_ttl_seconds"):
         if type(data[key]) is not int or data[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
-    for key in ("reviewer", "worker", "repair_paths", "models"):
+    for key in ("reviewer", "review_observer", "worker", "repair_paths", "models"):
         strings(data[key], key)
-    for key in ("checks", "attestors", "lens_reviewers"):
+    for key in ("checks", "lens_reviewers"):
         if not isinstance(data[key], dict):
             raise ValueError(f"{key} must be a table of named argv arrays")
         for name, command in data[key].items():
             if not NAME.fullmatch(name) or not strings(command, name):
                 raise ValueError(f"invalid {key} name or command")
-    if data["checks"].keys() != data["attestors"].keys():
-        raise ValueError("each required check needs an independent attestor")
+    if not isinstance(data["check_keys"], dict) or data["checks"].keys() != data["check_keys"].keys():
+        raise ValueError("each required check needs an approved public key")
     for role in ("reviewer", "worker"):
         order = data["models"]
         model, ceiling = data[f"{role}_model"], data["max_model"]
@@ -164,11 +173,39 @@ def config(path=None, *, control_only=False):
             if type(value) is not int or value < 0:
                 raise ValueError(f"memory.{stage}.{key} must be a nonnegative integer")
             memory[stage][key] = value
-    from .sandbox import execution_policy
+    from .evidence import public_key
+    from .sandbox import command_tools, execution_policy, outside_path
 
-    execution = execution_policy(data["execution"], forbidden=(repo, common, state.resolve()))
+    forbidden = (repo, common, state.resolve())
+    execution = execution_policy(data["execution"], forbidden=forbidden)
+    review_key = b"" if data["review_key"] == "" else public_key(outside_path(data["review_key"], forbidden))
+    check_keys = {name: public_key(outside_path(key, forbidden)) for name, key in data["check_keys"].items()}
+    if review_key and review_key in check_keys.values():
+        raise ValueError("review observation and check execution require separate signing keys")
+    if "general" in data["lens_reviewers"]:
+        raise ValueError("configure the general lens with reviewer")
+    review_tools = []
+    adapters = [data["reviewer"], *data["lens_reviewers"].values(), data["review_observer"]]
+    for argv in adapters:
+        if argv:
+            tools = command_tools(argv, execution)
+            tool = tools.get(argv[0].removeprefix("/tools/"))
+            if not argv[0].startswith("/tools/") or not tool or not tool.executable:
+                raise ValueError("review commands need an executable registered under /tools")
+            if any(tool.inode == other.inode or tool.digest == other.digest for other in review_tools):
+                raise ValueError("each lens and the review observer need distinct review adapters")
+            review_tools.append(tool)
+    for argv in data["checks"].values():
+        tools = command_tools(argv, execution)
+        tool = tools.get(argv[0].removeprefix("/tools/"))
+        if not argv[0].startswith("/tools/") or not tool or not tool.executable:
+            raise ValueError("check commands need an executable registered under /tools")
+        if any(tool.inode == other.inode or tool.digest == other.digest for other in review_tools):
+            raise ValueError("check and review adapters must be separate")
+    command_tools(data["worker"], execution)
     data.update(
         repo=repo, state=state, repo_id=identity, profile=path, execution=execution, memory=memory,
-        policy_id=policy_id(raw + overrides, execution["tools"].values()),
+        review_key=review_key, check_keys=check_keys,
+        policy_id=policy_id(raw + overrides, execution, (review_key, *check_keys.values())),
     )
     return data

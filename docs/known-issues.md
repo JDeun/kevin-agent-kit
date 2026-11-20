@@ -15,8 +15,9 @@ Finding numbers refer to the v0.1 pre-release audit.
 | M16 | Per-command time and output limits, per-loop concurrency, and a repair cap are available. Cross-project quotas, provider usage metering, and hard CPU, memory and disk quotas are pending. |
 | L01 | Managed rule blocks support dry runs, upgrades, backups, and removal. The standalone CLI installer fails on an occupied prefix. Binary upgrade and rollback need a separate workflow. |
 
-The review contract can require exact scope and explicit closure evidence.
-Review quality depends on the trusted adapter and reviewer. For hosted CI,
+The review contract requires independently signed coverage and protected
+closure evidence. Review quality depends on the approved review source.
+For hosted CI,
 the provider adapter checks an exact published candidate, base, run and
 mandatory checks. The operator still approves which CI source and test
 policy are authoritative.
