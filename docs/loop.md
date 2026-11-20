@@ -7,10 +7,10 @@ branch-and-commit job. Use a trusted, private state directory outside the checko
 workers edit.
 
 ```sh
-@PROJECT_NAME@ --config queue.toml start
-@PROJECT_NAME@ --config queue.toml enqueue topic/example "$(git rev-parse topic/example)"
-@PROJECT_NAME@ --config queue.toml status
-@PROJECT_NAME@ --config queue.toml stop
+kevin-agent-kit --config queue.toml start
+kevin-agent-kit --config queue.toml enqueue topic/example "$(git rev-parse topic/example)"
+kevin-agent-kit --config queue.toml status
+kevin-agent-kit --config queue.toml stop
 ```
 
 The equivalent source command is `python3 -m core.loop`. Call `run` for a foreground process
@@ -67,7 +67,7 @@ When only other findings remain at the cap, the coordinator writes an accept rec
 start a fresh repair budget or `defer` to leave the source for later work.
 
 ```sh
-@PROJECT_NAME@ --config queue.toml decide 1 revise --source 'Maintainer review'
+kevin-agent-kit --config queue.toml decide 1 revise --source 'Maintainer review'
 ```
 
 ## Merge train

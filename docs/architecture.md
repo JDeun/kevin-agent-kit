@@ -1,6 +1,6 @@
 # Architecture
 
-@PROJECT_NAME@ runs a local coordinator for a Git repository. The operator
+kevin-agent-kit runs a local coordinator for a Git repository. The operator
 configures the agent commands and the verification command. The coordinator
 moves reviewed work through the loop while the project owner decides which
 design to build, when to release, and when to clean up shared resources.

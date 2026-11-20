@@ -1,5 +1,10 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
+module=guards
+if [ ! -f "$root/project.toml" ]; then
+    module="$(basename -- "$root").guards"
+    root=$(dirname -- "$root")
+fi
 export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -P -m guards agent-sec scan "$@"
+exec python3 -P -m "$module" agent-sec scan "$@"

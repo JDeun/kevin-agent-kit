@@ -1,6 +1,8 @@
 {
-  "name": "@PROJECT_NAME@",
+  "name": "kevin_agent_kit",
   "description": "Coordinate implementation, review and integration with human decisions.",
   "version": "@PROJECT_VERSION@",
-  "author": {"name": "Project contributors"}
+  "author": {"name": "JDeun"},
+  "repository": "https://github.com/JDeun/kevin-agent-kit.git",
+  "license": "MIT"
 }

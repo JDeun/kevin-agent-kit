@@ -5,7 +5,10 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core.ledgers.store import iso_date, nonempty, read_records, transact
+if __package__ == "guards":
+    from core.ledgers.store import iso_date, nonempty, read_records, transact
+else:
+    from ..core.ledgers.store import iso_date, nonempty, read_records, transact
 
 from .security import scan
 

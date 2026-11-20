@@ -9,7 +9,10 @@ import tempfile
 from threading import Event
 import tomllib
 
-from core.loop.runtime import Retry, run as run_command
+if __package__ == "reviews.persona":
+    from core.loop.runtime import Retry, run as run_command
+else:
+    from ...core.loop.runtime import Retry, run as run_command
 
 
 REVIEW_PROMPTS = {

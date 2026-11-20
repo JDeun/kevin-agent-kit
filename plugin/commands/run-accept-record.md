@@ -1,7 +1,7 @@
 ---
-description: Run the accept-record skill for @PROJECT_NAME@.
+description: Run the accept-record skill for kevin-agent-kit.
 ---
 
-Use the `@PROJECT_NAME@:accept-record` skill. Validate paths or IDs before running commands.
+Use the `kevin_agent_kit:accept-record` skill. Validate paths or IDs before running commands.
 
 Arguments: $ARGUMENTS

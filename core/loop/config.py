@@ -2,7 +2,9 @@ import re
 import tomllib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+MODULE_PREFIX = __package__.removesuffix("core.loop")
+ROOT = PACKAGE_ROOT.parent if MODULE_PREFIX else PACKAGE_ROOT
 NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 
 

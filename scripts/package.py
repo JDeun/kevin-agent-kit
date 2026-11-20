@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -10,24 +11,24 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from core.loop.config import NAME, project
 
-TOKEN = "@PROJECT_NAME@"
-ENTRIES = ("project.toml", "LICENSE", "README.md", "AGENTS.md", "core", "docs",
-           "agents", "reviews", "guards", "verify", "plugin")
+RUNTIME = ("core", "reviews", "guards", "verify")
+DOCUMENTS = ("reviews/persona/README.md", "verify/README.md")
+ENTRIES = ("project.toml", "LICENSE", "README.md", "AGENTS.md", "docs", "agents", "plugin")
 
 
-def copy_tree(source, target, name, version):
+def copy_tree(source, target, render):
     if source.is_symlink():
         raise ValueError(f"symlinks are outside the package inputs: {source}")
     if source.is_dir():
         target.mkdir(parents=True, exist_ok=True)
         for item in sorted(source.iterdir()):
             if item.name not in {"__pycache__", "node_modules", ".pytest_cache", ".venv"}:
-                copy_tree(item, target / item.name.replace(TOKEN, name), name, version)
+                copy_tree(item, target / render(item.name), render)
         return
+    target.parent.mkdir(parents=True, exist_ok=True)
     if source.suffix in (".md", ".json"):
         content = source.read_text(encoding="utf-8")
-        target.write_text(
-            content.replace(TOKEN, name).replace("@PROJECT_VERSION@", version), encoding="utf-8")
+        target.write_text(render(content), encoding="utf-8")
     else:
         shutil.copy2(source, target)
 
@@ -35,11 +36,23 @@ def copy_tree(source, target, name, version):
 def build(destination):
     meta = project(ROOT)
     name = meta["name"]
+    module = name.replace("-", "_")
+    # Render the upstream brand in source docs and plugin templates, keeping its URL.
+    manifest = json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
+    upstream = Path(manifest["repository"]).name.removesuffix(".git")
+    names = {upstream: name, manifest["name"]: module}
+    alternatives = "|".join(re.escape(value) for value in names)
+    brand = re.compile(rf"(?<![\w-])(?:{alternatives})(?![\w-]|\.git)")
+
+    def render(content):
+        return brand.sub(lambda match: names[match[0]], content).replace(
+            "@PROJECT_VERSION@", meta["version"])
+
     destination = destination or ROOT / "dist" / name
     if destination.is_symlink():
         raise ValueError(f"build output cannot be a symlink: {destination}")
     destination = destination.resolve()
-    if any(destination.is_relative_to(ROOT / entry) for entry in ENTRIES):
+    if any(destination.is_relative_to(ROOT / entry) for entry in (*ENTRIES, *RUNTIME)):
         raise ValueError(f"build output cannot be inside a package input: {destination}")
     if destination.exists():
         raise ValueError(f"build output already exists: {destination}")
@@ -47,18 +60,24 @@ def build(destination):
     with tempfile.TemporaryDirectory(dir=destination.parent, prefix=".build-") as temp:
         stage = Path(temp) / "product"
         stage.mkdir()
-        for entry in ENTRIES:
-            copy_tree(ROOT / entry, stage / entry, name, meta["version"])
+        for entry in (*ENTRIES, *DOCUMENTS):
+            copy_tree(ROOT / entry, stage / entry, render)
+        package = stage / module
+        for entry in RUNTIME:
+            copy_tree(ROOT / entry, package / entry, render)
+        (package / "__init__.py").touch()
+        (package / "__main__.py").write_text(
+            "from .core.loop.__main__ import main\n\nraise SystemExit(main())\n", encoding="utf-8")
         shutil.copy2(ROOT / "LICENSE", stage / "plugin" / "LICENSE")
-        (stage / "bin").mkdir()
+        (stage / "bin").mkdir(exist_ok=True)
         command = stage / "bin" / name
         command.write_text(
             "#!/bin/sh\n"
             "set -eu\n"
             'root=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)\n'
-            f'if [ ! -d "$root/core/loop" ]; then root="$root/share/{name}"; fi\n'
+            f'if [ ! -f "$root/{module}/__main__.py" ]; then root="$root/share/{name}"; fi\n'
             'export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"\n'
-            'exec python3 -P -m core.loop "$@"\n',
+            f'exec python3 -P -m {module} "$@"\n',
             encoding="utf-8",
         )
         command.chmod(0o755)

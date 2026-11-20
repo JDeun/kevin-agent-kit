@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 
-from .config import config, project
+from .config import MODULE_PREFIX, ROOT, config, project
 from .daemon import notify, running, serve, start
 from .engine import Engine
 from .git import Git
@@ -91,9 +91,9 @@ def main(argv=None):
         "screenshot": "verify.screenshot",
     }
     if argv and argv[0] in modules:
-        root = Path(__file__).resolve().parents[2]
-        env = {**os.environ, "PYTHONPATH": str(root)}
-        os.execve(sys.executable, [sys.executable, "-P", "-m", modules[argv[0]], *argv[1:]], env)
+        module = MODULE_PREFIX + modules[argv[0]]
+        env = {**os.environ, "PYTHONPATH": str(ROOT)}
+        os.execve(sys.executable, [sys.executable, "-P", "-m", module, *argv[1:]], env)
     parser = argparse.ArgumentParser(prog=project()["name"])
     parser.add_argument("--config", type=Path, help="load loop overrides from a TOML file")
     commands = parser.add_subparsers(dest="action", required=True)

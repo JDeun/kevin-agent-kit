@@ -7,6 +7,7 @@ import sys
 from threading import Event
 import time
 
+from .config import ROOT
 from .engine import Engine
 from .runtime import Busy, lock
 from .store import Store
@@ -74,11 +75,10 @@ def start(cfg, config_path):
     state.mkdir(parents=True, exist_ok=True)
     if running(state):
         return
-    args = [sys.executable, "-P", "-m", "core.loop"]
+    args = [sys.executable, "-P", "-m", __package__]
     if config_path:
         args += ["--config", str(config_path.resolve())]
-    root = Path(__file__).resolve().parents[2]
-    env = {**os.environ, "PYTHONPATH": str(root)}
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
     with (state / "daemon.log").open("ab") as log:
         child = subprocess.Popen(
             [*args, "run"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,

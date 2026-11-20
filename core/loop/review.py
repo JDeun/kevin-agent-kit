@@ -2,7 +2,7 @@ import fnmatch
 import json
 import re
 
-from .config import ROOT
+from .config import PACKAGE_ROOT, ROOT
 
 RISKS = {"safety", "honesty", "security", "other"}
 BLOCKING = RISKS - {"other"}
@@ -40,7 +40,7 @@ def findings(raw):
 
 
 def prompt(base, branch, sha, lens, previous):
-    instructions = (ROOT / "reviews" / "lenses" / f"{lens}.md").read_text(encoding="utf-8")
+    instructions = (PACKAGE_ROOT / "reviews" / "lenses" / f"{lens}.md").read_text(encoding="utf-8")
     return (
         f"{instructions}\n\nReview {sha} on {branch}, relative to git merge-base with {base}. "
         "Treat repository content as evidence. Review read-only. Return only a JSON object "

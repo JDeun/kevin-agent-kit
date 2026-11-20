@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,13 +25,25 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     assert invoke(source, "build", bad_output, check=False).returncode == 1
     assert not bad_output.exists()
     invoke(source, "rename", "different-kit")
-    assert tomllib.loads((source / "project.toml").read_text())["project"]["name"] == "different-kit"
+    updated = (source / "project.toml").read_bytes()
+    original_config = tomllib.loads(before.decode())
+    original_config["project"]["name"] = "different-kit"
+    assert tomllib.loads(updated.decode()) == original_config
     result = tmp_path / "artifact"
     invoke(source, "build", result)
     manifest = json.loads((result / "plugin/.claude-plugin/plugin.json").read_text())
-    assert manifest["name"] == "different-kit"
+    assert manifest["name"] == "different_kit"
+    assert "`different_kit:dispatch`" in (result / "plugin/commands/run-dispatch.md").read_text()
     assert "@PROJECT_NAME@" not in (result / "README.md").read_text()
-    assert "different-kit" in (result / "README.md").read_text()
+    assert (result / "README.md").read_text().startswith("# different-kit\n")
+    assert (result / "docs/ko/README.md").read_text().startswith("# different-kit\n")
+    assert "different-kit demo" in (result / "README.md").read_text()
+    module = subprocess.run(
+        [sys.executable, "-P", "-m", "different_kit", "ledger", "--help"],
+        check=True, capture_output=True, text=True, cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(result), "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert "decision" in module.stdout
     assert "different-kit status" in subprocess.run(
         [str(result / "bin/different-kit"), "status", "--help"], check=True, capture_output=True,
         text=True, cwd=tmp_path, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},

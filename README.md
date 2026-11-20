@@ -1,8 +1,11 @@
-# @PROJECT_NAME@
+# kevin-agent-kit
 
-[한국어](docs/ko/README.md)
+A local harness that coordinates coding agents from implementation through review and integration.
 
-@PROJECT_NAME@ is a local harness for coordinating a crew of coding agents.
+> one human holds the decision gate; an agent fleet does the rest
+
+[한국어](docs/ko/README.md) · [Repository](https://github.com/JDeun/kevin-agent-kit.git)
+
 People set direction, choose among reviewed designs, and authorize shipping and
 cleanup. The crew organizes the work, reviews the proposed changes, repairs
 issues in isolated worktrees, and gathers verification evidence.
@@ -23,14 +26,17 @@ Build and install from the checkout to use the standalone command.
 ```sh
 ./scripts/build.sh
 ./scripts/install.sh
-@PROJECT_NAME@ demo
+kevin-agent-kit demo
 ```
 
 Load the rendered Claude Code plugin with
-`claude --plugin-dir ./dist/@PROJECT_NAME@/plugin`. Add the installed command's
+`claude --plugin-dir ./dist/kevin-agent-kit/plugin`. Add the installed command's
 directory to `PATH` before invoking the plugin.
-Use `./scripts/rename.sh NEW` before building to choose a different
-command and plugin name.
+Use `./scripts/rename.sh NEW` before building to change `[project].name` in
+`project.toml`. The build uses that name for the CLI and rendered documentation.
+It replaces hyphens with underscores for the Python package and Claude Code
+command namespace. With the build directory on `PYTHONPATH`, run the package
+as `python3 -m kevin_agent_kit`.
 
 ## Run it on a repository
 
@@ -40,12 +46,12 @@ loop, enqueue the local branch and exact commit to review, then check its
 state.
 
 ```sh
-@PROJECT_NAME@ --config ./project.toml start
-@PROJECT_NAME@ --config ./project.toml enqueue feature/example "$(git rev-parse feature/example)"
-@PROJECT_NAME@ --config ./project.toml status
+kevin-agent-kit --config ./project.toml start
+kevin-agent-kit --config ./project.toml enqueue feature/example "$(git rev-parse feature/example)"
+kevin-agent-kit --config ./project.toml status
 ```
 
-When finished, stop the loop with `@PROJECT_NAME@ --config ./project.toml stop`.
+When finished, stop the loop with `kevin-agent-kit --config ./project.toml stop`.
 
 Use `python3 -m core.loop` in place of the installed command from the source
 checkout. See the [architecture](docs/architecture.md) for the loop and

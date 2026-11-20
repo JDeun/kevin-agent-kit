@@ -1,8 +1,11 @@
-# @PROJECT_NAME@
+# kevin-agent-kit
 
-[English](../../README.md)
+여러 코딩 에이전트의 구현, 리뷰, 통합을 로컬에서 조율하는 하네스입니다.
 
-@PROJECT_NAME@은 여러 코딩 에이전트가 로컬에서 협업하도록 돕는 하네스입니다.
+> one human holds the decision gate; an agent fleet does the rest
+
+[English](../../README.md) · [저장소](https://github.com/JDeun/kevin-agent-kit.git)
+
 사람이 작업 방향을 정하고, 검토된 설계안을 선택하며, 배포와 정리를 승인합니다.
 에이전트는 작업을 조율하고 변경 사항을 검토하며, 격리된 워크트리에서 문제를 수정하고
 검증 근거를 수집합니다.
@@ -23,12 +26,15 @@ python3 -m core.loop demo
 ```sh
 ./scripts/build.sh
 ./scripts/install.sh
-@PROJECT_NAME@ demo
+kevin-agent-kit demo
 ```
 
-`claude --plugin-dir ./dist/@PROJECT_NAME@/plugin`으로 Claude Code 플러그인을 불러옵니다.
+`claude --plugin-dir ./dist/kevin-agent-kit/plugin`으로 Claude Code 플러그인을 불러옵니다.
 플러그인을 쓰기 전에 설치한 명령의 디렉터리를 `PATH`에 추가합니다.
-빌드 전에 `./scripts/rename.sh NEW`를 실행하면 명령과 플러그인 이름을 바꿀 수 있습니다.
+빌드 전에 `./scripts/rename.sh NEW`를 실행하면 `project.toml`의 `[project].name`이 바뀝니다.
+빌드는 이 값을 CLI와 생성된 문서에 반영합니다. Python 패키지와 Claude Code 명령의
+네임스페이스에는 하이픈을 밑줄로 바꾼 이름을 씁니다. 빌드 디렉터리를 `PYTHONPATH`에
+추가하면 `python3 -m kevin_agent_kit`로 패키지를 실행할 수 있습니다.
 
 ## 프로젝트에 적용하기
 
@@ -36,12 +42,12 @@ python3 -m core.loop demo
 루프를 시작한 뒤 검토할 로컬 브랜치와 정확한 커밋을 등록하고 상태를 확인합니다.
 
 ```sh
-@PROJECT_NAME@ --config ./project.toml start
-@PROJECT_NAME@ --config ./project.toml enqueue feature/example "$(git rev-parse feature/example)"
-@PROJECT_NAME@ --config ./project.toml status
+kevin-agent-kit --config ./project.toml start
+kevin-agent-kit --config ./project.toml enqueue feature/example "$(git rev-parse feature/example)"
+kevin-agent-kit --config ./project.toml status
 ```
 
-작업을 마치면 `@PROJECT_NAME@ --config ./project.toml stop`으로 루프를 종료합니다.
+작업을 마치면 `kevin-agent-kit --config ./project.toml stop`으로 루프를 종료합니다.
 
 소스 체크아웃에서는 설치 명령 대신 `python3 -m core.loop`를 쓸 수 있습니다.
 실행 흐름과 사람이 결정하는 지점은 [아키텍처](../architecture.md)에,
