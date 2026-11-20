@@ -38,6 +38,14 @@ unit = ["/tools/check-evidence"]
 [loop.check_keys]
 unit = "/home/example/kit-keys/check-source.pem"
 
+[loop.evidence.observer]
+bundle = "incremental"
+retention_seconds = 0
+
+[loop.evidence.checks.unit]
+bundle = "incremental"
+retention_seconds = 3600
+
 [loop.execution.tools]
 review = "/home/example/kit-tools/review"
 security-review = "/home/example/kit-tools/security-review"
@@ -119,12 +127,30 @@ use capped backoff. Other nonzero exits block the job.
 
 ## Signed evidence sources
 
-The observer and check adapters receive a fresh `request` on stdin and a
-read-only Git bundle at `AGENT_CANDIDATE_BUNDLE`. Each adapter sends the
-bundle and request to its configured evidence broker. The request binds
-the repository, base, source, candidate, bundle digest, policy, named
-operation, and fresh invocation. Verify the bundle digest and check the
-exact candidate commit at the source before starting its work.
+Set an explicit bundle scope and retention period for the observer and
+every named check in the trusted profile. An existing profile needs these
+approvals before it can start a live loop.
+
+- `incremental` sends objects reachable from the candidate that are outside the
+  approved base and source histories. The broker must already have the exact
+  base and source commits and their reachable objects. Prerequisite headers
+  contain commit IDs and fixed comments. The adapter must fail if the
+  prerequisites are unavailable. [Git bundle format](https://git-scm.com/docs/gitformat-bundle#_semantics)
+- `full` sends the candidate and its entire reachable history. This can include
+  content deleted before the current review. Approve it for a destination
+  authorized to receive that history. [Git bundle object prerequisites](https://git-scm.com/docs/git-bundle#_object_prerequisites)
+
+The observer and check adapters receive the request on stdin and a read-only
+bundle at `AGENT_CANDIDATE_BUNDLE`. Send the approved bundle and request to the
+configured broker. The signed request binds the repository, base, source,
+candidate, transmitted bundle digest, scope, prerequisite commits, approved
+`retention_seconds`, policy, named operation, and fresh invocation. Before
+execution, verify the digest, run `git bundle verify` in the broker's repository,
+and check the imported candidate commit. The broker enforces retention for
+the request, bundle, and derived material such as checkouts and logs. A value of
+`0` requires discarding that material after the invocation. Positive values
+limit how long it may be kept after completion.
+See [evidence data scope](adr/evidence-data-scope.md).
 
 For required checks, run the approved check policy in a separate execution
 environment. Observe execution and results from a trusted supervisor or CI
@@ -137,7 +163,9 @@ of the requested check on the exact candidate. It includes the original
 `execution_id`, and a nonempty `tool_version`.
 
 The observer receives `request`, `review`, and `prior_protected` on
-stdin. Verify `request.review_input_sha256` against the canonical JSON
+stdin. These inputs include review text and changed paths. Approve an observer
+authorized to receive that material and apply the same retention period to it.
+Verify `request.review_input_sha256` against the canonical JSON
 object containing `review` and `prior_protected`.
 Collect the observed paths and hash of the complete patch reviewed by the
 primary adapter. Compute the patch in an isolated Git repository using the
@@ -192,6 +220,12 @@ new SHA explicitly. If the target or policy changes, or evidence expires,
 retry the existing job with `kevin-agent-kit retry JOB_ID`. Status
 distinguishes an externally included source from a verified candidate.
 
+The queue records safety, security, and honesty findings as soon as it
+validates their review receipt, before requesting independent observation.
+Restart and retry carry those findings forward for independent resolution.
+A review left open by an interruption before its observations can be recorded
+moves the job to `interrupted` on restart. The queue keeps the pending request
+for diagnosis and blocks automatic or ordinary retry of that job.
 At the round cap, remaining safety, security, or honesty findings block the
 job and retain the evidence for the operator. Other findings create a human
 decision record. Inspect it with `accept-record ID` and record `revise`
@@ -199,7 +233,9 @@ or `defer` with `decide ID CHOICE --source SOURCE`. Revise restarts review
 from the approved source. Defer leaves the job closed.
 
 Use `kevin-agent-kit candidate JOB_ID --output /absolute/path/candidate.bundle`
-to export the ready bundle. The command rechecks repository identity, exact
+to write the ready bundle to a local file. This bundle includes the full
+history reachable from the candidate for standalone import. The command
+rechecks repository identity, exact
 source and target refs, policy, evidence age, and bundle digest. Inspect it
 with `git bundle list-heads /absolute/path/candidate.bundle`. After you
 approve the exact base and candidate, import

@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -104,7 +105,20 @@ class Git:
         self.run("commit", "--quiet", "-m", "fix: apply scoped review repairs")
         return self.resolve()
 
-    def bundle(self, path, sha):
+    def bundle(self, path, sha, *prerequisites):
         ref = "refs/heads/kevin-candidate"
         self.run("update-ref", ref, sha)
-        self.run("bundle", "create", str(path), ref)
+        if not prerequisites:
+            self.run("bundle", "create", str(path), ref)
+            return
+        with tempfile.TemporaryFile(dir=path.parent) as source:
+            self.run("bundle", "create", "-", ref, *(f"^{commit}" for commit in prerequisites), stdout=source)
+            source.seek(0)
+            with path.open("xb") as target:
+                while (line := source.readline()) != b"\n":
+                    if not line:
+                        raise Conflict("incomplete Git bundle header")
+                    # Git includes the excluded commit's subject as an advisory comment.
+                    target.write(line.split(b" ", 1)[0] + b" prerequisite\n" if line.startswith(b"-") else line)
+                target.write(b"\n")
+                shutil.copyfileobj(source, target)

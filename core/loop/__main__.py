@@ -12,7 +12,7 @@ from .config import MODULE_PREFIX, ROOT, config, project, repo_id
 from .daemon import ensure_state, running, serve, start, stop, validate_execution
 from .engine import Engine, check_candidate, export_candidate
 from .git import Git
-from .runtime import Busy, run
+from .runtime import Busy, module_command, run
 from .setup import global_rules, repository_profile
 from .store import SHA, Store
 
@@ -54,9 +54,7 @@ Path("example.txt").write_text("correct" + chr(10))
             request = json.loads(stdin)["request"]
             with bundle.open("rb") as stream:
                 assert hashlib.file_digest(stream, "sha256").hexdigest() == request["bundle_sha256"]
-            with tempfile.TemporaryDirectory(dir=root) as temp:
-                checked = Git(Path(temp))
-                checked.run("init", "--quiet", "--template=")
+            with git.snapshot(root, *request["bundle_prerequisites"]) as (checked, _):
                 checked.run("bundle", "unbundle", str(bundle))
                 sha = request["candidate"]
                 result = dict(request=request, tool_version="demo", execution_id=request["invocation"])
@@ -75,6 +73,8 @@ Path("example.txt").write_text("correct" + chr(10))
         repo=repo, state=state, target="main", repo_id=repo_id(git.common()), policy_id="demo",
         reviewer=review_command, reviewer_model="demo", review_observer=["observe-fixture"],
         review_key=b"demo-review-source", check_keys={"example": b"demo-check-source"},
+        evidence={"observer": {"bundle": "incremental", "retention_seconds": 0},
+                  "checks": {"example": {"bundle": "incremental", "retention_seconds": 0}}},
         worker=[sys.executable, "-I", "-c", worker], worker_model="demo",
         checks={"example": ["check-fixture"]}, repair_paths=["example.txt"],
         lenses={}, lens_reviewers={"security": review_command}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
@@ -117,9 +117,8 @@ def main(argv=None):
         "screenshot": "verify.screenshot",
     }
     if argv and argv[0] in modules:
-        module = MODULE_PREFIX + modules[argv[0]]
-        env = {**os.environ, "PYTHONPATH": str(ROOT)}
-        os.execve(sys.executable, [sys.executable, "-P", "-m", module, *argv[1:]], env)
+        command = module_command(ROOT, MODULE_PREFIX + modules[argv[0]], *argv[1:])
+        os.execv(command[0], command)
     meta = project()
     parser = argparse.ArgumentParser(prog=meta["name"], allow_abbrev=False)
     parser.add_argument("--version", action="version", version=meta["version"])
@@ -131,6 +130,8 @@ def main(argv=None):
     setup.add_argument("--global", dest="global_rules", action="store_true")
     setup.add_argument("--dry-run", action="store_true")
     setup.add_argument("--uninstall", action="store_true")
+    setup.add_argument("--adopt-rules-sha256", action="append", default=[], metavar="SHA256",
+                       help="approve the exact bytes of a reviewed legacy global rules block")
     enqueue = commands.add_parser("enqueue")
     enqueue.add_argument("branch")
     enqueue.add_argument("sha")
@@ -148,10 +149,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == "init":
-            if args.uninstall and not args.global_rules:
-                raise ValueError("--uninstall requires --global")
+            if (args.uninstall or args.adopt_rules_sha256) and not args.global_rules:
+                raise ValueError("--uninstall and --adopt-rules-sha256 require --global")
             if args.global_rules:
-                for path in global_rules(dry_run=args.dry_run, uninstall=args.uninstall):
+                for path in global_rules(dry_run=args.dry_run, uninstall=args.uninstall, adopt=args.adopt_rules_sha256):
                     print(path)
             else:
                 print(repository_profile(Path.cwd(), dry_run=args.dry_run))

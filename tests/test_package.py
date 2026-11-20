@@ -55,9 +55,11 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
         env={**os.environ, "PYTHONPATH": str(result), "PYTHONDONTWRITEBYTECODE": "1"},
     )
     assert "decision" in module.stdout
+    isolated_env = {**os.environ, "PATH": str(tmp_path), "PYTHONPATH": str(source),
+                    "PYTHONHOME": str(tmp_path / "unused-python-home")}
     assert "different-kit status" in subprocess.run(
         [str(result / "bin/different-kit"), "status", "--help"], check=True, capture_output=True,
-        text=True, cwd=tmp_path, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True, cwd=source, env=isolated_env,
     ).stdout
     prefix = tmp_path / "install space"
     prefix.mkdir()
@@ -67,9 +69,13 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     (prefix / "bin").unlink()
     invoke(source, "install", "--prefix", prefix)
     assert (prefix / "share/different-kit/plugin/.claude-plugin/plugin.json").is_file()
-    output = subprocess.run([str(prefix / "bin/different-kit"), "--help"],
-                            cwd=tmp_path, capture_output=True, check=True, text=True)
-    assert "different-kit" in output.stdout
+    output = subprocess.run([str(prefix / "bin/different-kit"), "ledger", "--help"],
+                            cwd=source, capture_output=True, check=True, text=True, env=isolated_env)
+    assert "decision" in output.stdout
+    guard = prefix / "share/different-kit/different_kit/guards/agent-sec"
+    output = subprocess.run([str(guard), "--help"], cwd=source, capture_output=True,
+                            check=True, text=True, env=isolated_env)
+    assert "--root" in output.stdout
 
 
 def test_scan_checks_all_historical_names_of_the_same_blob(tmp_path):

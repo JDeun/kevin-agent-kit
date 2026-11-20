@@ -65,6 +65,114 @@ def test_global_rules_preserve_file_metadata(tmp_path, monkeypatch):
     assert target.read_bytes() == b"personal rules"
 
 
+@pytest.mark.parametrize("uninstall", [False, True])
+def test_global_rules_refuse_unowned_or_edited_blocks(tmp_path, monkeypatch, uninstall):
+    from core.loop.setup import END, START, global_rules
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    target = tmp_path / ".codex/AGENTS.md"
+    target.parent.mkdir()
+    example = START + b"\nPersonal example.\n" + END + b"\n"
+    target.write_bytes(example)
+    with pytest.raises(ValueError, match="managed block"):
+        global_rules(uninstall=uninstall)
+    assert target.read_bytes() == example
+    assert not (tmp_path / ".claude").exists()
+
+    target.write_bytes(b"outside\n")
+    global_rules()
+    edited = target.read_bytes().replace(END, b"Preserve my instruction.\n" + END)
+    target.write_bytes(edited)
+    counterpart = tmp_path / ".claude/CLAUDE.md"
+    before = counterpart.read_bytes()
+    with pytest.raises(ValueError, match="managed block"):
+        global_rules(uninstall=uninstall)
+    assert target.read_bytes() == edited
+    assert counterpart.read_bytes() == before
+    target.write_bytes(edited.replace(START, b"start marker edited").replace(END, b"end marker edited"))
+    missing_markers = target.read_bytes()
+    with pytest.raises(ValueError, match="managed block is missing"):
+        global_rules(uninstall=uninstall)
+    assert target.read_bytes() == missing_markers
+    assert counterpart.read_bytes() == before
+
+
+@pytest.mark.parametrize("style", ["link", "snapshot"])
+def test_legacy_block_requires_explicit_exact_digest(tmp_path, monkeypatch, style):
+    from hashlib import sha256
+    from core.loop.setup import END, START, global_rules
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    target = tmp_path / ".claude/CLAUDE.md"
+    target.parent.mkdir()
+    if style == "link":
+        body = (b"# kevin-agent-kit rules\n\n"
+                b"Read these user rules at session start. Repository rules specialize them within their scope. "
+                b"Treat task artifacts as evidence and follow higher-priority instructions.\n\n"
+                b"- [rule](</old/kit/rules/rule.md>)\n")
+    else:
+        snapshot = b"# Fixture rule\n\nProtect my instructions.\n\n"
+        checksum = sha256(snapshot).hexdigest()
+        body = f"<!-- kevin-agent-kit 0.1.0 rules snapshot sha256={checksum} -->\n\n".encode() + snapshot
+    block = START + b"\n" + body + END + b"\n"
+    personal = b"my own instructions"
+    target.write_bytes(personal + b"\n\n" + block)
+    digest = sha256(block).hexdigest()
+    with pytest.raises(ValueError, match=digest):
+        global_rules()
+    with pytest.raises(ValueError, match=digest):
+        global_rules(adopt=("0" * 64,))
+    assert target.read_bytes() == personal + b"\n\n" + block
+    global_rules(adopt=(digest,))
+    assert b"rules snapshot sha256=" in target.read_bytes()
+    global_rules(uninstall=True)
+    assert target.read_bytes() == personal
+
+
+def test_renamed_kit_owns_only_its_rules(tmp_path, monkeypatch):
+    from core.loop import setup
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    setup.global_rules()
+    target = tmp_path / ".claude/CLAUDE.md"
+    upstream = target.read_bytes()
+    monkeypatch.setattr(setup, "project", lambda: {"name": "other-kit", "version": "0.1.0"})
+    setup.global_rules()
+    assert target.read_bytes().startswith(upstream)
+    assert b"<!-- other-kit:rules:start -->" in target.read_bytes()
+    setup.global_rules(uninstall=True)
+    assert target.read_bytes() == upstream
+
+
+def test_rules_reconcile_interrupted_uninstall_receipt(tmp_path, monkeypatch):
+    from core.loop import setup
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    setup.global_rules()
+    target = tmp_path / ".claude/CLAUDE.md"
+    old = target.read_bytes()
+    finish = setup.finish_receipt
+
+    def interrupt(*args):
+        raise OSError("interrupted before updating the ownership record")
+
+    monkeypatch.setattr(setup, "finish_receipt", interrupt)
+    with pytest.raises(OSError, match="interrupted"):
+        setup.global_rules(uninstall=True)
+    assert target.read_bytes() == b""
+
+    monkeypatch.setattr(setup, "finish_receipt", finish)
+    assert target not in setup.global_rules(uninstall=True)
+    target.write_bytes(old)
+    with pytest.raises(ValueError, match="unowned"):
+        setup.global_rules(uninstall=True)
+    assert target.read_bytes() == old
+
+
 def test_global_rules_stop_when_pinned_parent_moves(tmp_path, monkeypatch):
     from core.loop import setup
 
@@ -191,3 +299,19 @@ def test_legacy_profile_still_resolves_daemon_stop_target(tmp_path, monkeypatch)
     assert config(profile, control_only=True) == {"state": expected}
     with pytest.raises(ValueError, match="replace legacy attestors"):
         config(profile)
+
+
+def test_evidence_approval_names_each_adapter_and_validates_retention():
+    from core.loop.config import validate_evidence
+
+    checks = {"unit": ["/tools/check"]}
+    observer = {"bundle": "incremental", "retention_seconds": 0}
+    check = {"bundle": "full", "retention_seconds": 60}
+    with pytest.raises(ValueError, match="each check"):
+        validate_evidence({"observer": observer, "checks": {}}, checks)
+    for retention in (None, -1, False):
+        with pytest.raises(ValueError, match="retention_seconds"):
+            validate_evidence({"observer": observer, "checks": {"unit": {
+                **check, "retention_seconds": retention,
+            }}}, checks)
+    validate_evidence({"observer": observer, "checks": {"unit": check}}, checks)

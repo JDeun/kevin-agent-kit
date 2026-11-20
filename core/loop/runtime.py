@@ -24,6 +24,24 @@ class Cancelled(Exception):
     pass
 
 
+_RUN_MODULE = """\
+from pathlib import Path
+import runpy
+import sys
+
+root, module = sys.argv[1:3]
+if not (Path(root) / module.partition(".")[0] / "__init__.py").is_file():
+    raise SystemExit(f"kit module is missing from {root}: {module}")
+sys.path.insert(0, root)
+del sys.argv[:2]
+runpy.run_module(module, run_name="__main__", alter_sys=True)
+"""
+
+
+def module_command(root, module, *args):
+    return [sys.executable, "-I", "-c", _RUN_MODULE, str(root), module, *args]
+
+
 def private_dir(path):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()

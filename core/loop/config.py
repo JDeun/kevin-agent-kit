@@ -92,6 +92,17 @@ def strings(value, key):
     return value
 
 
+def validate_evidence(policy, checks):
+    if (not isinstance(policy, dict) or set(policy) != {"observer", "checks"}
+            or not isinstance(policy["checks"], dict) or policy["checks"].keys() != checks.keys()):
+        raise ValueError("explicit evidence data approval is required for the observer and each check")
+    for adapter in (policy["observer"], *policy["checks"].values()):
+        if (not isinstance(adapter, dict) or set(adapter) != {"bundle", "retention_seconds"}
+                or adapter["bundle"] not in ("incremental", "full")
+                or type(adapter["retention_seconds"]) is not int or adapter["retention_seconds"] < 0):
+            raise ValueError("evidence approval requires a bundle scope and nonnegative retention_seconds")
+
+
 def policy_id(raw, execution, keys):
     code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
     lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
@@ -145,6 +156,8 @@ def config(path=None, *, control_only=False):
                 raise ValueError(f"invalid {key} name or command")
     if not isinstance(data["check_keys"], dict) or data["checks"].keys() != data["check_keys"].keys():
         raise ValueError("each required check needs an approved public key")
+    if data["evidence"] != {}:
+        validate_evidence(data["evidence"], data["checks"])
     for role in ("reviewer", "worker"):
         order = data["models"]
         model, ceiling = data[f"{role}_model"], data["max_model"]

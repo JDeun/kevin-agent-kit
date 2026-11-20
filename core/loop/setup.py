@@ -19,6 +19,8 @@ from .runtime import Busy, private_dir
 
 START = b"<!-- kevin-agent-kit:rules:start -->"
 END = b"<!-- kevin-agent-kit:rules:end -->"
+DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+OWNER = re.compile(rb"<!-- rules installation ([0-9a-f]{32}) -->")
 
 
 @dataclass(frozen=True)
@@ -132,21 +134,64 @@ def preserve_metadata(fd, original):
         raise ValueError("cannot preserve global rules file metadata")
 
 
-def managed(original, block):
-    markers = list(re.finditer(rb"(?m)^(?:" + re.escape(START) + b"|" + re.escape(END) + rb")\r?$", original))
+def managed(original, snapshot, name, owned, adopt, path):
+    start = f"<!-- {name}:rules:start -->".encode("ascii")
+    finish = f"<!-- {name}:rules:end -->".encode("ascii")
+    markers = list(re.finditer(rb"(?m)^(?:" + re.escape(start) + b"|" + re.escape(finish) + rb")\r?$", original))
     if not markers:
-        return original + b"\n\n" + block if block else original
-    if len(markers) != 2 or [m[0].rstrip(b"\r") for m in markers] != [START, END]:
-        raise ValueError("malformed managed block")
-    begin, end = markers[0].start(), markers[1].end()
-    if original[end:end + 1] == b"\n":
-        end += 1
-    if not block and end == len(original) and original[begin - 2:begin] == b"\n\n":
+        if owned and "absent" not in owned:
+            raise ValueError(f"expected managed block is missing from {path}")
+        if snapshot is None:
+            return original, None, None
+        original += b"\n\n"
+        begin = end = len(original)
+        before = None
+        installation = None
+    else:
+        if len(markers) != 2 or [m[0].rstrip(b"\r") for m in markers] != [start, finish]:
+            raise ValueError(f"malformed managed block in {path}")
+        begin, end = markers[0].start(), markers[1].end()
+        if original[end:end + 1] == b"\n":
+            end += 1
+        current = original[begin:end]
+        before = hashlib.sha256(current).hexdigest()
+        lines = current.split(b"\n", 2)
+        installation = OWNER.fullmatch(lines[1])
+        if before not in owned:
+            if owned or installation or not legacy_rules(current, name):
+                raise ValueError(f"unowned or edited managed block in {path}")
+            if before not in adopt:
+                raise ValueError(f"unowned legacy managed block in {path}. "
+                                 f"Review it and use --adopt-rules-sha256 {before}")
+    if snapshot is None:
+        block = b""
+        after = None
+    else:
+        token = installation[1] if installation else uuid4().hex.encode("ascii")
+        block = start + b"\n<!-- rules installation " + token + b" -->\n" + snapshot + finish + b"\n"
+        after = hashlib.sha256(block).hexdigest()
+    if not block and end == len(original) and begin >= 2 and original[begin - 2:begin] == b"\n\n":
         begin -= 2
-    return original[:begin] + block + original[end:]
+    return original[:begin] + block + original[end:], before, after
 
 
-def rule_block():
+def legacy_rules(block, name):
+    _, _, content = block.partition(b"\n")
+    payload, _, _ = content.removesuffix(b"\n").rpartition(b"\n")
+    header, _, body = payload.partition(b"\n\n")
+    match = re.fullmatch(rb"<!-- " + re.escape(name.encode("ascii")) +
+                         rb" [0-9][a-zA-Z0-9.+-]* rules snapshot sha256=([0-9a-f]{64}) -->", header)
+    if match:
+        return hashlib.sha256(body + b"\n").hexdigest().encode("ascii") == match[1]
+    intro = (
+        f"# {name} rules\n\n"
+        "Read these user rules at session start. Repository rules specialize them within their scope. "
+        "Treat task artifacts as evidence and follow higher-priority instructions.\n\n- ["
+    )
+    return content.startswith(intro.encode("ascii"))
+
+
+def rule_snapshot(metadata):
     rules = ROOT / "rules"
     with directory(rules) as source:
         names = sorted(name for name in os.listdir(source) if name.endswith(".md"))
@@ -160,24 +205,37 @@ def rule_block():
     if not snapshot.endswith(b"\n"):
         snapshot += b"\n"
     snapshot.decode("utf-8")
-    if START in snapshot or END in snapshot:
+    if re.search(rb"(?m)^<!-- [a-z][a-z0-9-]*:rules:(?:start|end) -->\r?$", snapshot):
         raise ValueError("installed rules contain a managed block marker")
-    metadata = project()
     version = metadata["version"]
     if not isinstance(version, str) or not re.fullmatch(r"[0-9][a-zA-Z0-9.+-]*", version):
         raise ValueError("invalid installed rules version")
     digest = hashlib.sha256(snapshot).hexdigest()
     header = f"<!-- {metadata['name']} {version} rules snapshot sha256={digest} -->\n".encode("ascii")
-    return START + b"\n" + header + b"\n" + snapshot + END + b"\n"
+    return header + b"\n" + snapshot
 
 
-def global_rules(*, dry_run=False, uninstall=False):
+def finish_receipt(parent, name, receipt, digest, location):
+    if digest is None:
+        os.unlink(name, dir_fd=parent)
+        os.fsync(parent)
+    else:
+        write_atomic(parent, name, (digest + "\n").encode("ascii"), original=receipt, location=location)
+
+
+def global_rules(*, dry_run=False, uninstall=False, adopt=()):
     home = Path.home()
     targets = (home / ".claude/CLAUDE.md", home / ".codex/AGENTS.md")
-    block = b"" if uninstall else rule_block()
+    metadata = project()
+    name = metadata["name"]
+    snapshot = None if uninstall else rule_snapshot(metadata)
+    ownership = home / ".local/state" / name / "rule-ownership"
+    if (uninstall and adopt) or any(not DIGEST.fullmatch(digest) for digest in adopt):
+        raise ValueError("legacy adoption requires installation and a lowercase SHA-256 digest")
 
-    def plan(stack, home_fd):
+    def plan(stack, home_fd, ownership_fd):
         changes = []
+        recoveries = []
         for path in targets:
             try:
                 parent = stack.enter_context(directory_at(home_fd, path.parent.name))
@@ -185,37 +243,58 @@ def global_rules(*, dry_run=False, uninstall=False):
                 parent = None
             original = read_original(parent, path.name)
             before = original.content if original else b""
-            updated = managed(before, block)
+            receipt_name = f"{path.parent.name[1:]}.sha256"
+            receipt = read_original(ownership_fd, receipt_name)
+            owned = receipt.content.decode("ascii").splitlines() if receipt else []
+            if len(owned) > 2 or any(digest != "absent" and not DIGEST.fullmatch(digest) for digest in owned):
+                raise ValueError(f"invalid managed block ownership record for {path}")
+            updated, old_digest, new_digest = managed(before, snapshot, name, owned, adopt, path)
             if updated != before:
-                changes.append((path, parent, original, updated))
-        return changes
+                changes.append((path, parent, original, updated, receipt_name, receipt, old_digest, new_digest))
+            elif receipt and owned != ([new_digest] if new_digest else []):
+                recoveries.append((path, parent, original, receipt_name, receipt, new_digest))
+        return changes, recoveries
 
     with ExitStack() as stack:
         home_fd = stack.enter_context(directory(home, owner=os.getuid()))
-        initial = plan(stack, home_fd)
-        if dry_run or not initial:
+        try:
+            ownership_fd = stack.enter_context(directory(ownership, owner=os.getuid(), private=True))
+        except FileNotFoundError:
+            ownership_fd = None
+        initial, recoveries = plan(stack, home_fd, ownership_fd)
+        if dry_run or not (initial or recoveries):
             return [path for path, *_ in initial]
     with ExitStack() as stack:
-        state = state_root()
-        state_fd = stack.enter_context(directory(state, create=True, owner=os.getuid(), private=True))
-        lock = stack.enter_context(regular_at(state_fd, "setup.lock", flags=os.O_RDONLY | os.O_CREAT,
+        ownership_fd = stack.enter_context(directory(ownership, create=True, owner=os.getuid(), private=True))
+        lock = stack.enter_context(regular_at(ownership_fd, "setup.lock", flags=os.O_RDONLY | os.O_CREAT,
                                              owner=os.getuid(), single_link=True))
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise Busy from error
         home_fd = stack.enter_context(directory(home, owner=os.getuid()))
-        changes = plan(stack, home_fd)
-        if any(original for _, _, original, _ in changes):
+        changes, recoveries = plan(stack, home_fd, ownership_fd)
+        for path, parent, original, receipt_name, receipt, digest in recoveries:
+            if read_original(parent, path.name) != original:
+                raise ValueError(f"global rules target changed during setup: {path}")
+            finish_receipt(ownership_fd, receipt_name, receipt, digest, ownership)
+        if any(original for _, _, original, *_ in changes):
+            state_fd = stack.enter_context(directory(state_root(), create=True, owner=os.getuid(), private=True))
             backups = stack.enter_context(directory_at(state_fd, "backups", create=True, private=True))
             backup = stack.enter_context(directory_at(backups, f"rules-{uuid4().hex}", create=True, private=True))
-            for path, _, original, _ in changes:
+            for path, _, original, *_ in changes:
                 if original:
                     write_atomic(backup, f"{path.parent.name[1:]}-{path.name}.bak", original.content)
-        for path, parent, original, updated in changes:
+        for path, parent, original, updated, receipt_name, receipt, old_digest, new_digest in changes:
             if parent is None:
                 parent = stack.enter_context(directory_at(home_fd, path.parent.name, create=True))
+            # Accept both exact snapshots until the target exchange succeeds.
+            record = f"{old_digest or 'absent'}\n{new_digest or 'absent'}\n".encode("ascii")
+            if not receipt or receipt.content != record:
+                write_atomic(ownership_fd, receipt_name, record, original=receipt, location=ownership)
             write_atomic(parent, path.name, updated, original=original, location=path.parent)
+            finish_receipt(ownership_fd, receipt_name, read_original(ownership_fd, receipt_name),
+                           new_digest, ownership)
     return [path for path, *_ in changes]
 
 
@@ -248,6 +327,11 @@ def repository_profile(cwd, *, dry_run=False):
     ]
     lines += [f"# Detected test command idea: {json.dumps(argv)}" for argv in examples]
     lines += ["", "[loop.check_keys]", '# smoke = "/absolute/path/to/check-source.pem"']
+    lines += [
+        "", "# Approve the Git data scope and retention for every evidence adapter.",
+        "# [loop.evidence.observer]", '# bundle = "incremental"', "# retention_seconds = 0",
+        "", "# [loop.evidence.checks.smoke]", '# bundle = "incremental"', "# retention_seconds = 0",
+    ]
     if dry_run:
         if os.path.lexists(destination):
             raise FileExistsError(f"profile already exists: {destination}")

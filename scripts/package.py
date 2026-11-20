@@ -52,6 +52,22 @@ def tracked_inputs():
         yield relative, entry in RUNTIME
 
 
+def write_launcher(command, module, relative_root):
+    command.write_text(
+        "#!/usr/bin/python3 -I\n"
+        "from pathlib import Path\n"
+        "import runpy\n"
+        "import sys\n\n"
+        f"root = Path(__file__).resolve().parents[1] / {relative_root!r}\n"
+        f"if not (root / {module!r} / '__init__.py').is_file():\n"
+        "    raise SystemExit(f'kit package is missing from {root}')\n"
+        "sys.path.insert(0, str(root))\n"
+        f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)\n",
+        encoding="utf-8",
+    )
+    command.chmod(0o755)
+
+
 def build(destination):
     meta = project(ROOT)
     name = meta["name"]
@@ -90,17 +106,7 @@ def build(destination):
             "from .core.loop.__main__ import main\n\nraise SystemExit(main())\n", encoding="utf-8")
         shutil.copy2(ROOT / "LICENSE", stage / "plugin" / "LICENSE")
         (stage / "bin").mkdir(exist_ok=True)
-        command = stage / "bin" / name
-        command.write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            'root=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)\n'
-            f'if [ ! -f "$root/{module}/__main__.py" ]; then root="$root/share/{name}"; fi\n'
-            'export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"\n'
-            f'exec python3 -P -m {module} "$@"\n',
-            encoding="utf-8",
-        )
-        command.chmod(0o755)
+        write_launcher(stage / "bin" / name, module, ".")
         stage.rename(destination)
     return destination
 
@@ -116,7 +122,7 @@ def install(prefix):
     try:
         with tempfile.TemporaryDirectory(dir=binary.parent, prefix=".install-") as temp:
             staged = Path(temp) / name
-            shutil.copy2(target / "bin" / name, staged)
+            write_launcher(staged, name.replace("-", "_"), f"share/{name}")
             os.link(staged, binary)
     except OSError:
         shutil.rmtree(target)

@@ -1,10 +1,14 @@
-#!/bin/sh
-set -eu
-root=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
-module=guards
-if [ ! -f "$root/project.toml" ]; then
-    module="$(basename -- "$root").guards"
-    root=$(dirname -- "$root")
-fi
-export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -P -m "$module" agent-sec scan "$@"
+#!/usr/bin/python3 -I
+from pathlib import Path
+import runpy
+import sys
+
+root = Path(__file__).resolve().parents[1]
+module = "guards"
+if not (root / "project.toml").is_file():
+    module = f"{root.name}.guards"
+    root = root.parent
+
+sys.path.insert(0, str(root))
+sys.argv[1:1] = ["agent-sec", "scan"]
+runpy.run_module(module, run_name="__main__", alter_sys=True)

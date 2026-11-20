@@ -4,13 +4,12 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
-import sys
 from threading import Event
 import time
 
-from .config import ROOT
+from .config import ROOT, validate_evidence
 from .engine import Engine
-from .runtime import Busy, lock, private_dir
+from .runtime import Busy, lock, module_command, private_dir
 from .sandbox import probe
 from .store import Store
 
@@ -119,6 +118,7 @@ def validate_execution(cfg):
     if not cfg["reviewer"] or not cfg["checks"]:
         raise ValueError("configure a reviewer and required checks in the trusted profile")
     probe()
+    validate_evidence(cfg["evidence"], cfg["checks"])
     from .evidence import OPENSSL
 
     if not cfg["lens_reviewers"].get("security") or not cfg["review_observer"] or not cfg["review_key"]:
@@ -136,13 +136,12 @@ def start(cfg):
             raise ValueError("daemon uses a different policy; stop and restart it")
         return
     validate_execution(cfg)
-    args = [sys.executable, "-P", "-m", __package__, "--config", str(cfg["profile"]), "run"]
-    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    args = module_command(ROOT, __package__, "--config", str(cfg["profile"]), "run")
     path = state / "daemon.log"
     fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "ab") as log:
         child = subprocess.Popen(args, cwd="/", stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                 start_new_session=True, env=env)
+                                 start_new_session=True)
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         try:

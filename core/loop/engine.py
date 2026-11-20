@@ -5,6 +5,7 @@ from threading import Event
 import hashlib
 import json
 import shutil
+import sqlite3
 import tempfile
 import time
 from uuid import uuid4
@@ -66,6 +67,19 @@ def export_candidate(cfg, evidence, destination):
             destination.hardlink_to(staged)
 
 
+def candidate_bundle(git, root, evidence, scope):
+    prerequisites = [evidence["base"], evidence["head"]] if scope == "incremental" else []
+    path = root / f"{scope}.bundle"
+    path.unlink(missing_ok=True)
+    git.bundle(path, evidence["candidate"], *prerequisites)
+    path.chmod(0o400)
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    return path, {
+        "bundle_sha256": digest, "bundle_scope": scope, "bundle_prerequisites": prerequisites,
+    }
+
+
 class Engine:
     def __init__(self, cfg, store, cancel=None, *, runner=execute, authenticate=signed_receipt):
         self.cfg = cfg
@@ -79,11 +93,16 @@ class Engine:
         self.active = {}
 
     def __enter__(self):
+        self.store.recover_pending_reviews()
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type, *_):
         self.cancel.set()
         self.executor.shutdown(wait=True)
+        if exc_type is None:
+            for job, future in self.active.values():
+                self.collect(job, future)
+        self.active.clear()
 
     def authority(self, evidence):
         check_inputs(self.cfg, evidence)
@@ -107,7 +126,9 @@ class Engine:
         return self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
                            policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
 
-    def review(self, work, bundle, evidence, paths, prior, history, rounds):
+    def review(self, job_id, work, package, evidence, paths, prior, history, rounds):
+        bundle, scope = package
+        observer = self.cfg["evidence"]["observer"]
         items = list(prior)
         selected = dict.fromkeys((*lenses(paths, self.cfg["lenses"]), *(item["lens"] for item in prior)))
         for lens in selected:
@@ -118,6 +139,7 @@ class Engine:
                 argv = self.cfg["reviewer"] if lens == "general" else self.cfg["lens_reviewers"].get(lens)
                 if not argv:
                     raise ValueError(f"configure a dedicated review adapter for the {lens} lens")
+                self.store.begin_review(job_id, request)
                 output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous))
                 review = review_receipt(output, request, previous)
                 env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
@@ -125,8 +147,11 @@ class Engine:
                 review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
                 for item in review["findings"]:
                     item["detail"] = redact(item["detail"], env_names)
+                self.store.record_protected(job_id, request, rounds,
+                                            [item for item in review["findings"] if item["risk"] in BLOCKING])
                 review_input = {"review": review, "prior_protected": previous}
-                observation = {**request, "kind": "review-observation", "invocation": uuid4().hex,
+                observation = {**request, **scope, "retention_seconds": observer["retention_seconds"],
+                               "kind": "review-observation", "invocation": uuid4().hex,
                                "review_input_sha256": hashlib.sha256(canonical(review_input)).hexdigest()}
                 key = self.cfg["review_key"]
                 output = self.command(
@@ -135,7 +160,7 @@ class Engine:
                 )
                 observed = observed_review(self.authenticate(output, key), observation, review["resolved"])
                 review["observation"] = {**observed, "source": source_id(key)}
-            except (OSError, ValueError, Retry) as cause:
+            except (OSError, ValueError, Retry, sqlite3.Error) as cause:
                 if review is not None:
                     known = {item["id"] for item in items if item["lens"] == lens}
                     items.extend({**item, "lens": lens} for item in review["findings"]
@@ -166,23 +191,24 @@ class Engine:
                 "policy": self.cfg["policy_id"], "run": uuid4().hex,
             }
             history = []
-            staged = root / "candidate.bundle"
+            approvals = self.cfg["evidence"]
+            observer = approvals["observer"]
+            scopes = {adapter["bundle"] for adapter in (observer, *approvals["checks"].values())}
+            seen = {(item["lens"], item["id"]): item for item in prior}
             for rounds in range(1, self.cfg["max_rounds"] + 1):
-                staged.unlink(missing_ok=True)
-                git.bundle(staged, evidence["candidate"])
-                staged.chmod(0o400)
-                with staged.open("rb") as stream:
-                    evidence["bundle_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                packages = {scope: candidate_bundle(git, root, evidence, scope) for scope in sorted(scopes)}
                 evidence["diff_sha256"] = git.diff_digest(base, evidence["candidate"])
                 paths = sorted(git.paths(base, evidence["candidate"]))
-                items = self.review(git.repo, staged, evidence, paths, prior, history, rounds)
-                prior = [item for item in items if item["risk"] in BLOCKING]
+                items = self.review(job["id"], git.repo, packages[observer["bundle"]],
+                                    evidence, paths, seen.values(), history, rounds)
+                open_protected = [item for item in items if item["risk"] in BLOCKING]
+                seen.update(((item["lens"], item["id"]), item) for item in open_protected)
                 report = {**evidence, "reviews": history, "rounds": rounds, "findings": items}
                 if not items:
                     break
                 if rounds == self.cfg["max_rounds"] or not (self.cfg["worker"] and self.cfg["repair_paths"]):
                     self.authority(evidence)
-                    if prior:
+                    if open_protected:
                         return "blocked", "protected findings require resolution", report
                     return "waiting", "human decision needed", report
                 try:
@@ -200,7 +226,10 @@ class Engine:
 
             receipts = []
             for name, argv in sorted(self.cfg["checks"].items()):
-                request = {**evidence, "kind": "required-check", "check": name, "invocation": uuid4().hex}
+                adapter = approvals["checks"][name]
+                staged, scope = packages[adapter["bundle"]]
+                request = {**evidence, **scope, "retention_seconds": adapter["retention_seconds"],
+                           "kind": "required-check", "check": name, "invocation": uuid4().hex}
                 try:
                     output = self.command("verify", argv, None, evidence, bundle=staged,
                                           stdin=json.dumps({"request": request}, ensure_ascii=True))
@@ -214,21 +243,25 @@ class Engine:
             if not receipts:
                 raise Conflict("configure mandatory checks before preparing candidates")
             self.authority(evidence)
+            full = packages.get("full") or candidate_bundle(git, root, evidence, "full")
+            staged, export_scope = full
             directory = private_dir(self.cfg["state"] / "candidates")
             bundle = directory / f"{evidence['run']}.bundle"
             with staged.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != evidence["bundle_sha256"]:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != export_scope["bundle_sha256"]:
                     raise Conflict("candidate bundle changed during evidence collection")
             self.authority(evidence)
             staged.replace(bundle)
             return "candidate", "awaiting repository owner", {
-                **report, "checks": receipts, "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
+                **report, **export_scope, "checks": receipts,
+                "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
 
     def collect(self, job, future):
         try:
             phase, detail, evidence = future.result()
         except Cancelled:
+            self.store.cancel_review(job["id"])
             return
         except InterruptedAttempt as error:
             self.record_failure(job, error.cause, error.evidence)

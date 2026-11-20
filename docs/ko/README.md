@@ -14,7 +14,9 @@
 
 ### 1. CLI와 전역 규칙 설치
 
-Git과 Python 3.11 이상을 설치합니다. 실제 저장소에서 루프를 실행하려면
+Git을 설치하고, 배포 CLI가 사용할 Python 3.11 이상을 `/usr/bin/python3`에 준비합니다.
+실행기는 Python 격리 모드를 사용합니다. 설치한 명령의 선택 의존성은 시스템 Python에서
+불러올 수 있어야 합니다. 실제 저장소에서 루프를 실행하려면
 OpenSSL과 Bubblewrap의 비특권 네임스페이스를 사용할 수 있는 Linux가 필요합니다.
 신뢰할 수 있는 키트 체크아웃에서 설치합니다. 기본 설치 경로는 `~/.local`입니다.
 
@@ -29,8 +31,12 @@ kevin-agent-kit init --global
 
 Claude Code를 실행하는 셸에도 `PATH`를 설정합니다. 데모는 임시 Git 저장소와
 내장 시험 명령을 사용합니다. 전역 설치는 `~/.claude/CLAUDE.md`와
-`~/.codex/AGENTS.md`에 규칙 본문을 복사하고 키트 버전과 본문 해시를 기록합니다.
-새 버전을 승인한 뒤 설치 명령을 다시 실행하면 규칙을 갱신할 수 있습니다.
+`~/.codex/AGENTS.md`에 규칙 본문을 복사하고 설치 ID, 키트 버전과 본문 해시를 기록합니다.
+새 버전을 승인한 뒤 `init --global`을 다시 실행하면 편집되지 않은 규칙을 갱신합니다.
+소유권이나 내용 충돌이 있으면 두 파일 모두 쓰기 전에 중단합니다.
+이전 링크형 또는 스냅샷 블록은 직접 검토한 뒤 `init --global --adopt-rules-sha256 SHA256`으로
+갱신합니다. 명령이 표시한 정확한 해시를 사용하고, 해시가 여러 개면 옵션을 반복합니다.
+[전역 규칙 소유권](../adr/global-rule-ownership.md)
 홈 및 클라이언트 디렉터리는 현재 사용자가 소유해야 하며 심볼릭 링크와
 그룹·기타 사용자 쓰기 권한은 허용하지 않습니다. 기존 파일을 갱신하려면 원자적
 파일 교환과 메타데이터 보존을 지원하는 Linux 파일시스템이 필요합니다.
@@ -51,7 +57,8 @@ Claude Code에서 마켓플레이스를 추가하고, 플러그인을 설치할 
 
 검토할 저장소에서 `kevin-agent-kit init`을 실행합니다. 출력된 TOML에서 감지된
 대상 브랜치와 검증 명령 후보를 확인합니다. 렌즈별 리뷰 어댑터와 독립 검토·필수
-검증의 서명 출처를 설정합니다. 자동 수정에는 작업자 명령과 수정 경로를 승인합니다.
+검증의 서명 출처를 설정하고 어댑터별 번들 범위와 보존 기간을 승인합니다.
+자동 수정에는 작업자 명령과 수정 경로를 승인합니다.
 설정은 `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`에 생성됩니다.
 [프로필과 래퍼 설정](../loop.md)
 
@@ -68,7 +75,8 @@ kevin-agent-kit status
 
 `candidate` 작업 ID와 근거를 확인한 뒤
 `kevin-agent-kit candidate JOB_ID --output /절대/경로/candidate.bundle`로
-검증한 커밋을 내보냅니다. 적용은 프로젝트의 기존 승인·Git 절차를 따릅니다.
+검증한 커밋과 그 커밋에서 도달할 수 있는 Git 이력을 로컬 파일로 내보냅니다.
+적용은 프로젝트의 기존 승인·Git 절차를 따릅니다.
 큐·로그·장부는 `${XDG_STATE_HOME:-$HOME/.local/state}/kevin-agent-kit/` 아래에 있습니다.
 
 ### 4. 루프 끄기와 전역 규칙 제거
@@ -79,7 +87,7 @@ kevin-agent-kit init --global --uninstall --dry-run
 kevin-agent-kit init --global --uninstall
 ```
 
-제거 명령은 관리 블록을 걷어냅니다. Claude Code 플러그인은
+제거 명령은 설치 기록과 일치하는 관리 블록을 걷어냅니다. Claude Code 플러그인은
 `/plugin uninstall kevin-agent-kit@kevin-agent-kit`으로 제거합니다.
 
 키트 체크아웃에서는 `python3 -m core.loop`를 쓸 수 있습니다.

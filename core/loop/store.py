@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -24,6 +24,7 @@ class Store:
                 raise ValueError("queue database must be private and user-owned")
         finally:
             os.close(fd)
+        self.path = path
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         try:
@@ -54,6 +55,19 @@ class Store:
                 CREATE TABLE IF NOT EXISTS evidence (
                     id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs,
                     phase TEXT NOT NULL, body TEXT NOT NULL
+                )
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS protected_observations (
+                    id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs,
+                    run TEXT NOT NULL, candidate TEXT NOT NULL, round_number INTEGER NOT NULL,
+                    lens TEXT NOT NULL, invocation TEXT NOT NULL, findings TEXT NOT NULL
+                )
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_reviews (
+                    job_id INTEGER PRIMARY KEY REFERENCES jobs,
+                    run TEXT NOT NULL, candidate TEXT NOT NULL, lens TEXT NOT NULL, invocation TEXT NOT NULL
                 )
             """)
             self.db.execute("""
@@ -95,6 +109,20 @@ class Store:
                     "INSERT INTO accept_records (job_id,recorded_at,branch,sha,rounds,findings) VALUES (?,?,?,?,?,?)",
                     (job["id"], now(), job["branch"], job["sha"], evidence["rounds"], json.dumps(evidence["findings"])),
                 )
+            self.db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job["id"],))
+
+    def recover_pending_reviews(self):
+        # A previous daemon could not establish that it saved every observation.
+        # Keep the pending request for diagnosis and prevent ordinary retries.
+        with self.db:
+            self.db.execute(
+                "UPDATE jobs SET phase='interrupted', detail='review observation recording was interrupted' "
+                "WHERE phase='review' AND id IN (SELECT job_id FROM pending_reviews)",
+            )
+
+    def cancel_review(self, job_id):
+        with self.db:
+            self.db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job_id,))
 
     def retry(self, job_id):
         with self.db:
@@ -133,6 +161,26 @@ class Store:
             raise ValueError("job has no ready candidate")
         return json.loads(row["body"])
 
+    def begin_review(self, job_id, request):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "INSERT INTO pending_reviews (job_id, run, candidate, lens, invocation) VALUES (?, ?, ?, ?, ?)",
+                (job_id, request["run"], request["candidate"], request["lens"], request["invocation"]),
+            )
+
+    def record_protected(self, job_id, request, round_number, findings):
+        # The worker commits through its own connection before calling the observer.
+        with closing(sqlite3.connect(self.path)) as db, db:
+            if findings:
+                db.execute(
+                    """INSERT INTO protected_observations
+                       (job_id, run, candidate, round_number, lens, invocation, findings)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (job_id, request["run"], request["candidate"], round_number,
+                     request["lens"], request["invocation"], json.dumps(findings)),
+                )
+            db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job_id,))
+
     def protected(self, job_id):
         # A retry rebuilds from the approved source, so prior repair resolutions
         # must be re-checked against the rebuilt candidate.
@@ -149,6 +197,11 @@ class Store:
             for finding in evidence["findings"]:
                 if finding["risk"] != "other":
                     protected[finding["lens"], finding["id"]] = finding
+        for row in self.db.execute(
+            "SELECT lens, findings FROM protected_observations WHERE job_id=? ORDER BY id", (job_id,),
+        ):
+            for finding in json.loads(row["findings"]):
+                protected[row["lens"], finding["id"]] = {**finding, "lens": row["lens"]}
         return list(protected.values())
 
     def status(self):
@@ -161,6 +214,11 @@ class Store:
             body = job.pop("body")
             if body is not None:
                 job["evidence"] = json.loads(body)
+            if job["phase"] == "interrupted":
+                request = self.db.execute(
+                    "SELECT run,candidate,lens,invocation FROM pending_reviews WHERE job_id=?", (job["id"],),
+                ).fetchone()
+                job["pending_review"] = dict(request)
             rows.append(job)
         counts = {}
         for row in rows:

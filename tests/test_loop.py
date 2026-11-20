@@ -74,6 +74,8 @@ def queue(tmp_path, monkeypatch):
                lens_reviewers={"security": ["security-fixture"]}, review_observer=["observe-fixture"],
                review_key=b"review-source", checks={"required": ["verify-fixture"]},
                check_keys={"required": b"check-source"},
+               evidence={"observer": {"bundle": "incremental", "retention_seconds": 0},
+                         "checks": {"required": {"bundle": "incremental", "retention_seconds": 0}}},
                max_rounds=2, repair_paths=["file.txt"],
                retry_initial_seconds=0.05, retry_limit=2)
     return git, cfg
@@ -141,6 +143,70 @@ def test_queue_never_updates_shared_branches_and_bundle_needs_explicit_export(qu
     assert git.run("symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
     with pytest.raises(FileExistsError):
         export_candidate(cfg, evidence, bundle)
+
+
+def test_evidence_uses_each_adapters_approved_scope(queue, tmp_path):
+    import hashlib
+
+    git, cfg = queue
+    git.run("switch", "feature")
+    fixture = git.repo / "obsolete.txt"
+    fixture.write_text("retired fixture content\n")
+    git.run("add", fixture.name)
+    git.run("commit", "-m", "add obsolete fixture")
+    retired = git.run("rev-parse", f"HEAD:{fixture.name}").stdout.strip()
+    git.run("rm", fixture.name)
+    git.run("commit", "-m", "remove obsolete fixture with private subject")
+    git.run("switch", "main")
+    base, head = git.head("main"), git.head("feature")
+    cfg["evidence"] = {
+        "observer": {"bundle": "incremental", "retention_seconds": 0},
+        "checks": {"required": {"bundle": "full", "retention_seconds": 60}},
+    }
+    saw = set()
+
+    def inspect(argv, cwd, cancel, timeout, *, role, stdin, bundle=None, **kwargs):
+        if role != "reviewer" and role not in saw:
+            request = json.loads(stdin)["request"]
+            assert request["bundle_sha256"] == hashlib.sha256(bundle.read_bytes()).hexdigest()
+            isolated = tmp_path / role
+            isolated.mkdir()
+            receiver = Git(isolated)
+            receiver.run("init")
+            if role == "review-observer":
+                assert request["bundle_scope"] == "incremental"
+                assert request["retention_seconds"] == 0
+                assert request["bundle_prerequisites"] == [base, head]
+                assert receiver.run("bundle", "verify", str(bundle), allowed=(0, 1)).returncode == 1
+                # Inspect only the pack supplied by the adapter.
+                pack = tmp_path / "incremental.pack"
+                header, data = bundle.read_bytes().split(b"\n\n", 1)
+                assert b"private subject" not in header
+                pack.write_bytes(data)
+                with pack.open("rb") as stream:
+                    receiver.run("index-pack", "--stdin", stdin=stream)
+                assert receiver.run("cat-file", "-e", retired, allowed=(0, 1)).returncode == 1
+                assert receiver.run("cat-file", "-t", request["candidate"]).stdout.strip() == "commit"
+            else:
+                assert request["bundle_scope"] == "full"
+                assert request["retention_seconds"] == 60
+                assert request["bundle_prerequisites"] == []
+                receiver.run("bundle", "unbundle", str(bundle))
+                assert receiver.run("cat-file", "-t", retired).stdout.strip() == "blob"
+            saw.add(role)
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, bundle=bundle, **kwargs)
+
+    result = engine_run(cfg, "feature", head, inspect)
+    assert result["counts"] == {"candidate": 1}
+    assert saw == {"review-observer", "verify"}
+    ready = tmp_path / "ready.bundle"
+    export_candidate(cfg, result["jobs"][0]["evidence"], ready)
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    receiver = Git(fresh)
+    receiver.run("init")
+    receiver.run("bundle", "unbundle", str(ready))
+    assert receiver.run("cat-file", "-t", retired).stdout.strip() == "blob"
 
 
 @pytest.mark.parametrize("moved", ["main", "feature", "policy", "expired"])
@@ -229,6 +295,36 @@ def test_protected_finding_carries_across_partial_review_and_retry(queue):
     assert "explicit resolution evidence" in retry["jobs"][0]["detail"]
 
 
+def test_protected_finding_survives_stop_before_observer_completes(queue):
+    from core.loop.runtime import Cancelled
+
+    git, cfg = queue
+    sha = git.head("feature")
+    finding = {"id": "protected", "risk": "security", "detail": "Review evidence."}
+    observing = Event()
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        if role == "reviewer":
+            return review_response(stdin, [finding])
+        assert role == "review-observer"
+        observing.set()
+        assert cancel.wait(5)
+        raise Cancelled
+
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store, Engine(
+        cfg, store, runner=runner,
+    ) as engine:
+        store.enqueue("feature", sha)
+        engine.tick()
+        assert observing.wait(5)
+        assert store.protected(1) == [{**finding, "lens": "general"}]
+        assert store.status()["counts"] == {"review": 1}
+
+    restarted = engine_run(cfg, "feature", sha, clean_run)
+    assert restarted["counts"] == {"blocked": 1}
+    assert "explicit resolution evidence" in restarted["jobs"][0]["detail"]
+
+
 @pytest.mark.parametrize("risk, phase", [("security", "blocked"), ("other", "waiting")])
 def test_round_cap_blocks_protected_or_records_ordinary_findings(queue, risk, phase):
     git, cfg = queue
@@ -279,6 +375,104 @@ def test_primary_reviewer_cannot_close_protected_finding_on_its_own(queue):
     assert "independent review coverage or protected resolution" in job["detail"]
     assert job["evidence"]["findings"] == [{**finding, "lens": "general"}]
     assert not (cfg["state"] / "candidates").exists()
+
+
+def test_protected_closure_is_checked_again_after_another_repair(queue):
+    git, cfg = queue
+    cfg["max_rounds"] = 3
+    protected = {"id": "protected", "risk": "security", "detail": "Fixture protection"}
+    ordinary = {"id": "ordinary", "risk": "other", "detail": "Make one more repair."}
+    observed = set()
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        if role == "worker":
+            path = cwd / "file.txt"
+            path.write_text("second\n" if path.read_text() == "feature\n" else "third\n")
+            return ""
+        if role == "reviewer" and argv == cfg["reviewer"]:
+            revision = (cwd / "file.txt").read_text().strip()
+            if revision == "feature":
+                return review_response(stdin, [protected])
+            prior = json.loads(stdin.splitlines()[-1])["prior_protected"]
+            assert prior == [{**protected, "lens": "general"}]
+            return review_response(stdin, [ordinary] if revision == "second" else [],
+                                   resolved={"protected": "Primary checked this revision."})
+        out = clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+        if role == "review-observer" and json.loads(stdin)["review"]["resolved"]:
+            candidate = json.loads(stdin)["request"]["candidate"]
+            observed.add(candidate)
+            return json.dumps({**json.loads(out), "resolved": {"protected": "Independently confirmed."}})
+        return out
+
+    result = engine_run(cfg, "feature", git.head("feature"), runner)
+    assert result["counts"] == {"candidate": 1}
+    evidence = result["jobs"][0]["evidence"]
+    assert evidence["candidate"] in observed
+    assert len(observed) == 2
+
+
+def test_shutdown_collects_protected_evidence_after_a_journal_error(queue, monkeypatch):
+    import sqlite3
+
+    git, cfg = queue
+    attempted = Event()
+    finding = {"id": "protected", "risk": "security", "detail": "Fixture protection"}
+
+    def fail_journal(*args):
+        attempted.set()
+        raise sqlite3.OperationalError("fixture unavailable")
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        assert role == "reviewer"
+        return review_response(stdin, [finding])
+
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+        monkeypatch.setattr(store, "record_protected", fail_journal)
+        store.enqueue("feature", git.head("feature"))
+        with Engine(cfg, store, runner=runner) as engine:
+            engine.tick()
+            assert attempted.wait(5)
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as reopened:
+        assert reopened.protected(1) == [{**finding, "lens": "general"}]
+        assert reopened.status()["counts"] == {"blocked": 1}
+
+
+def test_restart_blocks_when_neither_observation_write_can_commit(queue, monkeypatch):
+    import sqlite3
+
+    git, cfg = queue
+    attempted = Event()
+    finding = {"id": "protected", "risk": "security", "detail": "Fixture protection"}
+    requests = []
+
+    def fail_write(*args, **kwargs):
+        attempted.set()
+        raise sqlite3.OperationalError("fixture unavailable")
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        assert role == "reviewer"
+        requests.append(json.loads(stdin.splitlines()[-1])["request"])
+        return review_response(stdin, [finding])
+
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+        monkeypatch.setattr(store, "record_protected", fail_write)
+        monkeypatch.setattr(store, "update", fail_write)
+        store.enqueue("feature", git.head("feature"))
+        with pytest.raises(sqlite3.OperationalError, match="fixture unavailable"):
+            with Engine(cfg, store, runner=runner) as engine:
+                engine.tick()
+                assert attempted.wait(5)
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as reopened:
+        with Engine(cfg, reopened, runner=runner) as restarted:
+            restarted.tick()
+            assert not restarted.active
+            report = reopened.status()
+            assert report["counts"] == {"interrupted": 1}
+            assert report["jobs"][0]["pending_review"] == {
+                key: requests[0][key] for key in ("run", "candidate", "lens", "invocation")
+            }
+            with pytest.raises(ValueError, match="retry requires"):
+                reopened.retry(1)
 
 
 @pytest.mark.parametrize("result", ["valid", "unsigned", "wrong-source", "wrong-candidate", "wrong-coverage"])

@@ -14,7 +14,9 @@ issues in isolated worktrees, and gathers verification evidence.
 
 ### 1. Install the CLI and user rules
 
-Install Git and Python 3.11 or later. The live loop also needs OpenSSL and
+Install Git and Python 3.11 or later at `/usr/bin/python3` for the packaged CLI.
+The launcher uses isolated Python startup. Optional packages for installed
+commands must be available to the system interpreter. The live loop also needs OpenSSL and
 Linux with working unprivileged Bubblewrap namespaces. Use a trusted checkout of this
 kit. The installer defaults to `~/.local`.
 
@@ -30,8 +32,13 @@ kevin-agent-kit init --global
 Persist the `PATH` setting in the shell that launches Claude Code. The demo
 uses bundled fixtures and a temporary Git repository. The global installer
 copies the installed rule text into a managed block in `~/.claude/CLAUDE.md`
-and `~/.codex/AGENTS.md`. Each block records the kit version and content hash.
-Rerun the installer to update the snapshot when you approve a new version.
+and `~/.codex/AGENTS.md`. Each block records the installation ID, kit version,
+and content hash. Rerun `init --global` to update an unedited snapshot after
+approving a new version. An ownership or content conflict stops the operation
+before writing either file. Review an older link or snapshot block before
+updating it with `init --global --adopt-rules-sha256 SHA256`. Use the exact
+digest reported for the reviewed block and repeat the option for distinct
+digests. See [global rule ownership](docs/adr/global-rule-ownership.md).
 The home and client paths must be owned by the current user, with no symlinks
 or group or other write access. Updating existing files requires Linux
 filesystem support for atomic exchange and metadata preservation.
@@ -54,7 +61,8 @@ See the [Claude Code marketplace guide](https://code.claude.com/docs/en/plugin-m
 In the repository you want the loop to review, run `kevin-agent-kit init`.
 Open the printed TOML path and review the detected target and test command
 suggestions. Configure dedicated review adapters and signed evidence sources
-for independent review and required checks.
+for independent review and required checks. Approve each evidence adapter's
+bundle scope and retention in the profile.
 Repair is optional and needs both a worker command and an approved path scope.
 The profile lives under `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`.
 See [profile and wrapper setup](docs/loop.md).
@@ -72,7 +80,8 @@ kevin-agent-kit status
 
 Look for a `candidate` job ID. After reviewing the evidence,
 `kevin-agent-kit candidate JOB_ID --output /absolute/path/candidate.bundle`
-exports the verified commit. Apply it through your repository's normal
+exports the verified commit with its reachable Git history to a local file.
+Apply it through your repository's normal
 approval and Git workflow. State, queue, and logs live under
 `${XDG_STATE_HOME:-$HOME/.local/state}/kevin-agent-kit/`.
 
@@ -84,7 +93,7 @@ kevin-agent-kit init --global --uninstall --dry-run
 kevin-agent-kit init --global --uninstall
 ```
 
-The uninstall command removes the managed blocks. To remove the Claude Code
+The uninstall command removes the kit's intact, recorded blocks. To remove the Claude Code
 plugin, use `/plugin uninstall kevin-agent-kit@kevin-agent-kit`.
 
 From the kit checkout, use `python3 -m core.loop` in place of the installed
