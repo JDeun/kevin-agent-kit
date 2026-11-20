@@ -1,0 +1,17 @@
+architecture-fitness:
+  # The referenced runner image supplies the approved kit on PATH.
+  image: $FITNESS_RUNNER_IMAGE
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - |
+      if [ "$CI_PROJECT_ID" = "$CI_MERGE_REQUEST_PROJECT_ID" ]; then
+        target_remote=origin
+      else
+        target_remote="$CI_MERGE_REQUEST_PROJECT_URL.git"
+      fi
+      git fetch --no-tags -- "$target_remote" "refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      target_sha="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:-FETCH_HEAD}"
+      kevin-agent-kit fitness check --config fitness.toml --baseline fitness-baseline.json --target "$target_sha"

@@ -40,7 +40,7 @@ def test_global_rules_embed_an_immutable_copy(tmp_path, monkeypatch):
     rule.write_bytes(b"# Edited rule\n")
     installed = (tmp_path / ".claude/CLAUDE.md").read_bytes()
     assert text in installed
-    assert b"sha256" in installed and b"0.1.0" in installed
+    assert b"sha256" in installed and setup.project()["version"].encode() in installed
     assert str(source).encode() not in installed
 
 

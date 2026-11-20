@@ -106,10 +106,11 @@ def validate_evidence(policy, checks):
 def policy_id(raw, execution, keys):
     code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
     lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
+    prompts = PACKAGE_ROOT / "reviews/persona/prompts.py"
     rules = sorted((ROOT / "rules").glob("*.md"))
     tools = [repr(tool).encode("utf-8", errors="surrogateescape") for tool in execution["tools"].values()]
     sockets = [repr(socket).encode("utf-8", errors="surrogateescape") for socket in execution["sockets"].values()]
-    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules)), *tools, *sockets, *keys)
+    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules, prompts)), *tools, *sockets, *keys)
 
 
 def config(path=None, *, control_only=False):
@@ -142,6 +143,10 @@ def config(path=None, *, control_only=False):
         raise ValueError("state must be outside the checkout and Git directory")
     if control_only:
         return {"state": state}
+    if type(data["design_gate"]) is not bool:
+        raise ValueError("design_gate must be a boolean")
+    if type(data["repeat_class_rounds"]) is not int or data["repeat_class_rounds"] < 2:
+        raise ValueError("repeat_class_rounds must be an integer of at least two")
     for key in ("max_rounds", "max_jobs", "poll_seconds", "timeout_seconds", "retry_initial_seconds",
                 "retry_limit", "retry_max_seconds", "evidence_ttl_seconds"):
         if type(data[key]) is not int or data[key] < 1:

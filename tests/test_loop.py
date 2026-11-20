@@ -70,7 +70,7 @@ def queue(tmp_path, monkeypatch):
     profile = repository_profile(repo)
     cfg = config(profile)
     ensure_state(cfg["state"])
-    cfg.update(profile=None, reviewer=["review-fixture"], worker=["worker-fixture"],
+    cfg.update(profile=None, design_gate=False, reviewer=["review-fixture"], worker=["worker-fixture"],
                lens_reviewers={"security": ["security-fixture"]}, review_observer=["observe-fixture"],
                review_key=b"review-source", checks={"required": ["verify-fixture"]},
                check_keys={"required": b"check-source"},
@@ -103,6 +103,8 @@ def engine_run(cfg, branch, sha, runner, *, retry=False, authenticate=None):
 
 def review_response(stdin, findings=(), resolved=None):
     request = json.loads(stdin.splitlines()[-1])["request"]
+    if request.get("finding_class_required"):
+        findings = [{"finding_class": item["id"], **item} for item in findings]
     return json.dumps(dict(request=request, status="complete", tool_version="fixture",
                            reviewed_paths=request["paths"], diagnostics=[], findings=list(findings),
                            resolved=resolved or {}))
@@ -317,7 +319,7 @@ def test_protected_finding_survives_stop_before_observer_completes(queue):
         store.enqueue("feature", sha)
         engine.tick()
         assert observing.wait(5)
-        assert store.protected(1) == [{**finding, "lens": "general"}]
+        assert store.protected(1) == [{**finding, "lens": "general", "finding_class": "protected"}]
         assert store.status()["counts"] == {"review": 1}
 
     restarted = engine_run(cfg, "feature", sha, clean_run)
@@ -373,7 +375,7 @@ def test_primary_reviewer_cannot_close_protected_finding_on_its_own(queue):
     job = status["jobs"][0]
     assert job["phase"] == "blocked"
     assert "independent review coverage or protected resolution" in job["detail"]
-    assert job["evidence"]["findings"] == [{**finding, "lens": "general"}]
+    assert job["evidence"]["findings"] == [{**finding, "lens": "general", "finding_class": "protected"}]
     assert not (cfg["state"] / "candidates").exists()
 
 
@@ -394,7 +396,7 @@ def test_protected_closure_is_checked_again_after_another_repair(queue):
             if revision == "feature":
                 return review_response(stdin, [protected])
             prior = json.loads(stdin.splitlines()[-1])["prior_protected"]
-            assert prior == [{**protected, "lens": "general"}]
+            assert prior == [{**protected, "lens": "general", "finding_class": "protected"}]
             return review_response(stdin, [ordinary] if revision == "second" else [],
                                    resolved={"protected": "Primary checked this revision."})
         out = clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
@@ -433,7 +435,7 @@ def test_shutdown_collects_protected_evidence_after_a_journal_error(queue, monke
             engine.tick()
             assert attempted.wait(5)
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as reopened:
-        assert reopened.protected(1) == [{**finding, "lens": "general"}]
+        assert reopened.protected(1) == [{**finding, "lens": "general", "finding_class": "protected"}]
         assert reopened.status()["counts"] == {"blocked": 1}
 
 
@@ -620,3 +622,135 @@ def test_repaired_candidate_is_materialized_without_worker_scratch(queue):
         return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
 
     assert engine_run(cfg, "feature", sha, runner)["counts"] == {"candidate": 1}
+
+
+def test_design_gate_returns_implementation_without_design_before_review(queue):
+    git, cfg = queue
+    cfg["design_gate"] = True
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("implementation reached an adapter before design approval")
+
+    result = engine_run(cfg, "feature", git.head("feature"), unexpected)
+    assert result["counts"] == {"design-needed": 1}
+    assert result["metrics"]["review_rounds"] == 0
+
+
+@pytest.mark.parametrize("second, phase", [("coupling", "forest"), ("contention", "candidate")])
+def test_repeat_class_pauses_automatic_repair(queue, second, phase):
+    git, cfg = queue
+    cfg["max_rounds"] = 3
+    cfg["repeat_class_rounds"] = 2
+    worker_calls = 0
+
+    def classify(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        nonlocal worker_calls
+        if role == "worker":
+            worker_calls += 1
+            (cwd / "file.txt").write_text(f"repair {worker_calls}\n")
+            return ""
+        if role == "reviewer" and argv == cfg["reviewer"] and worker_calls < 2:
+            return review_response(stdin, [{
+                "id": f"case-{worker_calls}", "risk": "other", "detail": "Fixture.",
+                "finding_class": second if worker_calls else "coupling",
+            }])
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+
+    result = engine_run(cfg, "feature", git.head("feature"), classify)
+    assert result["counts"] == {phase: 1}
+    assert worker_calls == (1 if phase == "forest" else 2)
+    assert result["metrics"]["review_rounds"] == worker_calls + 1
+    if phase == "forest":
+        assert result["metrics"]["forest_escalations"] == 1
+        assert result["jobs"][0]["evidence"]["repeated_classes"] == ["coupling"]
+        git.run("switch", "feature")
+        git.run("commit", "--allow-empty", "-m", "new revision")
+        with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+            with pytest.raises(ValueError, match="retry requires"):
+                store.retry(1)
+            store.enqueue("feature", git.head("feature"), kind="routine")
+            with Engine(cfg, store, runner=classify) as engine:
+                engine.tick()
+            assert store.status()["jobs"][1]["phase"] == "forest-held"
+
+
+@pytest.mark.parametrize("case", ["approved", "includes-code", "rejected", "changed-design"])
+def test_design_review_binds_approval_to_design_only_commit(queue, case):
+    git, cfg = queue
+    cfg["design_gate"] = True
+    cfg["lens_reviewers"].update(architect=["architect-fixture"], sre=["sre-fixture"])
+    git.run("switch", "-c", "planned", "main")
+    design = git.repo / "design.md"
+    design.write_text(
+        "# Export design\n\n"
+        "## Canonical design\nOne export owner handles dispatch.\n"
+        "## Failure modes and rollback\nRestore the previous dispatcher on failure.\n"
+        "## Latency budget\np95 below 200 ms.\n"
+        "## Memory budget\nPeak RSS below 64 MiB.\n"
+        "## Test plan\nExercise dispatch, overload and rollback.\n"
+    )
+    git.run("add", design.name)
+    if case == "includes-code":
+        (git.repo / "code.py").write_text("answer = 42\n")
+        git.run("add", "code.py")
+    git.run("commit", "-m", "propose design")
+    design_sha = git.head("planned")
+    lenses_seen = []
+
+    def review_design(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        request = json.loads(stdin.splitlines()[-1])["request"]
+        assert role == "reviewer" and request["kind"] == "design-review"
+        assert request["head"] == design_sha and (cwd / design.name).is_file()
+        lenses_seen.append(request["lens"])
+        findings = [{"id": "rollback", "risk": "other", "detail": "Unclear rollback."}]
+        return review_response(stdin, findings if case == "rejected" and request["lens"] == "sre" else [])
+
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+        with Engine(cfg, store, runner=review_design) as engine:
+            if case == "includes-code":
+                with pytest.raises(ValueError, match="only"):
+                    engine.design_review("planned", design_sha, design.name)
+                assert not lenses_seen
+                return
+            result = engine.design_review("planned", design_sha, design.name)
+    assert lenses_seen == ["architect", "sre"]
+    assert result["status"] == ("changes-requested" if case == "rejected" else "approved")
+    (git.repo / "code.py").write_text("answer = 42\n")
+    if case == "changed-design":
+        design.write_text(design.read_text() + "\nChange the design.\n")
+    git.run("add", "-A")
+    git.run("commit", "-m", "implement")
+    status = engine_run(cfg, "planned", git.head("planned"), clean_run)
+    assert status["counts"] == {"candidate" if case == "approved" else "design-needed": 1}
+
+
+def test_v01_queue_rows_default_to_design_admission(queue):
+    import sqlite3
+
+    git, cfg = queue
+    cfg["design_gate"] = True
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+        store.enqueue("feature", git.head("feature"))
+        path = store.path
+    # Remove the v0.2 column to model an existing v0.1 queue.
+    with sqlite3.connect(path) as legacy:
+        legacy.execute("ALTER TABLE jobs DROP COLUMN kind")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("an unclassified legacy job reached review")
+
+    result = engine_run(cfg, "feature", git.head("feature"), unexpected)
+    assert result["jobs"][0]["kind"] == "unclassified"
+    assert result["counts"] == {"design-needed": 1}
+
+
+def test_status_counts_candidate_merge_conflicts(queue):
+    git, cfg = queue
+    git.run("switch", "main")
+    (git.repo / "file.txt").write_text("target\n")
+    git.run("add", "file.txt")
+    git.run("commit", "-m", "competing target change")
+
+    result = engine_run(cfg, "feature", git.head("feature"), clean_run)
+    assert result["counts"] == {"blocked": 1}
+    assert result["metrics"]["merge_failures"] == {"conflict": 1}

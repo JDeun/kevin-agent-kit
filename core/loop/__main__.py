@@ -10,9 +10,10 @@ import time
 
 from .config import MODULE_PREFIX, ROOT, config, project, repo_id
 from .daemon import ensure_state, running, serve, start, stop, validate_execution
+from .design import TASK_KINDS
 from .engine import Engine, check_candidate, export_candidate
 from .git import Git
-from .runtime import Busy, module_command, run
+from .runtime import Busy, Retry, module_command, run
 from .setup import global_rules, repository_profile
 from .store import SHA, Store
 
@@ -39,7 +40,8 @@ from pathlib import Path
 import sys
 request = json.loads(sys.stdin.read().splitlines()[-1])["request"]
 wrong = Path("example.txt").read_text().strip() != "correct"
-items = [{"id": "wrong-text", "risk": "other", "detail": "Use the expected text."}] if wrong else []
+items = [{"id": "wrong-text", "risk": "other", "detail": "Use the expected text.",
+          "finding_class": "unexpected-output"}] if wrong else []
 print(json.dumps(dict(request=request, status="complete", tool_version="demo",
                       reviewed_paths=request["paths"], diagnostics=[], findings=items, resolved={})))
 """
@@ -79,6 +81,7 @@ Path("example.txt").write_text("correct" + chr(10))
         checks={"example": ["check-fixture"]}, repair_paths=["example.txt"],
         lenses={}, lens_reviewers={"security": review_command}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
         evidence_ttl_seconds=60, retry_limit=1, retry_initial_seconds=1, retry_max_seconds=1,
+        design_gate=False, repeat_class_rounds=2,
         memory={stage: {"max_anon_mib": 0, "min_available_mib": 0} for stage in ("review", "test")},
     )
     # The standalone demo uses only its in-process fixture sources.
@@ -114,6 +117,7 @@ def main(argv=None):
         "hosting": "core.adapters",
         "ledger": "core.ledgers",
         "guard": "guards",
+        "fitness": "guards.fitness",
         "screenshot": "verify.screenshot",
     }
     if argv and argv[0] in modules:
@@ -135,6 +139,11 @@ def main(argv=None):
     enqueue = commands.add_parser("enqueue")
     enqueue.add_argument("branch")
     enqueue.add_argument("sha")
+    enqueue.add_argument("--kind", choices=TASK_KINDS, default="unclassified")
+    design = commands.add_parser("design-review", help="review a design-only source revision before implementation")
+    design.add_argument("branch")
+    design.add_argument("sha")
+    design.add_argument("--design", required=True, help="repository-relative Markdown path")
     retry = commands.add_parser("retry")
     retry.add_argument("job_id", type=int)
     candidate = commands.add_parser("candidate", help="export an exact ready candidate bundle")
@@ -178,7 +187,11 @@ def main(argv=None):
                     if (not SHA.fullmatch(args.sha) or args.branch == cfg["target"]
                             or git.head(args.branch) != args.sha):
                         raise ValueError("enqueue requires the exact current SHA of a distinct source branch")
-                    store.enqueue(args.branch, args.sha)
+                    store.enqueue(args.branch, args.sha, kind=args.kind)
+                elif args.action == "design-review":
+                    report = Engine(cfg, store).design_review(args.branch, args.sha, args.design)
+                    print(json.dumps(report, indent=2))
+                    return int(report["status"] != "approved")
                 elif args.action == "retry":
                     store.retry(args.job_id)
                 elif args.action == "candidate":
@@ -208,7 +221,7 @@ def main(argv=None):
                             report["counts"]["stale"] = report["counts"].get("stale", 0) + 1
                     report["counts"] = {phase: count for phase, count in report["counts"].items() if count}
                     print(json.dumps({"running": running(state), **report}, indent=2))
-    except (ValueError, OSError, sqlite3.Error, Busy) as error:
+    except (ValueError, OSError, sqlite3.Error, Busy, Retry) as error:
         print(f"{parser.prog}: {error or 'coordinator is already running'}", file=sys.stderr)
         return 1
     return 0

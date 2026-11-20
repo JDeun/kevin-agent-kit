@@ -7,6 +7,8 @@ import sqlite3
 import stat
 import time
 
+from .design import TASK_KINDS
+
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
@@ -48,7 +50,19 @@ class Store:
                     id INTEGER PRIMARY KEY, branch TEXT NOT NULL, sha TEXT NOT NULL,
                     phase TEXT NOT NULL DEFAULT 'review', attempts INTEGER NOT NULL DEFAULT 0,
                     next_at REAL NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL DEFAULT 'unclassified',
                     UNIQUE(branch, sha)
+                )
+            """)
+            if "kind" not in {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'unclassified'")
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS design_reviews (branch TEXT PRIMARY KEY, body TEXT NOT NULL)
+            """)
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS review_rounds (
+                    job_id INTEGER NOT NULL REFERENCES jobs, run TEXT NOT NULL, number INTEGER NOT NULL,
+                    PRIMARY KEY (job_id, run, number)
                 )
             """)
             self.db.execute("""
@@ -86,11 +100,44 @@ class Store:
         finally:
             self.db.close()
 
-    def enqueue(self, branch, sha):
+    def enqueue(self, branch, sha, *, kind="unclassified"):
         if not SHA.fullmatch(sha):
             raise ValueError("expected a full lowercase commit SHA")
+        if kind not in TASK_KINDS:
+            raise ValueError("unknown task kind")
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha) VALUES (?,?)", (branch, sha))
+            self.db.execute("INSERT OR IGNORE INTO jobs(branch,sha,kind) VALUES (?,?,?)", (branch, sha, kind))
+            recorded = self.db.execute("SELECT kind FROM jobs WHERE branch=? AND sha=?", (branch, sha)).fetchone()
+            if kind != "unclassified" and recorded["kind"] != kind:
+                raise ValueError("this branch and SHA already have a different task kind")
+
+    def latest_forest(self, branch):
+        return self.db.execute(
+            """SELECT j.id,j.sha FROM jobs j JOIN evidence e ON e.job_id=j.id
+               WHERE j.branch=? AND e.phase='forest' ORDER BY e.id DESC LIMIT 1""", (branch,),
+        ).fetchone()
+
+    def design(self, branch):
+        row = self.db.execute("SELECT body FROM design_reviews WHERE branch=?", (branch,)).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def save_design(self, report):
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            forest = self.latest_forest(report["branch"])
+            if (forest["id"] if forest else None) != report["forest_job"]:
+                raise ValueError("branch hold changed during design review; review the new redesign")
+            self.db.execute(
+                "INSERT OR REPLACE INTO design_reviews (branch,body) VALUES (?,?)",
+                (report["branch"], json.dumps(report)),
+            )
+
+    def record_round(self, job, run, number, *, escalation=None):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("INSERT INTO review_rounds VALUES (?,?,?)", (job["id"], run, number))
+            if escalation:
+                self._update(db, job, "forest", "redesign required after repeated finding classes",
+                             0, 0, escalation)
 
     def ready(self):
         return self.db.execute(
@@ -99,17 +146,20 @@ class Store:
 
     def update(self, job, phase, *, detail="", attempts=0, next_at=0, evidence=None):
         with self.db:
-            self.db.execute("UPDATE jobs SET phase=?,detail=?,attempts=?,next_at=? WHERE id=?",
-                            (phase, detail, attempts, next_at, job["id"]))
-            if evidence is not None:
-                self.db.execute("INSERT INTO evidence (job_id,phase,body) VALUES (?,?,?)",
-                                (job["id"], phase, json.dumps(evidence)))
-            if phase == "waiting":
-                self.db.execute(
-                    "INSERT INTO accept_records (job_id,recorded_at,branch,sha,rounds,findings) VALUES (?,?,?,?,?,?)",
-                    (job["id"], now(), job["branch"], job["sha"], evidence["rounds"], json.dumps(evidence["findings"])),
-                )
-            self.db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job["id"],))
+            self._update(self.db, job, phase, detail, attempts, next_at, evidence)
+
+    def _update(self, db, job, phase, detail, attempts, next_at, evidence):
+        db.execute("UPDATE jobs SET phase=?,detail=?,attempts=?,next_at=? WHERE id=?",
+                   (phase, detail, attempts, next_at, job["id"]))
+        if evidence is not None:
+            db.execute("INSERT INTO evidence (job_id,phase,body) VALUES (?,?,?)",
+                       (job["id"], phase, json.dumps(evidence)))
+        if phase == "waiting":
+            db.execute(
+                "INSERT INTO accept_records (job_id,recorded_at,branch,sha,rounds,findings) VALUES (?,?,?,?,?,?)",
+                (job["id"], now(), job["branch"], job["sha"], evidence["rounds"], json.dumps(evidence["findings"])),
+            )
+        db.execute("DELETE FROM pending_reviews WHERE job_id=?", (job["id"],))
 
     def recover_pending_reviews(self):
         # A previous daemon could not establish that it saved every observation.
@@ -128,10 +178,10 @@ class Store:
         with self.db:
             changed = self.db.execute(
                 "UPDATE jobs SET phase='review',attempts=0,next_at=0,detail='' "
-                "WHERE id=? AND phase IN ('blocked','candidate','stale')", (job_id,),
+                "WHERE id=? AND phase IN ('blocked','candidate','stale','design-needed','forest-held')", (job_id,),
             )
             if changed.rowcount != 1:
-                raise ValueError("retry requires a blocked, candidate or stale job")
+                raise ValueError("retry requires a blocked, candidate, stale or design-pending job")
 
     def decide(self, record, disposition, source):
         if not source.strip():
@@ -189,12 +239,12 @@ class Store:
             "SELECT body FROM evidence WHERE job_id=? ORDER BY id", (job_id,),
         ):
             evidence = json.loads(row["body"])
-            for review in evidence["reviews"]:
+            for review in evidence.get("reviews", []):
                 lens = review["request"]["lens"]
                 for finding in review["findings"]:
                     if finding["risk"] != "other":
                         protected[lens, finding["id"]] = {**finding, "lens": lens}
-            for finding in evidence["findings"]:
+            for finding in evidence.get("findings", []):
                 if finding["risk"] != "other":
                     protected[finding["lens"], finding["id"]] = finding
         for row in self.db.execute(
@@ -227,4 +277,14 @@ class Store:
             {**dict(row), "findings": json.loads(row["findings"])} for row in
             self.db.execute("SELECT * FROM accept_records ORDER BY id")
         ]
-        return {"counts": counts, "jobs": rows, "accept_records": records}
+        merge_failures = dict(self.db.execute("""
+            SELECT json_extract(body, '$.merge_failure') AS reason, count(*) FROM evidence
+            WHERE reason IS NOT NULL GROUP BY reason ORDER BY reason
+        """))
+        metrics = {
+            "queue_length": counts.get("review", 0),
+            "review_rounds": self.db.execute("SELECT count(*) FROM review_rounds").fetchone()[0],
+            "forest_escalations": counts.get("forest", 0),
+            "merge_failures": merge_failures,
+        }
+        return {"counts": counts, "jobs": rows, "accept_records": records, "metrics": metrics}

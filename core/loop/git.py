@@ -11,6 +11,12 @@ class Conflict(ValueError):
     pass
 
 
+class MergeFailure(Conflict):
+    def __init__(self, reason):
+        super().__init__(f"candidate merge failed: {reason}")
+        self.reason = reason
+
+
 def git_env():
     return {
         "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
@@ -90,7 +96,13 @@ class Git:
 
     def candidate(self, base, head):
         self.run("checkout", "--quiet", "--detach", base)
-        self.run("merge", "--no-edit", "--no-ff", head)
+        try:
+            self.run("merge", "--no-edit", "--no-ff", head)
+        except subprocess.TimeoutExpired as error:
+            raise MergeFailure("timeout") from error
+        except Conflict as error:
+            unmerged = self.run("ls-files", "-u", "-z").stdout
+            raise MergeFailure("conflict" if unmerged else "merge-error") from error
         return self.resolve()
 
     def repair(self, allowed_paths):

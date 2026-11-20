@@ -9,6 +9,8 @@ import tempfile
 from threading import Event
 import tomllib
 
+from .prompts import adversarial_prompt
+
 if __package__ == "reviews.persona":
     from core.loop.config import read_profile, repository
     from core.loop.review import rules
@@ -27,9 +29,9 @@ REVIEW_PROMPTS = {
         "Record the task, sample input, steps, observed output, and where you got stuck. "
         "Use runnable artifacts with available tools. Describe which steps you could carry out."
     ),
-    "adversarial": (
-        "Stress-test each artifact against the brief. Identify edge cases, accessibility "
-        "problems, and broken assumptions. Give concrete scenarios and cite artifact details."
+    "adversarial": adversarial_prompt(
+        "Review each alternative against the brief. Identify edge cases, accessibility "
+        "problems, and broken assumptions."
     ),
 }
 

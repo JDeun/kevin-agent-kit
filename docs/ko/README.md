@@ -66,10 +66,14 @@ Claude Code에서 마켓플레이스를 추가하고, 플러그인을 설치할 
 
 변경을 커밋한 로컬 브랜치를 등록합니다. 다른 프로필을 쓰려면 하위 명령 앞에
 `--config /절대/경로/profile.toml`을 지정합니다.
+새 기능이나 구조 변경은 [설계 문서](../design-template.md)만 먼저 커밋하고
+`kevin-agent-kit design-review BRANCH DESIGN_SHA --design PATH`를 실행합니다.
+아키텍트와 SRE 검토를 통과하면 구현을 시작합니다. 설정의 `design_gate = false`로
+초기 설계 게이트를 끌 수 있습니다.
 
 ```sh
 kevin-agent-kit start
-kevin-agent-kit enqueue feature/example "$(git rev-parse refs/heads/feature/example)"
+kevin-agent-kit enqueue feature/example "$(git rev-parse refs/heads/feature/example)" --kind feature
 kevin-agent-kit status
 ```
 
@@ -78,6 +82,8 @@ kevin-agent-kit status
 검증한 커밋과 그 커밋에서 도달할 수 있는 Git 이력을 로컬 파일로 내보냅니다.
 적용은 프로젝트의 기존 승인·Git 절차를 따릅니다.
 큐·로그·장부는 `${XDG_STATE_HOME:-$HOME/.local/state}/kevin-agent-kit/` 아래에 있습니다.
+같은 `finding_class`가 기본 두 라운드 연속 남으면 `forest`로 전환하고,
+해당 브랜치는 새 설계를 검토할 때까지 자동 수정을 보류합니다.
 
 ### 4. 루프 끄기와 전역 규칙 제거
 
@@ -99,6 +105,8 @@ CLI와 플러그인 이름을 바꿀 수 있습니다. Python 모듈 이름은 �
 - [페르소나 리뷰](../../reviews/persona/README.md)는 설계 대안과 의사결정 자료를 만듭니다.
 - [스크린샷 검증](../../verify/README.md)으로 실행 중인 앱을 캡처해 PR이나 MR에 근거를 남길 수 있습니다.
 - [가드](../guards.md)와 [장부](../ledgers.md)에서 검사 항목과 기록 방법을 확인할 수 있습니다.
+- [아키텍처 적합성](../fitness.md)에서 `kevin-agent-kit fitness`, 위반 기준선, 부하 시험과 CI 예시를 확인할 수 있습니다.
+- [운영 관측](../observability.md)은 배포 뒤 SLO 판독과 `status`의 큐 길이·라운드·숲 전환·머지 실패 지표를 설명합니다.
 - [비용과 컨텍스트](../cost.md)는 모델 선택과 세션 사용량 관리 방법을 설명합니다.
 
 ## 참고한 공개 프로젝트와 발표

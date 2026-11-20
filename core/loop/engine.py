@@ -1,3 +1,4 @@
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
@@ -11,12 +12,13 @@ import time
 from uuid import uuid4
 
 from .config import config, repo_id
+from .design import DESIGN_LENSES, approval_matches, document, validate_document
 from .evidence import canonical, signed_receipt, source_id
-from .git import Conflict, Git
+from .git import Conflict, Git, MergeFailure
 from .review import BLOCKING, brief, lenses, observed_review, prompt, review_receipt, verified_check
 from .runtime import Cancelled, MemoryGate, Retry, private_dir
 from .sandbox import execute, redact
-from .store import now
+from .store import SHA, now
 
 
 class SourceChanged(Conflict):
@@ -126,27 +128,73 @@ class Engine:
         return self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
                            policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
 
-    def review(self, job_id, work, package, evidence, paths, prior, history, rounds):
+    def review_result(self, argv, work, evidence, request, previous=(), prior_round=()):
+        output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous, prior_round))
+        review = review_receipt(output, request, previous)
+        env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
+        review["tool_version"] = redact(review["tool_version"], env_names)
+        review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
+        for item in review["findings"]:
+            item["detail"] = redact(item["detail"], env_names)
+            if "finding_class" in item and redact(item["finding_class"], env_names) != item["finding_class"]:
+                raise ValueError("finding_class contains a protected value")
+        return review
+
+    def design_review(self, branch, head, path):
+        base = self.git.head(self.cfg["target"])
+        if not base or branch == self.cfg["target"] or not SHA.fullmatch(head) or self.git.head(branch) != head:
+            raise ValueError("design-review requires the exact current SHA of a distinct source branch")
+        forest = self.store.latest_forest(branch)
+        if not self.git.ancestor(base, head) or self.git.paths(base, head) != [path]:
+            raise ValueError("the branch must start at the target and change only the design document")
+        # A reverted implementation still leaves implementation commits in this range.
+        history = self.git.run("log", "--format=", "--name-only", "-m", "-z", f"{base}..{head}").stdout
+        if set(history.strip("\0").split("\0")) != {path}:
+            raise ValueError("design history may change only the design document")
+        if forest and self.git.ancestor(head, forest["sha"]):
+            raise ValueError("a branch hold requires a new design commit")
+        blob = document(self.git, head, path)
+        validate_document(self.git, blob)
+        adapters = self.cfg["lens_reviewers"]
+        if not all(adapters.get(lens) for lens in DESIGN_LENSES):
+            raise ValueError("configure distinct architect and sre review adapters in the trusted profile")
+        evidence = {
+            "repo_id": self.cfg["repo_id"], "target": self.cfg["target"], "base": base, "head": head,
+            "branch": branch, "candidate": head, "policy": self.cfg["policy_id"], "run": uuid4().hex,
+            "design_blob": blob,
+        }
+        reviews = []
+        with self.git.snapshot(self.cfg["state"], base, head) as (git, _):
+            git.run("checkout", "--quiet", "--detach", head)
+            for lens in DESIGN_LENSES:
+                request = {**evidence, "kind": "design-review", "paths": [path], "lens": lens,
+                           "invocation": uuid4().hex}
+                reviews.append(self.review_result(adapters[lens], git.repo, evidence, request))
+        self.authority(evidence)
+        report = {
+            **evidence, "path": path, "blob": blob, "reviews": reviews, "reviewed_at": now(),
+            "forest_job": forest["id"] if forest else None,
+            "status": "changes-requested" if any(review["findings"] for review in reviews) else "approved",
+        }
+        self.store.save_design(report)
+        return report
+
+    def review(self, job_id, work, package, evidence, paths, prior, history, rounds, prior_round):
         bundle, scope = package
         observer = self.cfg["evidence"]["observer"]
         items = list(prior)
         selected = dict.fromkeys((*lenses(paths, self.cfg["lenses"]), *(item["lens"] for item in prior)))
         for lens in selected:
             previous = [item for item in prior if item["lens"] == lens]
-            request = {**evidence, "kind": "review", "lens": lens, "paths": paths, "invocation": uuid4().hex}
+            request = {**evidence, "kind": "review", "lens": lens, "paths": paths, "invocation": uuid4().hex,
+                       "finding_class_required": True}
             review = None
             try:
                 argv = self.cfg["reviewer"] if lens == "general" else self.cfg["lens_reviewers"].get(lens)
                 if not argv:
                     raise ValueError(f"configure a dedicated review adapter for the {lens} lens")
                 self.store.begin_review(job_id, request)
-                output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous))
-                review = review_receipt(output, request, previous)
-                env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
-                review["tool_version"] = redact(review["tool_version"], env_names)
-                review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
-                for item in review["findings"]:
-                    item["detail"] = redact(item["detail"], env_names)
+                review = self.review_result(argv, work, evidence, request, previous, prior_round)
                 self.store.record_protected(job_id, request, rounds,
                                             [item for item in review["findings"] if item["risk"] in BLOCKING])
                 review_input = {"review": review, "prior_protected": previous}
@@ -173,7 +221,7 @@ class Engine:
             items.extend({**item, "lens": lens} for item in review["findings"])
         return items
 
-    def step(self, job, prior):
+    def step(self, job, prior, forest, approval):
         base = self.git.head(self.cfg["target"])
         branch, head = job["branch"], job["sha"]
         if branch == self.cfg["target"] or not base:
@@ -182,7 +230,12 @@ class Engine:
             return "stale", "enqueued source changed; explicitly enqueue the new SHA", None
         if self.git.ancestor(head, base):
             return "included", "source is already included in target", None
-        merge_base = self.git.run("merge-base", base, head).stdout.strip()
+        phase, approval = self.design_gate(job, base, forest, approval)
+        if phase:
+            return phase, "review a design-only revision before implementation review", None
+        merge_base = self.git.run("merge-base", base, head, allowed=(0, 1)).stdout.strip()
+        if not merge_base:
+            raise MergeFailure("unrelated-histories")
         with self.git.snapshot(self.cfg["state"], base, head) as (git, root), ExitStack() as repairs:
             candidate = git.candidate(base, head)
             evidence = {
@@ -191,19 +244,33 @@ class Engine:
                 "policy": self.cfg["policy_id"], "run": uuid4().hex,
             }
             history = []
+            prior_round = []
+            classes = deque(maxlen=self.cfg["repeat_class_rounds"])
             approvals = self.cfg["evidence"]
             observer = approvals["observer"]
             scopes = {adapter["bundle"] for adapter in (observer, *approvals["checks"].values())}
             seen = {(item["lens"], item["id"]): item for item in prior}
             for rounds in range(1, self.cfg["max_rounds"] + 1):
+                if approval and not approval_matches(git, approval, base, evidence["candidate"], self.cfg["policy_id"]):
+                    return "design-needed", "candidate changed the approved design", None
                 packages = {scope: candidate_bundle(git, root, evidence, scope) for scope in sorted(scopes)}
                 evidence["diff_sha256"] = git.diff_digest(base, evidence["candidate"])
                 paths = sorted(git.paths(base, evidence["candidate"]))
                 items = self.review(job["id"], git.repo, packages[observer["bundle"]],
-                                    evidence, paths, seen.values(), history, rounds)
+                                    evidence, paths, seen.values(), history, rounds, prior_round)
                 open_protected = [item for item in items if item["risk"] in BLOCKING]
                 seen.update(((item["lens"], item["id"]), item) for item in open_protected)
                 report = {**evidence, "reviews": history, "rounds": rounds, "findings": items}
+                if approval:
+                    report["design"] = {key: approval[key] for key in ("head", "path", "blob", "reviewed_at")}
+                prior_round = items
+                classes.append({item["finding_class"] for item in items})
+                if len(classes) == classes.maxlen and (repeated := set.intersection(*classes)):
+                    self.authority(evidence)
+                    self.store.record_round(job, evidence["run"], rounds,
+                                            escalation={**report, "repeated_classes": sorted(repeated)})
+                    return None  # The worker already recorded the hold and its evidence atomically.
+                self.store.record_round(job, evidence["run"], rounds)
                 if not items:
                     break
                 if rounds == self.cfg["max_rounds"] or not (self.cfg["worker"] and self.cfg["repair_paths"]):
@@ -259,7 +326,7 @@ class Engine:
 
     def collect(self, job, future):
         try:
-            phase, detail, evidence = future.result()
+            outcome = future.result()
         except Cancelled:
             self.store.cancel_review(job["id"])
             return
@@ -269,7 +336,9 @@ class Engine:
         except Exception as error:
             self.record_failure(job, error, None)
             return
-        self.store.update(job, phase, detail=detail, evidence=evidence)
+        if outcome is not None:
+            phase, detail, evidence = outcome
+            self.store.update(job, phase, detail=detail, evidence=evidence)
 
     def record_failure(self, job, error, evidence):
         if isinstance(error, Retry):
@@ -284,7 +353,18 @@ class Engine:
             return
         phase = "stale" if isinstance(error, SourceChanged) else "blocked"
         detail = str(error) if isinstance(error, ValueError) else type(error).__name__
+        if isinstance(error, MergeFailure):
+            evidence = {"merge_failure": error.reason}
         self.store.update(job, phase, detail=detail[:500], evidence=evidence)
+
+    def design_gate(self, job, base, forest, approval):
+        required = self.cfg["design_gate"] and job["kind"] != "routine"
+        if not required and not forest:
+            return None, None
+        approved = approval_matches(self.git, approval, base, job["sha"], self.cfg["policy_id"])
+        if forest and (not approved or approval["forest_job"] != forest["id"]):
+            return "forest-held", None
+        return (None, approval) if approved else ("design-needed", None)
 
     def tick(self):
         for job_id, (job, future) in list(self.active.items()):
@@ -297,6 +377,8 @@ class Engine:
                 break
             if job["branch"] in active_branches:
                 continue
+            forest = self.store.latest_forest(job["branch"])
+            approval = self.store.design(job["branch"])
             prior = self.store.protected(job["id"])
-            self.active[job["id"]] = job, self.executor.submit(self.step, job, prior)
+            self.active[job["id"]] = job, self.executor.submit(self.step, job, prior, forest, approval)
             active_branches.add(job["branch"])

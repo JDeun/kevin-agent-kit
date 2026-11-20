@@ -1,0 +1,8 @@
+[python]
+source_root = "."
+exclude = [".venv/**", "build/**"]
+blocking_calls = ["builtins.open", "time.sleep", "subprocess.run", "urllib.request.urlopen"]
+
+[[python.forbidden_imports]]
+paths = ["service/**"]
+modules = ["storage.private"]

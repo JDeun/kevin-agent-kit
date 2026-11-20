@@ -1,0 +1,38 @@
+name: Architecture fitness
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  fitness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate the kit pin
+        env:
+          KIT_REPOSITORY: ${{ vars.FITNESS_KIT_REPOSITORY }}
+          KIT_REVISION: ${{ vars.FITNESS_KIT_REVISION }}
+        run: |
+          test -n "$KIT_REPOSITORY"
+          [[ "$KIT_REVISION" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.FITNESS_KIT_REPOSITORY }}
+          ref: ${{ vars.FITNESS_KIT_REVISION }}
+          persist-credentials: false
+          path: kit
+      - name: Install the approved kit
+        working-directory: kit
+        run: |
+          ./scripts/install.sh --prefix "$RUNNER_TEMP/fitness-kit"
+          printf '%s\n' "$RUNNER_TEMP/fitness-kit/bin" >> "$GITHUB_PATH"
+      - name: Check architecture fitness
+        working-directory: source
+        env:
+          TARGET_SHA: ${{ github.event.pull_request.base.sha }}
+        run: >
+          kevin-agent-kit fitness check --config fitness.toml
+          --baseline fitness-baseline.json --target "$TARGET_SHA"

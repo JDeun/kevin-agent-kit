@@ -71,10 +71,14 @@ See [profile and wrapper setup](docs/loop.md).
 
 Use a local source branch with a committed change. For another profile, pass
 `--config /absolute/path/to/profile.toml` before the subcommand.
+For a new feature or architecture change, first commit the
+[design document](docs/design-template.md) on its own and run
+`kevin-agent-kit design-review BRANCH DESIGN_SHA --design PATH`. Continue after
+the architect and SRE adapters approve the design.
 
 ```sh
 kevin-agent-kit start
-kevin-agent-kit enqueue feature/example "$(git rev-parse refs/heads/feature/example)"
+kevin-agent-kit enqueue feature/example "$(git rev-parse refs/heads/feature/example)" --kind feature
 kevin-agent-kit status
 ```
 
@@ -84,6 +88,10 @@ exports the verified commit with its reachable Git history to a local file.
 Apply it through your repository's normal
 approval and Git workflow. State, queue, and logs live under
 `${XDG_STATE_HOME:-$HOME/.local/state}/kevin-agent-kit/`.
+
+The loop holds a branch for redesign when a finding class repeats across two
+review rounds. See the [queue guide](docs/loop.md) for the design gate,
+configuration switches, and how to resume after a hold.
 
 ### 4. Stop the loop or remove the global rules
 
@@ -110,6 +118,8 @@ the build directory on `PYTHONPATH`. See the [architecture](docs/architecture.md
 - [Persona review](reviews/persona/README.md) produces alternative designs and a decision brief.
 - [Screenshot verification](verify/README.md) supplies running-app evidence for a PR or MR.
 - [Guards](docs/guards.md) and [ledgers](docs/ledgers.md) describe the available checks and records.
+- [Architecture fitness](docs/fitness.md) shows how to run `kevin-agent-kit fitness` and ratchet known violations in CI.
+- [Observability](docs/observability.md) defines the loop's status metrics and shows how to verify SLOs after rollout.
 - [Cost and context](docs/cost.md) covers agent model choice and session usage.
 
 ## Inspiration

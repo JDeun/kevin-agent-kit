@@ -321,8 +321,10 @@ def repository_profile(cwd, *, dry_run=False):
         "# Review this user-owned profile before starting the loop.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
         f"target = {json.dumps(target, ensure_ascii=False)}", "reviewer = []", "review_observer = []",
-        'review_key = ""', "worker = []", "repair_paths = []", "",
-        "[loop.lens_reviewers]", '# security = ["/tools/security-review"]', "",
+        'review_key = ""', "worker = []", "repair_paths = []",
+        "design_gate = true", "repeat_class_rounds = 2", "",
+        "[loop.lens_reviewers]", '# security = ["/tools/security-review"]',
+        '# architect = ["/tools/architect-review"]', '# sre = ["/tools/sre-review"]', "",
         "[loop.checks]", '# smoke = ["/tools/check-evidence"]',
     ]
     lines += [f"# Detected test command idea: {json.dumps(argv)}" for argv in examples]

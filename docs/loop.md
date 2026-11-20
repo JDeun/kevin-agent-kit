@@ -27,9 +27,13 @@ review_observer = ["/tools/observe-review"]
 review_key = "/home/example/kit-keys/review-source.pem"
 worker = ["/tools/repair"]
 repair_paths = ["src/**", "tests/unit/test_widget.py"]
+design_gate = true
+repeat_class_rounds = 2
 
 [loop.lens_reviewers]
 security = ["/tools/security-review"]
+architect = ["/tools/architect-review"]
+sre = ["/tools/sre-review"]
 db = ["/tools/db-review"]
 
 [loop.checks]
@@ -49,6 +53,8 @@ retention_seconds = 3600
 [loop.execution.tools]
 review = "/home/example/kit-tools/review"
 security-review = "/home/example/kit-tools/security-review"
+architect-review = "/home/example/kit-tools/architect-review"
+sre-review = "/home/example/kit-tools/sre-review"
 db-review = "/home/example/kit-tools/db-review"
 observe-review = "/home/example/kit-tools/observe-review"
 repair = "/home/example/kit-tools/repair"
@@ -110,7 +116,8 @@ adapters. Set `reviewer` for the general lens and use
 `[loop.lens_reviewers]` for each other lens.
 Use the scope, stable finding IDs, and JSON output contract printed in the
 review prompt. The final prompt line is a JSON input object containing the
-exact request and prior protected findings. The primary adapter returns one
+exact request, prior protected findings and the preceding complete round.
+The primary adapter returns one
 receipt binding the exact request, ordered paths, tool version, diagnostics,
 findings, and evidence for proposed protected closures. The separate review
 observer checks scope and completion using its source's own run telemetry
@@ -118,6 +125,15 @@ and the exact diff. For each proposed closure, it obtains a separately
 attributable review and records concrete resolution evidence signed by the
 observer's source. The coordinator requires that independent evidence
 before closing the finding.
+
+When the request includes `finding_class_required`, each finding also needs
+a stable lowercase kebab-case `finding_class` such as `missing-idempotency`.
+Use `prior_round` to keep a class stable across sites and lenses when the
+failure mechanism recurs. Keep the finding ID specific to the observation.
+The worker receives those labels with its review brief. The loop intersects
+labels across consecutive completed rounds in one repair attempt, including
+the initial review. A retried attempt rebuilds the candidate and starts a
+fresh series of rounds.
 
 Wrap model calls so model errors and truncated output remain failures.
 Read repository material, prior findings, and persona artifacts as data.
@@ -202,11 +218,47 @@ Replace legacy `[loop.attestors]` configurations with signed check sources
 in `[loop.checks]` and keys in `[loop.check_keys]`. The local demo uses
 embedded fixture sources.
 
+## Design-first admission
+
+Start the source branch at the current target. Commit only the completed
+[design document](design-template.md), then run:
+
+```sh
+kevin-agent-kit design-review topic/example "$(git rev-parse refs/heads/topic/example)" \
+  --design docs/design/example.md
+```
+
+The command uses two distinct registered reviewer adapters under
+`lens_reviewers.architect` and `lens_reviewers.sre`. Each receives the
+`design-review` request and uses the review receipt format for the named
+Markdown file. Both complete receipts must have zero findings. Use the JSON
+findings to revise and rerun a review. The accepted design-only SHA becomes
+an ancestor of the implementation. Keep the approved document in that
+revision's descendants and in the resulting candidate. A policy change
+requires a fresh approval.
+
+Enqueue features and architecture changes with `--kind feature` or
+`--kind architecture`. Unclassified work also needs design approval.
+Reserve `--kind routine` for work that leaves the design intact. Treat task
+classification as an operator decision. The default `design_gate = true`
+returns an implementation lacking approval as `design-needed` before review.
+To turn off initial admission, set `design_gate = false` in the profile
+and restart the daemon.
+
+When one finding class occurs in `repeat_class_rounds` consecutive rounds
+(two by default), the loop moves the job to `forest` before invoking the next
+repair. Use its findings and `repeated_classes` to identify the root cause and
+propose a redesign. Later jobs on the branch enter `forest-held` until a fresh
+design-only approval recorded after the escalation matches their ancestry.
+Start the redesign from the current target. A new branch can carry a new
+design and implementation, with the original branch's hold preserved.
+Inspect phases and counters with [status](observability.md).
+
 ## Queue operation and export
 
 ```sh
 kevin-agent-kit start
-kevin-agent-kit enqueue topic/example "$(git rev-parse refs/heads/topic/example)"
+kevin-agent-kit enqueue topic/example "$(git rev-parse refs/heads/topic/example)" --kind feature
 kevin-agent-kit status
 kevin-agent-kit stop
 ```

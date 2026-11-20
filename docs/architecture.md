@@ -13,12 +13,17 @@ flowchart TD
     Use --> Summary["Synthesis"]
     Adversarial --> Summary
     Summary --> Choice{"Human design choice"}
-    Choice --> Branch["Branch and exact head"]
+    Choice --> Design["Commit design and run architect and SRE review"]
+    Design -->|Approved| Branch["Implement and enqueue exact head"]
     Branch --> Queue["Private local queue"]
-    Queue --> Snapshot["Candidate from pinned source and target"]
+    Queue --> Admission{"Design evidence required and present?"}
+    Admission -->|Design needed| Design
+    Admission -->|Approved or exempt| Snapshot["Candidate from pinned source and target"]
     Snapshot --> Review["Independent review per lens"]
     Review -->|Repair within approved scope| Worker["Worker in a private checkout"]
     Worker --> Review
+    Review -->|Repeated finding class| Forest["Hold branch for redesign"]
+    Forest --> Design
     Review -->|Protected finding at cap| Blocked["Block and retain evidence"]
     Review -->|Ordinary finding at cap| Record["Human decision record"]
     Record -->|Revise| Queue
@@ -44,3 +49,4 @@ See [operating the loop](loop.md) for profiles and command contracts. Follow the
 [worker rules](../agents/worker-rules.md) and use the [ledgers](ledgers.md) for
 decisions and resource ownership. The [hosting adapters](hosting.md) and
 [screenshot guide](../verify/README.md) cover publishing evidence.
+See [observability](observability.md) for queue metrics and rollout objectives.
