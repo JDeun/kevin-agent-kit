@@ -59,12 +59,18 @@ def candidates(args: argparse.Namespace) -> int:
 
 
 def agent_sec(args: argparse.Namespace) -> int:
+    skipped: list[dict] = []
     try:
-        findings = scan(args.root, args.paths)
+        findings = scan(args.root, args.paths, skipped)
     except OSError as error:
         raise ValueError("Unable to read a requested scan path") from error
     print(json.dumps(findings, sort_keys=True))
-    return int(bool(findings))
+    if skipped:
+        # Zero findings only covers what was inspected. Say what was not.
+        print(json.dumps({"coverage": "incomplete", "not_inspected": skipped}, sort_keys=True), file=sys.stderr)
+    if findings:
+        return 1
+    return 2 if skipped and args.require_complete else 0
 
 
 def minimum_count(value: str) -> int:
@@ -96,6 +102,8 @@ def main() -> int:
     command = security.add_parser("scan")
     command.add_argument("--root", type=Path, default=Path("."))
     command.add_argument("paths", type=Path, nargs="*")
+    command.add_argument("--require-complete", action="store_true",
+                         help="exit 2 when any file or directory could not be inspected")
     command.set_defaults(handler=agent_sec)
 
     args = parser.parse_args()

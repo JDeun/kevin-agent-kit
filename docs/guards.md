@@ -35,10 +35,13 @@ judgment and link to evidence until a stable invariant emerges.
 ```sh
 ./guards/agent-sec --root . core guards
 python3 -m guards agent-sec scan --root . core guards
+python3 -m guards agent-sec scan --root . --require-complete core guards
 ```
 
 Pass files or directories under the root. With no paths the command scans the root. The static checks look for common credential patterns, sensitive literal assignments, destructive commands, downloaded scripts piped to a shell, and unrestricted values in known scope settings. The prompt check flags common cases where input, file contents, or tool output reach a Python prompt or message field. It also flags common template interpolations in prompt-like fields.
 
 Use each finding's rule, relative path, and line to review the code. The JSON output omits matched values and source text. The scan reads UTF-8 text files of up to 2 MiB, skips common metadata and dependency directories, and skips symlinks during traversal. Review prompt findings in context, including who controls the input, which message role receives it, and which actions the receiving agent can take. The scan uses static heuristics and can miss indirect flows or unfamiliar settings.
+
+Files it could not inspect (too large, binary, not UTF-8, a Python file that does not parse, a symlink, an excluded directory) are printed as a `coverage: incomplete` JSON object on stderr. An empty findings list therefore does not mean everything was covered; `--require-complete` makes the command exit 2 when anything was not inspected.
 
 Exit code 0 means the scan found no matches. Exit code 1 means it reported findings. Exit code 2 means it could not complete the requested scan.

@@ -71,3 +71,26 @@ def test_external_analyzer_can_retire_a_baseline_entry(tmp_path, capsys):
     debt.write_text("[]")
     assert main(args) == 0
     assert not any(json.loads(capsys.readouterr().out).values())
+
+
+def test_policy_from_target_ignores_a_candidate_that_weakens_its_own_policy(tmp_path, capsys):
+    git = Git(tmp_path)
+    git.run("init", "--initial-branch=main")
+    policy = '[python]\n[[python.forbidden_imports]]\npaths = ["**/*.py"]\nmodules = ["storage.private"]\n'
+    (tmp_path / "fitness.toml").write_text(policy)
+    (tmp_path / "service.py").write_text("x = 1\n")
+    (tmp_path / "baseline.json").write_text("[]")
+    git.run("add", ".")
+    git.run("commit", "-m", "policy")
+    # The candidate adds a violation and deletes the rule that would catch it.
+    (tmp_path / "service.py").write_text("import storage.private\n")
+    (tmp_path / "fitness.toml").write_text("[python]\n")
+    args = ["check", "--root", str(tmp_path), "--config", "fitness.toml", "--baseline", "baseline.json",
+            "--target", "main"]
+    assert main(args) == 0  # the candidate's own policy hides the violation
+    capsys.readouterr()
+    assert main([*args, "--policy-from-target"]) == 1
+    assert "storage.private" in capsys.readouterr().out
+    git.run("rm", "--cached", "-q", "fitness.toml")
+    git.run("commit", "-qm", "drop policy on target")
+    assert main([*args, "--policy-from-target"]) == 2

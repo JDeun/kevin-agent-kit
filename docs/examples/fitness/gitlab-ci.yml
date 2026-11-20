@@ -4,7 +4,8 @@ architecture-fitness:
   variables:
     GIT_DEPTH: "0"
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Only merged-result pipelines check the integration and carry the target SHA.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result"'
   script:
     - |
       if [ "$CI_PROJECT_ID" = "$CI_MERGE_REQUEST_PROJECT_ID" ]; then
@@ -13,5 +14,6 @@ architecture-fitness:
         target_remote="$CI_MERGE_REQUEST_PROJECT_URL.git"
       fi
       git fetch --no-tags -- "$target_remote" "refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-      target_sha="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:-FETCH_HEAD}"
-      kevin-agent-kit fitness check --config fitness.toml --baseline fitness-baseline.json --target "$target_sha"
+      target_sha="${CI_MERGE_REQUEST_TARGET_BRANCH_SHA:?merged-result pipelines provide the target SHA}"
+      kevin-agent-kit fitness check --config fitness.toml --policy-from-target \
+        --baseline fitness-baseline.json --target "$target_sha"

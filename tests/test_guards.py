@@ -81,3 +81,23 @@ def test_agent_sec_ignores_environment_lookup_and_flags_broad_recursive_delete(t
     assert json.loads(result.stdout) == [
         {"rule": "destructive-command", "path": "cleanup.sh", "line": 1}
     ]
+
+
+def test_agent_sec_reports_what_it_could_not_inspect(tmp_path):
+    (tmp_path / "ok.py").write_text("x = 1\n")
+    clean = guards("agent-sec", "scan", "--root", tmp_path, "--require-complete")
+    assert clean.returncode == 0 and clean.stderr == ""
+    (tmp_path / "broken.py").write_text("def (:\n")
+    (tmp_path / "blob.bin").write_bytes(b"\0\1")
+    (tmp_path / "latin.txt").write_bytes(b"\xff\xfe")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "ok.py")
+    result = guards("agent-sec", "scan", "--root", tmp_path)
+    assert result.returncode == 0 and json.loads(result.stdout) == []
+    report = json.loads(result.stderr)
+    reasons = {(item["path"], item["reason"]) for item in report["not_inspected"]}
+    assert report["coverage"] == "incomplete"
+    assert reasons == {("broken.py", "python-not-parsed"), ("blob.bin", "binary"), ("latin.txt", "not-utf-8"),
+                       ("node_modules", "excluded-directory"), ("link", "symlink")}
+    strict = guards("agent-sec", "scan", "--root", tmp_path, "--require-complete")
+    assert strict.returncode == 2

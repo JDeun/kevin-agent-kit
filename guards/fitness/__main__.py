@@ -21,6 +21,17 @@ def contents(root, name):
     return path.read_bytes()
 
 
+def target_blob(git, commit, name):
+    entry = git.run("ls-tree", "-z", "--full-tree", commit, "--", f":(literal){name}").stdout
+    if not entry:
+        return None
+    meta, _, found = entry.rstrip("\0").partition("\t")
+    mode, kind, blob = meta.split()
+    if found != name or mode not in ("100644", "100755") or kind != "blob":
+        raise ValueError(f"{name} must be a regular Git blob in the trusted target")
+    return git.run("cat-file", "blob", blob).stdout
+
+
 def target_counts(root, target, baseline):
     git = Git(root)
     actual_root = Path(git.run("rev-parse", "--show-toplevel").stdout.rstrip("\n")).resolve()
@@ -48,6 +59,9 @@ def main(argv=None):
         if action == "check":
             command.add_argument("--baseline", required=True, help="repository-relative proposed baseline")
             command.add_argument("--target", required=True, help="trusted Git target ref or commit")
+            command.add_argument("--policy-from-target", action="store_true",
+                                 help="read --config from the trusted target instead of the candidate, "
+                                      "so a candidate cannot weaken its own policy")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -55,7 +69,14 @@ def main(argv=None):
             raise ValueError("provide a Python --config or at least one analyzer's --findings")
         observed = Counter()
         if args.config:
-            settings = tomllib.loads(contents(root, args.config).decode("utf-8"))
+            if args.action == "check" and args.policy_from_target:
+                git = Git(root)
+                text = target_blob(git, git.resolve(args.target), str(relative_path(args.config)))
+                if text is None:
+                    raise ValueError("the trusted target has no policy file; land the policy first")
+                settings = tomllib.loads(text)
+            else:
+                settings = tomllib.loads(contents(root, args.config).decode("utf-8"))
             if settings.keys() != {"python"}:
                 raise ValueError("configure the Python checker under [python]")
             observed.update(scan(root, settings["python"]))

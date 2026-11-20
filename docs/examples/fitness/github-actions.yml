@@ -34,5 +34,5 @@ jobs:
         env:
           TARGET_SHA: ${{ github.event.pull_request.base.sha }}
         run: >
-          kevin-agent-kit fitness check --config fitness.toml
+          kevin-agent-kit fitness check --config fitness.toml --policy-from-target
           --baseline fitness-baseline.json --target "$TARGET_SHA"

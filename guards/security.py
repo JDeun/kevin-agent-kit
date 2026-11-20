@@ -60,10 +60,12 @@ def contains_untrusted(expression: ast.AST, names: set[str]) -> bool:
     return False
 
 
-def prompt_boundaries(content: str) -> set[int]:
+def prompt_boundaries(content: str, skipped: list | None = None, name: str = "") -> set[int]:
     try:
         tree = ast.parse(content)
     except (SyntaxError, ValueError):
+        if skipped is not None:
+            skipped.append({"path": name, "reason": "python-not-parsed"})
         return set()
     nodes = list(ast.walk(tree))
     bindings = [(node.targets, node.value) for node in nodes if isinstance(node, ast.Assign)]
@@ -107,18 +109,26 @@ def prompt_boundaries(content: str) -> set[int]:
     return tainted
 
 
-def findings_for(path: Path, root: Path) -> list[dict]:
+def findings_for(path: Path, root: Path, skipped: list | None = None) -> list[dict]:
+    relative = path.relative_to(root).as_posix()
+
+    def skip(reason: str) -> list:
+        if skipped is not None:
+            skipped.append({"path": relative, "reason": reason})
+        return []
+
     with path.open("rb") as handle:
         data = handle.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES or b"\0" in data:
-        return []
+    if len(data) > MAX_BYTES:
+        return skip("too-large")
+    if b"\0" in data:
+        return skip("binary")
     try:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
-        return []
+        return skip("not-utf-8")
 
     findings = set()
-    relative = path.relative_to(root).as_posix()
     for line_number, line in enumerate(content.splitlines(), 1):
         for rule, pattern in TEXT_RULES.items():
             if any(
@@ -129,14 +139,15 @@ def findings_for(path: Path, root: Path) -> list[dict]:
         if TEMPLATE_PROMPT.search(line):
             findings.add((line_number, "untrusted-prompt"))
     if path.suffix == ".py":
-        findings.update((number, "untrusted-prompt") for number in prompt_boundaries(content))
+        findings.update((number, "untrusted-prompt") for number in prompt_boundaries(content, skipped, relative))
     return [
         {"rule": rule, "path": relative, "line": number}
         for number, rule in sorted(findings)
     ]
 
 
-def scan(root: Path, paths: list[Path]) -> list[dict]:
+def scan(root: Path, paths: list[Path], skipped: list | None = None) -> list[dict]:
+    """Return findings. When `skipped` is a list, append every path or directory not inspected."""
     root = root.resolve()
     if not root.is_dir():
         raise ValueError("Scan root must be a directory")
@@ -154,10 +165,15 @@ def scan(root: Path, paths: list[Path]) -> list[dict]:
         while pending:
             current = pending.pop()
             if current.is_symlink():
+                if skipped is not None:
+                    skipped.append({"path": current.relative_to(root).as_posix(), "reason": "symlink"})
                 continue
-            if current.is_dir() and current.name not in SKIP_DIRS:
+            if current.is_dir() and current.name in SKIP_DIRS:
+                if skipped is not None:
+                    skipped.append({"path": current.relative_to(root).as_posix(), "reason": "excluded-directory"})
+            elif current.is_dir():
                 pending.extend(current.iterdir())
             elif current.is_file():
                 files.add(current)
 
-    return [finding for path in sorted(files) for finding in findings_for(path, root)]
+    return [finding for path in sorted(files) for finding in findings_for(path, root, skipped)]

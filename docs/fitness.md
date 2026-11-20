@@ -65,13 +65,19 @@ variables `FITNESS_KIT_REPOSITORY` (the public kit's owner and repository) and
 `FITNESS_KIT_REVISION` (the approved full commit SHA). For GitLab use
 `FITNESS_RUNNER_IMAGE` to select an approved image with the same kit on PATH.
 Set up the target baseline and policy first. Require the
-job before merge. Review changes to the CI definition, analyzer and settings
-as architecture policy changes. Keep their approved versions outside the
-candidate checkout if the job provides an independently signed required check.
+job before merge. Both examples pass `--policy-from-target`, which reads
+`fitness.toml` from the trusted target commit, so a candidate cannot widen its
+own exclusions or drop a forbidden boundary. Changing the policy then needs a
+change that lands on the target first (a separate reviewed change). Review
+changes to the CI definition and analyzer as architecture policy changes, and
+keep their approved versions outside the candidate checkout if the job provides
+an independently signed required check.
 
 The GitHub example uses the pull request merge result and its target commit.
 See [GitHub pull request events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request).
 The GitLab example fetches from the merge request's target project, including
 for fork pipelines. The runner needs read access to that repository. A merged
-results pipeline pins the baseline to its target SHA and checks the integration.
+results pipeline pins the baseline to its target SHA and checks the integration;
+the example runs only for merged-result pipelines and fails when the target SHA
+is missing, instead of falling back to a moving `FETCH_HEAD`.
 See [GitLab merge request pipelines](https://docs.gitlab.com/ci/pipelines/merge_request_pipelines/).
