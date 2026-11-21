@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.7
+
+A finding is identified by its journal item, not by the name the reviewer gave it.
+
+- The lineage re-check compares findings by source job, lens and a hash of the
+  finding's content (with the immutable journal row kept for display). A parent
+  that records the same ID for a different finding, or a finding whose ID
+  collides with one of the child's own, is no longer treated as already
+  reviewed: the child must resolve it, and a candidate that never saw it is
+  sent back to review. An inherited finding whose ID collides is offered to the
+  reviewer as `ID~<hash>`.
+- Export is held while any other job on the same lineage (its branch or a
+  parent's branch) is in `review` or `interrupted`.
+- A candidate prepared by 0.3.6 has the old lineage record and must be
+  retried.
+
 ## 0.3.6
 
 Inheritance across branches is a live dependency, not a snapshot taken at dispatch.

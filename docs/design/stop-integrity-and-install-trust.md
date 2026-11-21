@@ -76,13 +76,20 @@ current SHA resolves it.
 **Inheritance is a live dependency (0.3.6).** The inherited set is not computed
 once at dispatch. A job with an `--inherit-from` parent is not dispatched while a
 job up that chain is in `review` or `interrupted`. A candidate records the
-`(lens, id)` pairs its review was given (`lineage_reviewed`) and its job ID.
+lineage items its review was given (`lineage_reviewed`) and its job ID. An item is
+identified by its source job, lens and a hash of its content, with the immutable
+journal row (or evidence position) kept for display. The reviewer's own ID is a
+label only: the same ID with different content is a new finding, and an inherited
+finding whose ID collides with another is offered to the reviewer as `ID~<hash>`
+so it needs its own resolution.
 The coordinator recomputes the lineage from the journals when it is about to
 store the candidate, in `status` and on every export, and treats a finding the
 review never saw, or a parent that is back in review, as a conflict: the job
-returns to review, or the candidate is stale. Findings the job journaled itself
+returns to review, or the candidate is stale. Export also waits while any job on
+the lineage (the branch or a parent's branch) is in `review` or `interrupted`.
+Findings the job journaled itself
 are excluded from that comparison. Evidence without a lineage record, from a
-0.3.5 queue, is refused until the job is retried.
+0.3.5 or 0.3.6 queue, is refused until the job is retried.
 
 **A killed coordinator.** Starting the coordinator reads the stored output of
 every open attempt through the scanner again before it interrupts the job, so a

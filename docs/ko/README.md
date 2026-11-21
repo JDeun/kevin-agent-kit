@@ -5,7 +5,7 @@
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **실험 단계 v0.3.6.** 실제 리뷰·수정·검사에는 Linux Bubblewrap 네임스페이스가 필요합니다.
+> **실험 단계 v0.3.7.** 실제 리뷰·수정·검사에는 Linux Bubblewrap 네임스페이스가 필요합니다.
 > 모델 자격 증명은 운영자의 브로커가 보관합니다. 필수 검사는 후보 커밋에 고정된 새 읽기 전용 트리에서 실행합니다.
 > Bubblewrap을 사용할 수 없는 환경에서는 내장 데모를 실행할 수 있습니다. [알려진 문제](../known-issues.md)
 

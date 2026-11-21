@@ -1,4 +1,4 @@
-# Known issues in v0.3.6
+# Known issues in v0.3.7
 
 ## Supported scope
 

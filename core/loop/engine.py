@@ -134,17 +134,17 @@ def check_inputs(cfg, evidence):
         raise Conflict("execution policy changed; restart and retry")
 
 
-def check_candidate(cfg, evidence, store=None):
+def check_candidate(cfg, evidence, store=None, *, export=False):
     check_inputs(cfg, evidence)
     if store is not None:
-        check_lineage(store, evidence)
+        check_lineage(store, evidence, export=export)
     if cfg.get("profile") and config(cfg["profile"])["policy_id"] != evidence["policy"]:
         raise Conflict("execution policy changed; restart and retry")
     if evidence["expires_at"] <= time.time():
         raise Conflict("candidate evidence expired; retry the job")
 
 
-def check_lineage(store, evidence):
+def check_lineage(store, evidence, *, export=False):
     """Read the inherited findings again: a candidate stands only while its lineage has settled."""
     job = evidence.get("job")
     if job is None:
@@ -152,14 +152,23 @@ def check_lineage(store, evidence):
     parent = store.unsettled_parent(job)
     if parent is not None:
         raise Conflict(f"job {parent} that this job inherits from is still in review; retry after it settles")
-    gap = store.lineage_gap(job, evidence.get("lineage_reviewed", []))
+    reviewed = evidence.get("lineage_reviewed", [])
+    if any(not isinstance(entry, list) or len(entry) != 4 for entry in reviewed):
+        raise Conflict("candidate lineage record predates finding identity; retry the job")
+    gap = store.lineage_gap(job, reviewed)
     if gap:
         raise Conflict("lineage findings this review never saw were recorded since: "
-                       + ", ".join(f"{lens}:{name}" for lens, name in gap) + "; retry the job")
+                       + ", ".join(f"{lens}:{item}" for _, lens, _, item in gap) + "; retry the job")
+    if export:
+        # An open review anywhere on the lineage (any job on this branch or on a parent's
+        # branch) may still record findings this candidate has not seen, so export waits.
+        open_review = store.open_lineage_review(job)
+        if open_review is not None:
+            raise Conflict(f"job {open_review} on the same lineage is still in review; export after it settles")
 
 
 def export_candidate(cfg, evidence, destination, store=None):
-    check_candidate(cfg, evidence, store)
+    check_candidate(cfg, evidence, store, export=True)
     path = cfg["state"] / "candidates" / f"{evidence['run']}.bundle"
     with path.open("rb") as source:
         if hashlib.file_digest(source, "sha256").hexdigest() != evidence["bundle_sha256"]:
@@ -172,7 +181,7 @@ def export_candidate(cfg, evidence, destination, store=None):
             with staged.open("xb") as target:
                 staged.chmod(0o600)
                 shutil.copyfileobj(source, target)
-            check_candidate(cfg, evidence, store)
+            check_candidate(cfg, evidence, store, export=True)
             destination.hardlink_to(staged)
 
 
@@ -462,7 +471,9 @@ class Engine:
             raise cause
         return review
 
-    def step(self, job, prior, forest, approval):
+    def step(self, job, prior, forest, approval, lineage=None):
+        if lineage is None:
+            lineage = self.store.inherited_lineage(job)[1]
         base = self.git.head(self.cfg["target"])
         branch, head = job["branch"], job["sha"]
         if branch == self.cfg["target"] or not base:
@@ -589,7 +600,7 @@ class Engine:
             staged.replace(bundle)
             return "candidate", "awaiting repository owner", {
                 **report, **export_scope, "checks": receipts, "runs": self.trace(evidence),
-                "job": job["id"], "lineage_reviewed": sorted([lens, name] for lens, name in seen),
+                "job": job["id"], "lineage_reviewed": [list(entry) for entry in lineage],
                 "trust": self.cfg.get("trust", "signed"),
                 "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
@@ -672,6 +683,6 @@ class Engine:
                 continue
             forest = self.store.latest_forest(job["branch"])
             approval = self.store.design(job["branch"])
-            prior = self.store.inherited_protected(job)
-            self.active[job["id"]] = job, self.executor.submit(self.step, job, prior, forest, approval)
+            prior, lineage = self.store.inherited_lineage(job)
+            self.active[job["id"]] = job, self.executor.submit(self.step, job, prior, forest, approval, lineage)
             active_branches.add(job["branch"])

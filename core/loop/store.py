@@ -41,6 +41,12 @@ JOURNAL = (
 )
 
 
+def content_hash(finding):
+    """The identity of a finding's content: everything the reviewer said except bookkeeping keys."""
+    body = {key: value for key, value in finding.items() if key not in ("lens", "finding_class")}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -259,13 +265,49 @@ class Store:
     def lineage_gap(self, job_id, reviewed):
         """Protected findings of the inherited lineage that the job's review never saw.
 
-        `reviewed` is the (lens, id) list its candidate evidence recorded at dispatch.
+        `reviewed` is the [source job, lens, content hash, item] list its candidate
+        evidence recorded at dispatch. A finding is the journal item itself, so it is
+        the source job and the content that match; the reviewer's own ID never does.
         The journals of the parent chain and of the branch are read again on every call.
         """
         job = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        own = {(item["lens"], item["id"]) for item in self.protected(job_id)}
-        known = {tuple(key) for key in reviewed}
-        return sorted({(item["lens"], item["id"]) for item in self.inherited_protected(dict(job))} - own - known)
+        known = {tuple(entry[:3]) for entry in reviewed}
+        current = self.lineage_items(dict(job))
+        return sorted({item for key, item in current.items() if key not in known})
+
+    def lineage_sources(self, job_id):
+        """Every job whose open findings this job owes: its branch peers and parents, transitively."""
+        marks = ",".join("?" * len(SETTLED_PHASES))
+        sources, pending = {job_id}, [job_id]
+        while pending:
+            current = self.db.execute("SELECT branch,inherits FROM jobs WHERE id=?", (pending.pop(),)).fetchone()
+            linked = {row["id"] for row in self.db.execute(
+                f"SELECT id FROM jobs WHERE branch=? AND phase NOT IN ({marks})",
+                (current["branch"], *SETTLED_PHASES))}
+            if current["inherits"] is not None:
+                linked.add(current["inherits"])
+            pending.extend(linked - sources)
+            sources |= linked
+        return sources - {job_id}
+
+    def open_lineage_review(self, job_id):
+        """A job on the same lineage that is still being reviewed, or None."""
+        sources = sorted(self.lineage_sources(job_id))
+        if not sources:
+            return None
+        row = self.db.execute(
+            f"SELECT id FROM jobs WHERE id IN ({','.join('?' * len(sources))}) "
+            "AND phase IN ('review','interrupted') ORDER BY id", sources).fetchone()
+        return row["id"] if row else None
+
+    def lineage_items(self, job):
+        """{(source job, lens, content hash): (source job, lens, content hash, item)} of the lineage."""
+        items = {}
+        for source in sorted(self.lineage_sources(job["id"])):
+            for origin, lens, finding in self._protected_rows(source):
+                items.setdefault((source, lens, content_hash(finding)),
+                                 (source, lens, content_hash(finding), f"{source}:{origin}"))
+        return items
 
     def update(self, job, phase, *, detail="", attempts=0, next_at=0, evidence=None):
         with self.db:
@@ -399,51 +441,64 @@ class Store:
                        "VALUES (?,?,?,?)", (invocation, finding["id"], json.dumps(finding), now()))
 
     def inherited_protected(self, job):
-        """Protected findings this job must still resolve.
+        return self.inherited_lineage(job)[0]
+
+    def inherited_lineage(self, job):
+        """Protected findings this job must still resolve, with the lineage items they come from.
 
         Sources are every other job on its branch whose last state left findings open
-        and its named parent, followed transitively.
+        and its named parent, followed transitively. A finding is told apart by its
+        content, not by the ID the reviewer gave it: when two different findings share
+        an ID, the inherited one is offered under `ID~<content hash prefix>` so each
+        needs its own resolution. Both values come from one read of the journals.
         """
-        marks = ",".join("?" * len(SETTLED_PHASES))
-        sources, pending = {job["id"]}, [job["id"]]
-        while pending:
-            current = self.db.execute("SELECT branch,inherits FROM jobs WHERE id=?", (pending.pop(),)).fetchone()
-            linked = {row["id"] for row in self.db.execute(
-                f"SELECT id FROM jobs WHERE branch=? AND phase NOT IN ({marks})",
-                (current["branch"], *SETTLED_PHASES))}
-            if current["inherits"] is not None:
-                linked.add(current["inherits"])
-            pending.extend(linked - sources)
-            sources |= linked
+        own = self.protected(job["id"])
+        taken = {(item["lens"], item["id"]): content_hash(item) for item in own}
         merged = {}
-        for source in (*sorted(sources - {job["id"]}), job["id"]):
-            for finding in self.protected(source):
-                merged[finding["lens"], finding["id"]] = finding
-        return list(merged.values())
+        for source in sorted(self.lineage_sources(job["id"])):
+            for _, lens, finding in self._protected_rows(source):
+                digest = content_hash(finding)
+                merged[lens, digest] = {**finding, "lens": lens}
+        inherited = []
+        for (lens, digest), finding in merged.items():
+            name = finding["id"]
+            if taken.get((lens, name), digest) != digest:
+                name = f"{name}~{digest[:8]}"
+                while (lens, name) in taken:
+                    name += "_"
+            taken[lens, name] = digest
+            inherited.append({**finding, "id": name})
+        return [*inherited, *own], sorted(self.lineage_items(job).values())
 
     def protected(self, job_id):
         # A retry rebuilds from the approved source, so prior repair resolutions
         # must be re-checked against the rebuilt candidate.
         protected = {}
-        for row in self.db.execute(
-            "SELECT body FROM evidence WHERE job_id=? ORDER BY id", (job_id,),
-        ):
+        for _, lens, finding in self._protected_rows(job_id):
+            protected[lens, finding["id"]] = {**finding, "lens": lens}
+        return list(protected.values())
+
+    def _protected_rows(self, job_id):
+        """(origin, lens, finding) of every protected finding the job recorded, oldest first.
+
+        The origin is the immutable journal row, or the evidence row and position for
+        findings recorded before the journal existed.
+        """
+        for row in self.db.execute("SELECT id,body FROM evidence WHERE job_id=? ORDER BY id", (job_id,)):
             evidence = json.loads(row["body"])
-            for review in evidence.get("reviews", []):
+            for number, review in enumerate(evidence.get("reviews", [])):
                 lens = review["request"]["lens"]
-                for finding in review["findings"]:
+                for index, finding in enumerate(review["findings"]):
                     if finding["risk"] != "other":
-                        protected[lens, finding["id"]] = {**finding, "lens": lens}
-            for finding in evidence.get("findings", []):
+                        yield f"evidence-{row['id']}-r{number}-{index}", lens, finding
+            for index, finding in enumerate(evidence.get("findings", [])):
                 if finding["risk"] != "other":
-                    protected[finding["lens"], finding["id"]] = finding
+                    yield f"evidence-{row['id']}-f{index}", finding["lens"], finding
         for row in self.db.execute(
-            """SELECT a.lens, f.body FROM finding_journal f JOIN review_attempts a USING (invocation)
+            """SELECT f.id, a.lens, f.body FROM finding_journal f JOIN review_attempts a USING (invocation)
                WHERE a.job_id=? ORDER BY f.id""", (job_id,),
         ):
-            finding = json.loads(row["body"])
-            protected[row["lens"], finding["id"]] = {**finding, "lens": row["lens"]}
-        return list(protected.values())
+            yield f"journal-{row['id']}", row["lens"], json.loads(row["body"])
 
     def status(self):
         # One read transaction so counts, jobs and counters describe the same moment.

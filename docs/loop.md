@@ -309,7 +309,11 @@ cannot drop one silently. Inheritance is a live dependency: a job with `--inheri
 dispatched while any job up its chain is `review` or `interrupted`, and the coordinator reads
 the parents' journals again before it stores a candidate, in `status` and on every export. A
 finding recorded since, or a parent back in review, returns the job to review or makes its
-candidate stale. Repeat detection is scoped to the lens that raised the class. Re-running
+candidate stale. A finding is identified by the journal item and its content, never by the ID
+the reviewer wrote: the same ID with different content is a new finding that must be
+resolved on its own (shown to the reviewer as `ID~<hash>` when it collides). Export is also
+held while any other job on the same lineage, the branch or a parent's branch, is in
+`review` or `interrupted`. Repeat detection is scoped to the lens that raised the class. Re-running
 `enqueue --kind routine` on an unclassified SHA that is still in review or `design-needed`
 corrects the classification in place and records a `reclassified` evidence row.
 Inspect phases and counters with [status](observability.md).
