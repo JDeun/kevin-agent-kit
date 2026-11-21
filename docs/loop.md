@@ -334,11 +334,14 @@ in the reviewer's output. The journal is append-only. Restart, retry and
 resume carry those findings forward for explicit resolution.
 
 A review attempt closes only when the coordinator read the whole output, the
-output ended outside every JSON object, array and string, and the close marker
-was written. A stop that meets all three leaves the job queued for the next
-start. A stop, timeout or size limit that cuts the output, an unreadable
+output is one complete JSON document (or holds no JSON object at all), every
+finding object in it could be stored, and the close marker was written. A stop
+that meets these leaves the job queued for the next start. A stop, timeout or
+size limit that cuts the output, text around the document, an unreadable
 stream or a failed write keeps the attempt open with the raw output, and the
-job becomes `interrupted`. A coordinator that died mid-review is treated the
+job becomes `interrupted`. A finding that was printed but cannot be stored
+(cut inside a value, or malformed) is journaled as a stand-in `unread-…`
+finding that quotes the printed text, so the next review has to resolve it. A coordinator that died mid-review is treated the
 same way on the next start. No command erases an open attempt, and an
 interrupted job is never dispatched or retried automatically.
 

@@ -91,6 +91,7 @@ class Container:
     findings_array: bool
     finding_object: bool
     parts: list[str]
+    start: int = 0
 
 
 def protected_entry(item):
@@ -115,13 +116,18 @@ class Scanner:
 
     Each container is decoded once, validating descendants even in a truncated
     document. `feed` returns the findings completed by the new text. After
-    `finish`, `settled` tells whether the output ended outside every JSON
-    object, array and string; only then is the recovered list known to be whole.
+    `finish`, `settled` tells whether the recovered list is known to be whole:
+    the output holds no JSON object at all, or it is exactly one complete JSON
+    document. Quote parity in surrounding prose can hide a structure from the
+    token scan, so balanced brackets alone never settle an output. `unread`
+    holds the text of each finding object that was printed but could not be
+    stored: one that is invalid, or one the output ended inside.
     """
 
     def __init__(self):
         self.text = ""
         self.settled = False
+        self.unread = []
         self._position = 0
         self._cursor = 0
         self._stack = []
@@ -133,7 +139,9 @@ class Scanner:
 
     def finish(self):
         found = self._advance(final=True)
-        self.settled = not self._stack and not self._open_string
+        body = self.text.strip()
+        self.settled = "{" not in body or whole_document(body)
+        entry = None
         if self._stack and self._stack[-1].finding_object and not self._open_string:
             # The output stopped inside a finding whose fields are already complete.
             frame = self._stack[-1]
@@ -141,9 +149,11 @@ class Scanner:
             try:
                 entry = protected_entry(decode("".join(frame.parts) + rest + "}"))
             except ValueError:
-                entry = None
-            if entry:
-                found.append(entry)
+                pass
+        if entry:
+            found.append(entry)
+        else:
+            self.unread += [self.text[frame.start:] for frame in self._stack if frame.finding_object][:1]
         return found
 
     def _advance(self, final):
@@ -170,7 +180,7 @@ class Scanner:
             if token in ("{", "["):
                 is_finding = token == "{" and bool(stack) and stack[-1].findings_array
                 stack.append(Container(token == "[" and match.start() == self._findings_array_at,
-                                       is_finding, [token]))
+                                       is_finding, [token], match.start()))
             elif stack:
                 frame = stack.pop()
                 frame.parts.append(token)
@@ -180,14 +190,26 @@ class Scanner:
                 try:
                     value = decode("".join(frame.parts))
                 except ValueError:
-                    replacement = "invalid"
+                    value, replacement = None, "invalid"
                 else:
                     replacement = "{}" if isinstance(value, dict) else "[]"
-                    if frame.finding_object and (entry := protected_entry(value)):
+                if frame.finding_object:
+                    if entry := protected_entry(value):
                         found.append(entry)
+                    elif not isinstance(value, dict) or value.get("risk") != "other":
+                        # Not a valid ordinary finding either: it may have been a protected one.
+                        self.unread.append(raw[frame.start:match.end()])
                 if stack:
                     stack[-1].parts.append(replacement)
         return found
+
+
+def whole_document(text):
+    try:
+        json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 def scan(raw):

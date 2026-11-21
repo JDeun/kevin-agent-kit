@@ -7,10 +7,12 @@ Redesign of stop integrity and install trust. See
 
 - Journal each protected finding the moment its JSON object closes in the
   reviewer's output, in an append-only table. A review attempt closes only
-  with a separate marker, written when the whole output was read, ended
-  outside every JSON structure and was recorded. A stop, timeout, size limit
-  or failed write keeps the attempt open with the raw output and moves the job
-  to `interrupted`. No statement deletes an attempt or a journal row.
+  with a separate marker, written when the whole output was read, parsed
+  as one complete JSON document and was recorded. Output cut by a stop,
+  timeout or size limit, text around the document or a failed write keeps the
+  attempt open with the raw output and moves the job to `interrupted`. A
+  finding that was printed but cannot be stored is journaled as a stand-in the
+  next review must resolve. No statement deletes an attempt or a journal row.
 - Add `resume JOB_ID` and `evidence JOB_ID`. A resumed job and every later SHA
   on the branch inherit the journaled findings. `--inherit-from` accepts any
   job, follows its sources and marks an interrupted source `superseded`.
@@ -21,7 +23,8 @@ Redesign of stop integrity and install trust. See
 - **Upgrade step:** a profile now records the snapshot it approves as
   `install_sha256`. Run `init --approve-install` for each existing profile
   after reviewing the install. Until then the profile does not load and
-  `doctor` reports the mismatch. `stop` still works.
+  `doctor` reports the mismatch. `stop` still works. A persona-review
+  profile needs a top-level `install_sha256` as well.
 - The 0.3.4 queue is migrated in place. The second path-based trust check,
   the per-path policy hash and the pending-review deletion paths are removed.
 

@@ -9,6 +9,7 @@ def test_personas_produce_artifacts_before_the_decision(tmp_path, monkeypatch, c
     from reviews.persona import __main__ as persona
     from core.loop.config import profile_dir
     from core.loop.runtime import run
+    from core.loop.setup import approval_line
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
 
@@ -59,7 +60,7 @@ else:
     config = profile_dir() / "personas.toml"
     config.parent.mkdir(parents=True)
     config.write_text(
-        f"[alternatives]\nalpha = {command('alpha')}\nbravo = {command('bravo')}\n"
+        f"{approval_line()}\n[alternatives]\nalpha = {command('alpha')}\nbravo = {command('bravo')}\n"
         f"[review]\nuse = {command('use')}\nadversarial = {command('adversarial')}\n"
         f"synthesis = {command('synthesis')}\n",
         encoding="utf-8",

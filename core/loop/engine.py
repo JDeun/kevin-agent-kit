@@ -44,34 +44,56 @@ class ReviewOutput:
     end reaches the same record, and decides whether the attempt may close.
     """
 
-    def __init__(self, record):
+    def __init__(self, record, invocation="", reason=None):
         self.record = record
+        self.invocation = invocation
         self.scanner = Scanner()
         self.findings = []
-        self.reason = None
+        self.reason = reason
+        self._text, self._found = "", []
 
     def __call__(self, text):
-        found = self.scanner.feed(text)
+        self._commit(text, self.scanner.feed(text))
+
+    def _commit(self, text, found):
+        # Keep what a failed write could not store, so the next write carries it.
+        self._text += text
+        self._found += found
         self.findings += found
-        self.record(text, found)
+        self.record(self._text, self._found)
+        self._text, self._found = "", []
+
+    def unread(self):
+        """Stand-in protected findings for objects the reviewer printed but the journal cannot hold.
+
+        The next review must resolve each one explicitly, so an operator resume
+        cannot drop a finding that was cut off or malformed.
+        """
+        return [{
+            "id": f"unread-{hashlib.sha256((self.invocation + text).encode('utf-8', 'replace')).hexdigest()[:16]}",
+            "risk": "honesty", "finding_class": "unread-review-output",
+            "detail": "The coordinator could not read this finding from an earlier review of this change. "
+                      "Review the affected code again before resolving it. Printed text: " + text[:1000],
+        } for text in self.scanner.unread]
 
     def conclude(self, output, error=None):
         seen = self.scanner.text
         rest = seen if output is None else output
         if not rest.startswith(seen):
             self.reason = "output changed between reads"
-        else:
-            found = self.scanner.feed(rest[len(seen):])
-            found += self.scanner.finish()
-            self.findings += found
-            self.record(rest[len(seen):], found)
-            if getattr(error, "output_truncated", False):
-                self.reason = "output truncated"
-            elif isinstance(error, sqlite3.Error):
-                self.reason = "review could not be recorded"
-            elif not self.scanner.settled:
-                self.reason = "output ended inside a JSON structure"
-        return self
+            return
+        found = self.scanner.feed(rest[len(seen):])
+        found += self.scanner.finish()
+        found += self.unread()
+        if getattr(error, "output_truncated", False):
+            self.reason = "output truncated"
+        elif isinstance(error, sqlite3.Error):
+            self.reason = "review could not be recorded"
+        elif self.scanner.unread:
+            self.reason = "a finding in the output could not be read"
+        elif not self.scanner.settled:
+            self.reason = "output is not one complete JSON document"
+        self._commit(rest[len(seen):], found)
 
     @property
     def settled(self):
@@ -218,7 +240,7 @@ class Engine:
         attempt settled, and `salvaged`, the protected findings recovered from it.
         """
         model_verdict = self.cfg.get("review_format") == "verdict"
-        observed = ReviewOutput(record)
+        observed = ReviewOutput(record, request["invocation"])
 
         def conclude(output, error=None):
             try:
@@ -276,8 +298,10 @@ class Engine:
             "design_blob": blob,
         }
         protected = self.store.design_protected(branch)
+        # Output of earlier unsettled design reviews stays with the branch (the last three).
+        held = (self.store.design(branch) or {}).get("unsettled", [])
         report = {**evidence, "path": path, "blob": blob, "forest_job": forest["id"] if forest else None,
-                  "reviews": [], "open_protected": protected, "status": "incomplete"}
+                  "reviews": [], "open_protected": protected, "status": "incomplete", "unsettled": held}
         self.store.save_design(report)
         adapters = self.cfg["lens_reviewers"]
         if not all(adapters.get(lens) for lens in DESIGN_LENSES):
@@ -302,8 +326,8 @@ class Engine:
                 except Exception as error:
                     observed = getattr(error, "observed", None)
                     if observed is not None and not observed.settled:
-                        report["unsettled"] = {"request": request, "reason": observed.reason,
-                                               "output": observed.scanner.text}
+                        report["unsettled"] = [*held[-2:], {"request": request, "reason": observed.reason,
+                                                            "output": observed.scanner.text}]
                         self.store.save_design(report)
                     raise
                 report.pop("rejected_request", None)
@@ -388,7 +412,8 @@ class Engine:
                 record=lambda text, found: self.store.observe(invocation, text, found))
             outcome, cause = "complete", None
         except Exception as error:
-            observed, cause = error.observed, error
+            observed = getattr(error, "observed", None) or ReviewOutput(None, reason="review failed unexpectedly")
+            cause = error
             outcome = "stopped" if isinstance(error, Cancelled) else "rejected"
         try:
             self.store.settle(invocation, outcome if observed.settled else None, observed.digest, observed.reason)

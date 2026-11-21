@@ -115,6 +115,16 @@ def policy_id(installed, profile, execution, keys):
     return fingerprint(installed.encode("ascii"), profile, *tools, *sockets, *keys)
 
 
+def require_approval(approved):
+    """Refuse a profile whose recorded install snapshot is not the one this process read."""
+    installed = install.snapshot().digest
+    if approved != installed:
+        raise ValueError(
+            f"this profile does not approve the installed kit (installed sha256={installed}, "
+            f"approved {approved or 'none'}); review the install, then record it as install_sha256 "
+            "(`init --approve-install` for a loop profile)")
+
+
 def config(path=None, *, control_only=False):
     installed = install.snapshot()
     data = tomllib.loads(install.project_bytes().decode())["loop"]
@@ -145,10 +155,7 @@ def config(path=None, *, control_only=False):
         raise ValueError("state must be outside the checkout and Git directory")
     if control_only:
         return {"state": state}
-    if data["install_sha256"] != installed.digest:
-        raise ValueError(
-            f"this profile does not approve the installed kit (sha256={installed.digest}); "
-            "review the install, then run `init --approve-install`")
+    require_approval(data["install_sha256"])
     if data["trust"] not in ("signed", "local"):
         raise ValueError('trust must be "signed" or "local"')
     if type(data["design_gate"]) is not bool:

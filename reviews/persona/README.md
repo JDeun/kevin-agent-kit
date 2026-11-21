@@ -9,9 +9,13 @@ Save a private persona profile under the kit's XDG configuration
 runs in a fresh Bubblewrap sandbox, and returns its artifact on stdout.
 Use approved wrappers mounted under `/tools`. For model calls use a scoped
 broker and add its socket to `[execution.sockets]` under `persona`. See the
-[loop's execution setup](../../docs/loop.md).
+[loop's execution setup](../../docs/loop.md). Record the installed kit snapshot you
+reviewed as a top-level `install_sha256`; `doctor` prints the current digest, and
+a profile that names another snapshot does not load.
 
 ```toml
+install_sha256 = "<digest printed by doctor>"
+
 [alternatives]
 compact = ["/tools/persona-agent", "compact"]
 guided = ["/tools/persona-agent", "guided"]

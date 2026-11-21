@@ -408,5 +408,95 @@ def test_design_review_saves_findings_as_they_appear_and_keeps_unsettled_output(
     assert [item["id"] for item in saved[0]] == ["protected"]
     assert report["status"] == "incomplete"
     assert [item["id"] for item in report["open_protected"]["sre"]] == ["protected"]
-    assert report["unsettled"]["reason"] == "output ended inside a JSON structure"
-    assert FINDING["detail"] in report["unsettled"]["output"]
+    assert report["unsettled"][-1]["reason"] == "output is not one complete JSON document"
+    assert FINDING["detail"] in report["unsettled"][-1]["output"]
+    # The next design review keeps that evidence and must resolve the finding.
+    with store_of(cfg) as store, Engine(cfg, store, runner=lambda *a, stdin, **k: review_response(stdin)) as engine:
+        with pytest.raises(ValueError, match="explicit resolution"):
+            engine.design_review("planned", repo.head("planned"), design.name)
+        assert FINDING["detail"] in store.design("planned")["unsettled"][-1]["output"]
+
+
+def stray_quote_then_cut(stdin):
+    """Prose with an odd number of quotes before the document, cut after a complete finding."""
+    return 'Note: the panel is 5" wide.\n' + cut_after_complete_finding(stdin)
+
+
+def cut_inside_detail(stdin):
+    text = review_response(stdin, [FINDING])
+    return text[:text.index(FINDING["detail"]) + 6]
+
+
+def test_stray_quote_before_the_document_cannot_settle_a_cut_review(queue):  # noqa: F811
+    git, cfg = queue
+    assert scan('5" {"findings":[{"id":"a","risk":"security","detail":"d"}')[1] is False
+    assert scan('5" {"findings":[{"id":"a","risk":"security","detail":"d"}]}')[1] is False
+    start_and_stop(cfg, git, stopping_reviewer(stray_quote_then_cut))
+    with store_of(cfg) as store, Engine(cfg, store, runner=no_rerun):
+        assert store.status()["counts"] == {"interrupted": 1}
+        assert FINDING["detail"] in store.held(1)[0]["output"]
+
+
+@pytest.mark.parametrize("output", [cut_inside_detail, lambda stdin: review_response(
+    stdin, [{"id": "bad id", "risk": "security", "detail": "Malformed but protected."}])])
+def test_finding_the_journal_cannot_hold_becomes_an_obligation(queue, output):  # noqa: F811
+    git, cfg = queue
+    start_and_stop(cfg, git, stopping_reviewer(output))
+    with store_of(cfg) as store:
+        with Engine(cfg, store, runner=no_rerun):
+            assert store.status()["counts"] == {"interrupted": 1}
+        [stand_in] = store.protected(1)
+        assert stand_in["id"].startswith("unread-") and stand_in["risk"] == "honesty"
+        assert "protected" in stand_in["detail"]
+        store.resume(1)
+        # Resuming does not drop it: a clean review without a resolution is refused.
+        assert settle(cfg, store, clean_run, 1)["phase"] == "blocked"
+
+
+def test_successor_already_reviewed_cannot_supersede_an_interrupted_job(queue):  # noqa: F811
+    git, cfg = queue
+    interrupted_queue(cfg, git)
+    git.run("switch", "-c", "successor", "feature")
+    git.run("commit", "--quiet", "--allow-empty", "-m", "successor")
+    sha = git.head("successor")
+    git.run("switch", "main")
+    with store_of(cfg) as store:
+        with Engine(cfg, store, runner=no_rerun):
+            pass
+        store.resume(1)
+        job = store.enqueue("successor", sha, inherits=1)
+        store.update(job, "candidate")
+        store.update(store.status()["jobs"][0], "interrupted")
+        with pytest.raises(ValueError, match="already reviewed"):
+            store.enqueue("successor", sha, inherits=1)
+        assert store.status()["jobs"][0]["phase"] == "interrupted"
+
+
+def test_output_a_failed_write_missed_is_stored_with_the_next_write():
+    from core.loop.engine import ReviewOutput
+
+    written = []
+
+    def record(text, found):
+        if not written:
+            written.append(None)
+            raise sqlite3.OperationalError("busy")
+        written.append((text, [item["id"] for item in found]))
+
+    observed = ReviewOutput(record, "invocation")
+    text = json.dumps({"findings": [FINDING]})
+    with pytest.raises(sqlite3.OperationalError):
+        observed(text[:-1])
+    observed.conclude(text)
+    assert written[1:] == [(text, ["protected"])] and observed.settled
+
+
+def test_retry_refuses_a_job_with_an_open_attempt(queue):  # noqa: F811
+    git, cfg = queue
+    with store_of(cfg) as store:
+        job = store.enqueue("feature", git.head("feature"))
+        store.open_attempt(job["id"], {"run": "r", "candidate": "c", "lens": "general", "invocation": "i"}, 1)
+        store.update(job, "blocked")
+        with pytest.raises(ValueError, match="retry requires"):
+            store.retry(job["id"])
+        assert store.status()["jobs"][0]["pending_review"]["invocation"] == "i"

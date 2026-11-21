@@ -164,6 +164,9 @@ class Store:
             if inherits is not None and recorded["inherits"] != inherits:
                 raise ValueError("this branch and SHA are already queued without that inheritance")
             if inherits is not None and source["phase"] == "interrupted":
+                if recorded["phase"] != "review":
+                    raise ValueError("that job was already reviewed without these findings; "
+                                     "resume the interrupted job or enqueue a new SHA")
                 # The successor now owes the journaled findings; the interrupted job is done.
                 self.db.execute("UPDATE jobs SET phase='superseded',detail=?,updated_at=? WHERE id=?",
                                 (f"protected findings carried to job {recorded['id']}", stamp, inherits))
@@ -288,7 +291,8 @@ class Store:
         with self.db:
             changed = self.db.execute(
                 "UPDATE jobs SET phase='review',attempts=0,next_at=0,detail='' "
-                "WHERE id=? AND phase IN ('blocked','candidate','stale','design-needed','forest-held','wiki-needed')", (job_id,),
+                "WHERE id=? AND phase IN ('blocked','candidate','stale','design-needed','forest-held','wiki-needed') "
+                f"AND NOT EXISTS ({OPEN_ATTEMPT})", (job_id,),
             )
             if changed.rowcount != 1:
                 raise ValueError("retry requires a blocked, candidate, stale or design-pending job")
@@ -430,7 +434,7 @@ class Store:
                    FROM review_attempts a WHERE a.job_id=? AND a.closed_at IS NULL
                    ORDER BY a.opened_at DESC, a.invocation LIMIT 1""", (job["id"],),
             ).fetchone()
-            if request and job["phase"] != "review":
+            if request:
                 job["pending_review"] = dict(request)
             rows.append(job)
         counts = {}
