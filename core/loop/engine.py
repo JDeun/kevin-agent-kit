@@ -149,10 +149,16 @@ def check_lineage(store, evidence, *, export=False):
     job = evidence.get("job")
     if job is None:
         raise Conflict("candidate evidence has no lineage record; retry the job")
+    reviewed = evidence.get("lineage_reviewed", [])
+    with store.snapshot():
+        _check_lineage(store, job, reviewed, export)
+
+
+def _check_lineage(store, job, reviewed, export):
+    # Every read here shares one snapshot, so the verdicts below agree with each other.
     parent = store.unsettled_parent(job)
     if parent is not None:
         raise Conflict(f"job {parent} that this job inherits from is still in review; retry after it settles")
-    reviewed = evidence.get("lineage_reviewed", [])
     if any(not isinstance(entry, list) or len(entry) != 4 for entry in reviewed):
         raise Conflict("candidate lineage record predates finding identity; retry the job")
     gap = store.lineage_gap(job, reviewed)
@@ -341,9 +347,10 @@ class Engine:
             "branch": branch, "candidate": head, "policy": self.cfg["policy_id"], "run": uuid4().hex,
             "design_blob": blob,
         }
-        protected = self.store.design_protected(branch)
+        previous_report = self.store.design(branch)
+        protected = self.store.design_protected(branch, previous_report)
         # Output of earlier unsettled design reviews stays with the branch (the last three).
-        held = (self.store.design(branch) or {}).get("unsettled", [])
+        held = (previous_report or {}).get("unsettled", [])
         report = {**evidence, "path": path, "blob": blob, "forest_job": forest["id"] if forest else None,
                   "reviews": [], "open_protected": protected, "status": "incomplete", "unsettled": held}
         self.store.save_design(report)

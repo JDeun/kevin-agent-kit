@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.8
+
+A decision and the record of it come from one snapshot.
+
+- The finding list handed to a reviewer and the `lineage_reviewed` record are
+  derived from the same journal rows, read once inside a single read
+  transaction (`Store.snapshot`). Before, `inherited_lineage` read the journals
+  twice without a transaction, so a finding a peer recorded between the reads
+  was marked as reviewed although the reviewer never saw it. A regression test
+  injects a peer write between the reads.
+- The same pattern is fixed where a verdict and a later read could disagree:
+  `check_lineage` (parent still in review, lineage gap and open lineage review
+  now share one snapshot), `Store.lineage_gap` (job row and lineage items),
+  `Store.ready` (the ready list and each job's unsettled-parent check) and the
+  design review (the previous report is read once for both its protected
+  findings and its held output).
+
 ## 0.3.7
 
 A finding is identified by its journal item, not by the name the reviewer gave it.

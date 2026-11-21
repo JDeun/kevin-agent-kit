@@ -5,7 +5,7 @@ bundle. The kit never merges: the repository owner applies the candidate.
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **Experimental v0.3.7.** Live reviews, repairs and checks require working Linux
+> **Experimental v0.3.8.** Live reviews, repairs and checks require working Linux
 > Bubblewrap namespaces. Model credentials stay in an operator-run broker. Each
 > required check receives a fresh read-only tree pinned to the candidate commit.
 > The fixture demo runs on machines without Bubblewrap. See [known issues](docs/known-issues.md).

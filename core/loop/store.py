@@ -208,8 +208,10 @@ class Store:
         except Busy:
             raise ValueError("a design review is already running on this branch") from None
 
-    def design_protected(self, branch):
-        previous = self.design(branch) or {}
+    def design_protected(self, branch, previous=None):
+        if previous is None:
+            previous = self.design(branch)
+        previous = previous or {}
         if "open_protected" in previous:
             return previous["open_protected"]
         # Older reports record the findings only in each complete lens receipt.
@@ -237,11 +239,12 @@ class Store:
     def ready(self):
         # A job with an unsettled review attempt is never dispatched again, and a job
         # that inherits from a lineage still under review waits for it to settle.
-        rows = self.db.execute(
-            f"SELECT * FROM jobs WHERE phase='review' AND next_at <= ? AND NOT EXISTS ({OPEN_ATTEMPT}) "
-            "ORDER BY id", (time.time(),),
-        ).fetchall()
-        return [row for row in rows if self.unsettled_parent(row["id"]) is None]
+        with self.snapshot():
+            rows = self.db.execute(
+                f"SELECT * FROM jobs WHERE phase='review' AND next_at <= ? AND NOT EXISTS ({OPEN_ATTEMPT}) "
+                "ORDER BY id", (time.time(),),
+            ).fetchall()
+            return [row for row in rows if self.unsettled_parent(row["id"]) is None]
 
     def unsettled_parent(self, job_id):
         """The nearest job up the `--inherit-from` chain that is still being reviewed, or None.
@@ -270,9 +273,10 @@ class Store:
         the source job and the content that match; the reviewer's own ID never does.
         The journals of the parent chain and of the branch are read again on every call.
         """
-        job = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         known = {tuple(entry[:3]) for entry in reviewed}
-        current = self.lineage_items(dict(job))
+        with self.snapshot():
+            job = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            current = self.lineage_items(dict(job))
         return sorted({item for key, item in current.items() if key not in known})
 
     def lineage_sources(self, job_id):
@@ -450,15 +454,20 @@ class Store:
         and its named parent, followed transitively. A finding is told apart by its
         content, not by the ID the reviewer gave it: when two different findings share
         an ID, the inherited one is offered under `ID~<content hash prefix>` so each
-        needs its own resolution. Both values come from one read of the journals.
+        needs its own resolution. Both values derive from the same rows, read once in
+        one read transaction: a lineage item is recorded as reviewed only if the
+        finding list handed to the reviewer holds it.
         """
-        own = self.protected(job["id"])
+        with self.snapshot():
+            own = self.protected(job["id"])
+            rows = {source: list(self._protected_rows(source)) for source in sorted(self.lineage_sources(job["id"]))}
         taken = {(item["lens"], item["id"]): content_hash(item) for item in own}
-        merged = {}
-        for source in sorted(self.lineage_sources(job["id"])):
-            for _, lens, finding in self._protected_rows(source):
+        merged, items = {}, {}
+        for source, found in rows.items():
+            for origin, lens, finding in found:
                 digest = content_hash(finding)
                 merged[lens, digest] = {**finding, "lens": lens}
+                items.setdefault((source, lens, digest), (source, lens, digest, f"{source}:{origin}"))
         inherited = []
         for (lens, digest), finding in merged.items():
             name = finding["id"]
@@ -468,7 +477,7 @@ class Store:
                     name += "_"
             taken[lens, name] = digest
             inherited.append({**finding, "id": name})
-        return [*inherited, *own], sorted(self.lineage_items(job).values())
+        return [*inherited, *own], sorted(items.values())
 
     def protected(self, job_id):
         # A retry rebuilds from the approved source, so prior repair resolutions
@@ -500,13 +509,26 @@ class Store:
         ):
             yield f"journal-{row['id']}", row["lens"], json.loads(row["body"])
 
-    def status(self):
-        # One read transaction so counts, jobs and counters describe the same moment.
+    @contextmanager
+    def snapshot(self):
+        """One read transaction: every read inside it describes the same moment.
+
+        Nested use joins the transaction that is already open, so only the outermost
+        block begins and ends it. A peer's write waits until the block ends.
+        """
+        if self.db.in_transaction:
+            yield
+            return
         self.db.execute("BEGIN")
         try:
-            return self._status()
+            yield
         finally:
             self.db.rollback()
+
+    def status(self):
+        # One read transaction so counts, jobs and counters describe the same moment.
+        with self.snapshot():
+            return self._status()
 
     def _status(self):
         rows = []

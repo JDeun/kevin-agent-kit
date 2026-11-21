@@ -307,7 +307,10 @@ any job can be the source, and its own sources follow. The review then requires 
 evidence for each inherited finding (independent evidence in signed mode), so a new SHA
 cannot drop one silently. Inheritance is a live dependency: a job with `--inherit-from` is not
 dispatched while any job up its chain is `review` or `interrupted`, and the coordinator reads
-the parents' journals again before it stores a candidate, in `status` and on every export. A
+the parents' journals again before it stores a candidate, in `status` and on every export.
+The findings given to a reviewer and the lineage items recorded as reviewed come from one
+read transaction, so a finding recorded by a peer meanwhile is never recorded as reviewed
+without having been given. A
 finding recorded since, or a parent back in review, returns the job to review or makes its
 candidate stale. A finding is identified by the journal item and its content, never by the ID
 the reviewer wrote: the same ID with different content is a new finding that must be
