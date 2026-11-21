@@ -20,7 +20,7 @@ ENTRIES = (
 )
 
 
-def copy_file(relative, target, render, dirty=False):
+def copy_file(relative, target, render, dirty=False, mode=b"100644"):
     source = ROOT / relative
     if source.resolve() != source or not source.is_file():
         raise ValueError(f"package input must be a regular file without symlinks: {source}")
@@ -36,7 +36,8 @@ def copy_file(relative, target, render, dirty=False):
         target.write_text(render(data.decode("utf-8")), encoding="utf-8")
     else:
         target.write_bytes(data)
-    target.chmod(source.stat().st_mode & 0o777)
+    # Permissions come from the Git file type, never from the (possibly group-writable) work tree.
+    target.chmod(0o755 if mode == b"100755" else 0o644)
 
 
 def tracked_inputs(dirty=False):
@@ -61,7 +62,7 @@ def tracked_inputs(dirty=False):
             continue
         if mode not in {b"100644", b"100755"} or stage != b"0":
             raise ValueError(f"package input must be a tracked regular file: {relative}")
-        yield relative, entry in RUNTIME
+        yield relative, entry in RUNTIME, mode
 
 
 # The same check runs at install time here and at every launch inside the launcher.
@@ -74,6 +75,16 @@ def trusted(path):
         sticky = bool(info.st_mode & stat.S_ISVTX) and entry != path
         if info.st_uid not in (0, uid) or (info.st_mode & 0o022 and not sticky):
             raise SystemExit(f"untrusted kit path (owner or write access): {entry}")
+
+
+def trusted_tree(root):
+    import os, stat
+    uid = os.getuid()
+    for base, dirs, files in os.walk(root):
+        for name in (*dirs, *files):
+            info = os.lstat(os.path.join(base, name))
+            if stat.S_ISLNK(info.st_mode) or info.st_uid not in (0, uid) or info.st_mode & 0o022:
+                raise SystemExit(f"untrusted kit file (symlink, owner or write access): {os.path.join(base, name)}")
 """
 exec(TRUST_CHECK)
 
@@ -87,6 +98,7 @@ def write_launcher(command, module, relative_root):
         f"{TRUST_CHECK}\n"
         f"root = (Path(__file__).resolve().parents[1] / {relative_root!r}).resolve()\n"
         "trusted(root)\n"
+        f"trusted_tree(root / {module!r})\n"
         f"if not (root / {module!r} / '__init__.py').is_file():\n"
         "    raise SystemExit(f'kit package is missing from {root}')\n"
         "sys.path.insert(0, str(root))\n"
@@ -124,11 +136,11 @@ def build(destination, dirty=False):
         stage = Path(temp) / "product"
         stage.mkdir()
         package = stage / module
-        for path, runtime in tracked_inputs(dirty):
+        for path, runtime, mode in tracked_inputs(dirty):
             prefix = package if runtime else stage
-            copy_file(path, prefix.joinpath(*(render(part) for part in path.parts)), render, dirty)
+            copy_file(path, prefix.joinpath(*(render(part) for part in path.parts)), render, dirty, mode)
             if path.as_posix() in DOCUMENTS:
-                copy_file(path, stage / path, render, dirty)
+                copy_file(path, stage / path, render, dirty, mode)
         (package / "__init__.py").touch()
         (package / "__main__.py").write_text(
             "from .core.loop.__main__ import main\n\nraise SystemExit(main())\n", encoding="utf-8")
@@ -145,7 +157,7 @@ def install(prefix, dirty=False):
     destination = prefix / "share" / name
     if binary.exists() or binary.is_symlink() or destination.exists() or destination.is_symlink():
         raise ValueError(f"install path already exists for {name}")
-    for part in (prefix / "bin", prefix / "share"):
+    for part in (prefix, prefix / "bin", prefix / "share"):
         if part.is_symlink():
             raise ValueError(f"install directory cannot be a symlink: {part}")
     binary.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +165,7 @@ def install(prefix, dirty=False):
     trusted(binary.parent)
     trusted(destination.parent)
     target = build(destination, dirty=dirty)
+    trusted_tree(target)
     created = target.lstat()
     try:
         with tempfile.TemporaryDirectory(dir=binary.parent, prefix=".install-") as temp:
@@ -207,7 +220,7 @@ def main():
         if args.action == "build":
             print(build(args.destination, args.allow_dirty))
         elif args.action == "install":
-            print(install(args.prefix.resolve(), args.allow_dirty))
+            print(install(args.prefix.absolute(), args.allow_dirty))
         else:
             print(rename(args.name))
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:

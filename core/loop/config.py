@@ -210,6 +210,9 @@ def config(path=None, *, control_only=False):
 
     forbidden = (repo, common, state.resolve())
     execution = execution_policy(data["execution"], forbidden=forbidden)
+    if not local and execution["isolation"] == "none":
+        raise ValueError('isolation = "none" is only valid with trust = "local"; signed evidence '
+                         "needs the sandbox")
     if local and execution["isolation"] != "none":
         raise ValueError('trust = "local" runs adapters directly; also set isolation = "none" under '
                          "[loop.execution] to acknowledge that they are not isolated")

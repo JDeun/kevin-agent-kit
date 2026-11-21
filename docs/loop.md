@@ -22,9 +22,18 @@ them. In this mode:
 - the reviewer, security lens and worker run through `kevin-agent-kit agent review|worker
   --cli codex|claude`, which calls `codex exec` or `claude -p` with read-only or edit
   permissions, extracts the model's JSON verdict from its output and builds the exact
-  receipt the loop requires. A missing verdict, an incomplete review or a rate limit fails
-  the command with exit status 3 or 75 (retry), so it is never read as a clean review;
-- required checks run in the candidate checkout with their real exit status;
+  receipt the loop requires. A missing verdict or a rate limit fails the command with exit
+  status 3 or 75 (retry). A verdict is complete only with an explicit `status` of `complete`,
+  a `findings` array whose every item has a valid id, risk and detail, and a `resolved`
+  object; anything else becomes a `partial` receipt that the loop rejects while keeping its
+  well-formed protected findings. Profiles written by `init --agent` pass `--unsandboxed`,
+  so Codex runs with `--sandbox danger-full-access` for both roles (its own sandbox needs
+  user namespaces, which are the reason this mode exists) and the read-only reviewer is
+  read-only by instruction only;
+- required checks run in the candidate checkout with their real exit status and an empty
+  `HOME`. The checkout must equal the candidate commit before the run, and HEAD and the
+  tracked files must be unchanged after it, or the check fails; a repair counts only if the
+  worker left HEAD where it was and changed only staged paths inside `repair_paths`;
 - every command's exit code, duration and output hash are stored under `runs`, and each check
   under `checks` with `source = "local-unsigned"`; the candidate record carries
   `trust = "local"`.

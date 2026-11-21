@@ -29,7 +29,7 @@ if args == ["--version"]:
     print("fake-cli 1.2.3")
     raise SystemExit(0)
 prompt = sys.stdin.read()
-write = ("workspace-write" in args) or ("acceptEdits" in args)
+write = ("workspace-write" in args) or ("acceptEdits" in args) or "approved_paths" in prompt
 if write:
     open("file.txt", "w").write("fixed\\n")
     print("edited")

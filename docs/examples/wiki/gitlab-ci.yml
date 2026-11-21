@@ -6,4 +6,4 @@ wiki-lint:
       changes:
         - docs/research/**/*
   script:
-    - kevin-agent-kit wiki lint --dir docs/research
+    - kevin-agent-kit wiki --dir docs/research lint

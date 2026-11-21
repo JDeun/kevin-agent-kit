@@ -11,4 +11,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # The kit must be installed from a pinned, reviewed release.
-      - run: kevin-agent-kit wiki lint --dir docs/research
+      - run: kevin-agent-kit wiki --dir docs/research lint

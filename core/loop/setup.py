@@ -338,7 +338,7 @@ def repository_profile(cwd, *, dry_run=False, agent=None):
 def agent_profile(repo, target, examples, agent):
     """A working profile that drives a real agent CLI directly, without Bubblewrap or signing."""
     def adapter(role):
-        return json.dumps(module_command(ROOT, MODULE_PREFIX + "core.agents", role, "--cli", agent))
+        return json.dumps(module_command(ROOT, MODULE_PREFIX + "core.agents", role, "--cli", agent, "--unsandboxed"))
 
     checks = [f"tests = {json.dumps(examples[0])}"] if examples else [
         '# tests = ["python3", "-m", "pytest", "-q"]  # add the command that proves a change works']

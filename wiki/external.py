@@ -1,4 +1,5 @@
 """Read-only lint of a hosted wiki (GitHub or GitLab `.wiki.git`). Never writes back."""
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -24,8 +25,13 @@ def clone(url, destination):
 
 def audit(checkout):
     errors, warnings = [], []
-    names = {path.relative_to(checkout).as_posix(): path for path in checkout.rglob("*")
-             if path.is_file() and ".git" not in path.relative_to(checkout).parts}
+    names = {}
+    for base, dirs, files in os.walk(checkout):
+        dirs[:] = [d for d in dirs if d != ".git" and not (Path(base) / d).is_symlink()]
+        for name in files:
+            path = Path(base) / name
+            if not path.is_symlink():  # never follow a link out of the checkout
+                names[path.relative_to(checkout).as_posix()] = path
     pages = {name for name in names if name.lower().endswith(".md")}
     linked = set()
     stems = {Path(name).with_suffix("").as_posix().lower(): name for name in pages}

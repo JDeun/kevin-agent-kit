@@ -1,3 +1,8 @@
+# NOT A TRUSTED GATE ON ITS OWN. A pull_request workflow is read from the merge commit, so a
+# candidate can edit this file. It is a trusted gate only when the approved copy runs from outside
+# the candidate: an organization-level required workflow or ruleset that pins this file to a
+# reviewed revision of a separate repository. Treat a copy that lives in the candidate's own
+# repository as advisory feedback.
 name: Architecture fitness
 on: pull_request
 permissions:

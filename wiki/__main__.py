@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from . import DEFAULT_DIR, WikiError, ingest, init, lint, lint_task
+from . import DEFAULT_DIR, WikiError, ingest, init, lint, lint_task, write_new
 from .external import lint_remote
 
 
@@ -18,7 +18,8 @@ def checkout_root(path):
 
 def emit(text, output):
     if output:
-        Path(output).write_text(text, encoding="utf-8")
+        if not write_new(Path(output), text):
+            raise WikiError(f"refusing to overwrite an existing file: {output}")
         print(f"task written to {output}")
     else:
         print(text)

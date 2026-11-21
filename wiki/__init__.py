@@ -66,6 +66,19 @@ def locate(root, directory):
     return path
 
 
+def guard(base):
+    """Refuse symlinks anywhere in the wiki tree the kit reads or writes."""
+    entries = [base / "README.md", base / "AGENTS.md", base / "sources"]
+    sources = base / "sources"
+    if sources.is_dir() and not sources.is_symlink():
+        entries += list(sources.iterdir())
+    if base.is_dir():
+        entries += list(base.glob("*.md"))
+    for entry in entries:
+        if entry.is_symlink():
+            raise WikiError(f"the wiki cannot contain a symlink: {entry.name}")
+
+
 def write_new(path, data):
     """Create a file exclusively. Return False when it already exists."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +93,7 @@ def write_new(path, data):
 
 def init(root, directory=DEFAULT_DIR):
     base = locate(root, directory)
+    guard(base)
     created, kept = [], []
     for relative, text in (("README.md", MAP_TEMPLATE), ("AGENTS.md", RULES_TEMPLATE),
                            (f"sources/{MANIFEST}", "{}\n")):
@@ -93,6 +107,7 @@ def sha256(path):
 
 
 def read_manifest(base):
+    guard(base)
     path = base / "sources" / MANIFEST
     if not path.is_file():
         raise WikiError("run `wiki init` first: the sources manifest is missing")
@@ -167,7 +182,7 @@ New raw source: `{directory}/sources/{target}`. Do not edit it.
 4. If the source contradicts an existing statement, keep both and add a block
    beginning `> CONFLICT:` that names both sources. Do not resolve it yourself.
 5. State only what the sources support. List unverified items as open questions.
-6. Run `wiki lint --dir {directory}` and fix every error.
+6. Run `wiki --dir {directory} lint` and fix every error.
 
 Existing pages:
 {existing}
@@ -192,6 +207,7 @@ def links_in(base, path, errors, *, text=None):
 
 def lint(root, directory=DEFAULT_DIR, *, strict=False):
     base = locate(root, directory)
+    guard(base)
     errors, warnings = [], []
     if not (base / "README.md").is_file():
         raise WikiError("the wiki map README.md is missing; run `wiki init`")
@@ -250,6 +266,7 @@ def lint(root, directory=DEFAULT_DIR, *, strict=False):
 
 def lint_task(root, directory=DEFAULT_DIR):
     base = locate(root, directory)
+    guard(base)
     listing = "\n".join(f"- {directory}/{path.name}" for path in pages(base)) or "- (none)"
     return f"""# Wiki lint task (judgement checks)
 
@@ -270,4 +287,3 @@ unsupported, resolved-conflict), `quote` and `evidence` (a source path or
 Pages:
 {listing}
 """
-

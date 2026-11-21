@@ -5,6 +5,14 @@
 
 > one human holds the decision gate; an agent fleet does the rest
 
+> **상태: 실험 단계 (v0.3.2).** 아직 보안 경계로 의존하지 마세요.
+> - 로컬 신뢰 모드(`init --agent`)는 비격리·무서명입니다. 모델 CLI와 필수 검사가 계정의 파일과
+>   네트워크로 실행되고 후보의 규칙·텍스트가 리뷰어에 영향을 줄 수 있으니, 일회용 호스트와
+>   신뢰하는 후보에만 쓰세요.
+> - 격리·서명 모드는 Linux Bubblewrap과 외부 브로커가 필요하며 여기서는 검증되지 않았습니다.
+>   검사 대상 저장소 안에 정의한 CI 작업은 게이트가 아니라 참고용입니다.
+> - 실제 모델 검증은 Codex CLI 로컬 모드만 했습니다. [알려진 문제](../known-issues.md)
+
 [English](../../README.md) · [저장소](https://github.com/JDeun/kevin-agent-kit.git)
 
 사람이 작업 방향을 정하고, 검토된 설계안을 선택하며, 배포와 정리를 승인합니다.

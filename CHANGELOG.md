@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2
+
+- Installed files take their permissions from the Git file type (0644 or 0755), never from
+  the work tree, and the installer and every launch reject a kit tree with symlinks or
+  group or other write access. A symlinked install prefix is refused as documented.
+- The wiki refuses symlinks inside its tree (`sources/`, manifest, map, pages), `external`
+  skips linked files, and `--task-out` never overwrites a file. The wiki CI examples and the
+  generated ingest task put `--dir` before the action.
+- The real-CLI adapter accepts only an explicit `complete` verdict with a well-formed
+  `findings` array and `resolved` object. Anything else becomes a `partial` receipt that
+  keeps its protected findings. Unisolated profiles pass `--unsandboxed` so Codex no longer
+  fails on its own Bubblewrap.
+- Local mode binds repairs and required checks to the candidate: a worker that moves HEAD is
+  rejected, and a required check must start on the exact candidate commit and leave HEAD and
+  tracked files unchanged. Required checks get an empty `HOME`. `trust = "signed"` with
+  `isolation = "none"` is rejected.
+- State the supported scope plainly: README status, `docs/known-issues.md` and the fitness
+  and loop docs say that local mode is unisolated and that a CI job defined inside the
+  checked repository is advisory.
+
 ## 0.3.1
 
 - Add `doctor`, which reports whether Bubblewrap, OpenSSL, Git and the agent CLIs work on

@@ -5,6 +5,14 @@ bundle. The kit never merges: the repository owner applies the candidate.
 
 > one human holds the decision gate; an agent fleet does the rest
 
+> **Status: experimental (v0.3.2).** Expect rough edges; do not rely on it as a security boundary yet.
+> - Local trust mode (`init --agent`) is unisolated and unsigned: model CLIs and required checks run with
+>   your account's files and network, and candidate rules or text can influence a reviewer. Use a
+>   disposable host and only trusted candidates.
+> - The isolated, signed mode needs Linux Bubblewrap and external brokers that are not verified here;
+>   a CI job defined inside the repository it checks is advisory, not a gate.
+> - Real-model checks covered the Codex CLI in local mode only; see [known issues](docs/known-issues.md).
+
 [한국어](docs/ko/README.md) · [Repository](https://github.com/JDeun/kevin-agent-kit.git)
 
 People set direction, choose among reviewed designs, and authorize shipping and

@@ -320,9 +320,10 @@ class Engine:
                         return "blocked", "protected findings require resolution", report
                     return "waiting", "human decision needed", report
                 try:
+                    git.pristine(evidence["candidate"])
                     self.command("worker", self.cfg["worker"], git.repo, evidence,
                                  stdin=brief(evidence, items, self.cfg["repair_paths"]))
-                    repaired = git.repair(self.cfg["repair_paths"])
+                    repaired = git.repair(self.cfg["repair_paths"], evidence["candidate"])
                     with ExitStack() as next_checkout:
                         git, _ = next_checkout.enter_context(git.snapshot(self.cfg["state"], base, repaired))
                         git.run("checkout", "--quiet", "--detach", repaired)
@@ -336,7 +337,7 @@ class Engine:
             for name, argv in sorted(self.cfg["checks"].items()):
                 if local:
                     try:
-                        receipts.append(self.local_check(name, argv, git.repo, evidence))
+                        receipts.append(self.local_check(name, argv, git, evidence))
                     except (OSError, ValueError, Retry) as cause:
                         failed = {"check": name, "status": "failed", "source": "local-unsigned",
                                   "exit_code": getattr(cause, "code", None)}
@@ -375,13 +376,24 @@ class Engine:
                 "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
 
-    def local_check(self, name, argv, work, evidence):
-        """Run a required check directly in the candidate checkout and keep its exit code."""
+    def local_check(self, name, argv, git, evidence):
+        """Run a required check directly in the candidate checkout and keep its exit code.
+
+        The result counts only if the checkout was exactly the candidate commit before the run
+        and the run left HEAD and the tracked files untouched, so the tree the check saw is the
+        tree the exported bundle carries.
+        """
         started = time.monotonic()
+        candidate = evidence["candidate"]
         request = {**evidence, "kind": "required-check", "check": name, "invocation": uuid4().hex}
-        output = self.command("verify", argv, work, evidence, stdin=json.dumps({"request": request}))
+        try:
+            git.pristine(candidate)
+            output = self.command("verify", argv, git.repo, evidence, stdin=json.dumps({"request": request}))
+            git.unchanged(candidate)
+        except Conflict as error:
+            raise ValueError(f"required check {name} did not run on the exact candidate: {error}") from error
         return {
-            "request": request, "check": name, "status": "passed", "executed": True, "exit_code": 0,
+            "request": request, "tree": git.tree(candidate), "check": name, "status": "passed", "executed": True, "exit_code": 0,
             "duration_seconds": round(time.monotonic() - started, 3),
             "output_sha256": hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest(),
             "tool_version": "local", "execution_id": uuid4().hex, "collected_at": now(),

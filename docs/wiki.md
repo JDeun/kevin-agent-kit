@@ -29,7 +29,10 @@ kevin-agent-kit wiki lint --task-out /tmp/lint-task.md
 kevin-agent-kit wiki external https://example.com/org/repo.wiki.git
 ```
 
-Pass `--dir` before the action to use another directory. All commands run in
+Pass `--dir` before the action (`wiki --dir DIR lint`) to use another directory. The wiki
+tree must not contain symlinks: `init`, `ingest` and `lint` refuse a linked `sources/`,
+manifest, map or page, and `external` skips linked files. `--task-out` refuses to overwrite
+an existing file. All commands run in
 the current checkout unless you pass `--root`.
 
 - `init` creates the map, the rules and `sources/` and never overwrites

@@ -105,9 +105,27 @@ class Git:
             raise MergeFailure("conflict" if unmerged else "merge-error") from error
         return self.resolve()
 
-    def repair(self, allowed_paths):
+    def pristine(self, commit):
+        """The checkout is exactly `commit`: HEAD, tracked files and untracked files all match."""
+        if self.resolve() != commit:
+            raise Conflict("the checkout is not at the candidate commit")
+        if self.run("status", "--porcelain", "-z", "--untracked-files=all").stdout:
+            raise Conflict("the candidate checkout has uncommitted or untracked changes")
+
+    def unchanged(self, commit):
+        """After a command ran: HEAD and every tracked file are still `commit`."""
+        if self.resolve() != commit or self.run("diff", "--quiet", "--ignore-submodules=none", commit,
+                                                allowed=(0, 1)).returncode:
+            raise Conflict("a command changed the candidate checkout")
+
+    def tree(self, commit):
+        return self.run("rev-parse", "--verify", f"{commit}^{{tree}}").stdout.strip()
+
+    def repair(self, allowed_paths, expected=None):
         from .review import matches
 
+        if expected is not None and self.resolve() != expected:
+            raise Conflict("worker moved HEAD; only staged changes are accepted as a repair")
         self.run("add", "-A", "--", ".")
         paths = self.paths("--cached")
         if not paths:

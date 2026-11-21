@@ -11,6 +11,8 @@ def main(argv=None):
         prog="agent", description="Run a real agent CLI as the loop's reviewer or worker (stdin is the prompt).")
     parser.add_argument("role", choices=("review", "worker", "versions"))
     parser.add_argument("--cli", choices=CLIS, default="codex")
+    parser.add_argument("--unsandboxed", action="store_true",
+                        help="do not enable the CLI's own sandbox (for unisolated local profiles)")
     args = parser.parse_args(argv)
     model = os.environ.get("AGENT_MODEL")
     try:
@@ -19,9 +21,9 @@ def main(argv=None):
             return 0
         prompt = sys.stdin.read()
         if args.role == "review":
-            print(json.dumps(review(args.cli, prompt, workspace(), model)))
+            print(json.dumps(review(args.cli, prompt, workspace(), model, unsandboxed=args.unsandboxed)))
         else:
-            work(args.cli, prompt, workspace(), model)
+            work(args.cli, prompt, workspace(), model, unsandboxed=args.unsandboxed)
         return 0
     except (AgentError, ValueError, KeyError) as error:
         print(f"agent {args.role}: {error}", file=sys.stderr)

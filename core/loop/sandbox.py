@@ -254,6 +254,11 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
                     raise ValueError(f"sandbox tool changed: {tool.path}")
             path.chmod(0o500 if tool.executable else 0o400)
             paths[name] = path
-        cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle)
         unisolated = policy.get("isolation") == "none"
+        if unisolated and role == "verify":
+            # Required checks never see the account's model credentials: they get an empty HOME.
+            home = temp / "home"
+            home.mkdir(mode=0o700)
+            extra = {**(extra or {}), "HOME": str(home)}
+        cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle)
         return run(cmd, str(cwd) if unisolated and cwd is not None else "/", cancel, timeout, prompt=stdin, env=env)

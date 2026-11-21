@@ -1,3 +1,8 @@
+# NOT A TRUSTED GATE ON ITS OWN. Merge request pipelines read this file from the candidate's
+# own project, so a candidate can edit it. It is a trusted gate only when the approved definition
+# is enforced from outside the candidate (for example a pipeline execution or compliance policy
+# that your GitLab tier provides, with the runner image pinned). Without one, treat it as
+# advisory feedback.
 architecture-fitness:
   # The referenced runner image supplies the approved kit on PATH.
   image: $FITNESS_RUNNER_IMAGE
