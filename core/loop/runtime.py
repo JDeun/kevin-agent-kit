@@ -1,3 +1,4 @@
+import codecs
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -11,8 +12,7 @@ import sys
 import tempfile
 import time
 
-from .bootstrap import EMBEDDED
-from .config import MODULE_PREFIX
+from .install import EMBEDDED, MODULE_PREFIX
 
 
 class Busy(Exception):
@@ -120,15 +120,21 @@ while True:
 OUTPUT_LIMIT = 1024 * 1024
 
 
+def readable(text):
+    # Literal NUL is illegal even inside a JSON string. A damaged entry stays
+    # invalid while complete, well-formed siblings remain readable.
+    return re.sub(r"[\udc80-\udcff]", "\0", text)
+
+
 @contextmanager
 def failed_stdout(stream, capture):
     try:
         yield
-    except (ValueError, Retry, Cancelled) as error:
+    except Exception as error:
         if capture:
             # A stop reads the same final bytes as a failure: the supervisor has
             # already ended the process group. Anything cut off or unreadable
-            # leaves the stop unable to prove it saw every finding.
+            # leaves the caller unable to prove it saw every finding.
             try:
                 stream.seek(0)
                 raw = stream.read(OUTPUT_LIMIT + 1)
@@ -136,18 +142,36 @@ def failed_stdout(stream, capture):
                 error.output_truncated = True
             else:
                 error.output_truncated = len(raw) > OUTPUT_LIMIT
-                text = raw[:OUTPUT_LIMIT].decode("utf-8", errors="surrogateescape")
-                # Literal NUL is illegal even inside a JSON string. A damaged entry
-                # stays invalid while complete, well-formed siblings remain readable.
-                error.output = re.sub(r"[\udc80-\udcff]+", "\0", text)
+                error.output = readable(raw[:OUTPUT_LIMIT].decode("utf-8", errors="surrogateescape"))
         raise
 
 
-def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_output=False):
+def follow(stream, watch):
+    """Return a function that hands newly written output to `watch` while the command runs."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
+    offset = 0
+
+    def pump():
+        nonlocal offset
+        while offset < OUTPUT_LIMIT:
+            chunk = os.pread(stream.fileno(), min(2**16, OUTPUT_LIMIT - offset), offset)
+            if not chunk:
+                break
+            offset += len(chunk)
+            text = readable(decoder.decode(chunk))
+            if text:
+                watch(text)
+
+    return pump
+
+
+def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_output=False, watch=None):
+    """Run a supervised command. `watch` receives standard output as text while it is produced."""
     if cancel.is_set():
         raise Cancelled
     with (tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout,
           tempfile.TemporaryFile() as stderr, failed_stdout(stdout, capture_failed_output)):
+        pump = follow(stdout, watch) if watch else None
         if prompt is not None:
             stdin.write(prompt.encode("utf-8"))
             stdin.seek(0)
@@ -162,7 +186,7 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_out
             finally:
                 os.close(write_fd)
             try:
-                code = wait_for_status(read_fd, cancel, timeout, (stdout, stderr))
+                code = wait_for_status(read_fd, cancel, timeout, (stdout, stderr), pump)
             finally:
                 stop_group(child)
         finally:
@@ -181,9 +205,11 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_out
             raise ValueError("command output was not UTF-8") from None
 
 
-def wait_for_status(fd, cancel, timeout, outputs):
+def wait_for_status(fd, cancel, timeout, outputs, pump=None):
     deadline = time.monotonic() + timeout
     while not cancel.is_set():
+        if pump:
+            pump()
         if any(os.fstat(stream.fileno()).st_size > OUTPUT_LIMIT for stream in outputs):
             raise ValueError("command output exceeded 1 MiB")
         remaining = deadline - time.monotonic()

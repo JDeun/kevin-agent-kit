@@ -9,7 +9,8 @@ import sys
 from threading import Event
 import time
 
-from .config import ROOT, validate_evidence
+from .config import validate_evidence
+from .install import ROOT
 from .engine import Engine
 from .runtime import Busy, lock, module_command, private_dir
 from .sandbox import probe

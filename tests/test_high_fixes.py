@@ -52,18 +52,18 @@ def test_n11_installed_files_ignore_work_tree_permissions(tmp_path):
 
 def test_n11_tree_check_rejects_writable_and_linked_files(tmp_path):
     tree = tmp_path / "tree"
-    tree.mkdir()
-    good = tree / "good.py"
+    (tree / "fixture").mkdir(parents=True)
+    good = tree / "fixture/__init__.py"
     good.write_text("x = 1\n")
     good.chmod(0o644)
-    package.trusted_tree(tree)
+    assert package.kit.take(tree, ("fixture",)).files == {"fixture/__init__.py": b"x = 1\n"}
     good.chmod(0o664)
-    with pytest.raises(SystemExit, match="untrusted kit file"):
-        package.trusted_tree(tree)
+    with pytest.raises(ValueError, match="untrusted kit file"):
+        package.kit.take(tree, ("fixture",))
     good.chmod(0o644)
-    (tree / "link.py").symlink_to(good)
-    with pytest.raises(SystemExit, match="untrusted kit file"):
-        package.trusted_tree(tree)
+    (tree / "fixture/link.py").symlink_to(good)
+    with pytest.raises(ValueError, match="untrusted kit file"):
+        package.kit.take(tree, ("fixture",))
 
 
 # W01 -------------------------------------------------------------------------------------
@@ -264,13 +264,13 @@ def test_r02_submodule_requires_unavailable_external_tree(tmp_path):
 @pytest.mark.parametrize("trust", ["local", "signed"])
 def test_old_profiles_refuse_host_execution(tmp_path, monkeypatch, trust):
     from core.loop.config import config
-    from core.loop.setup import repository_profile
+    from core.loop.setup import approval_line, repository_profile
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     repo = repository(tmp_path / "repo")
     path = repository_profile(repo.repo)
-    path.write_text(f'[loop]\nrepo = {json.dumps(str(repo.repo))}\ntrust = "{trust}"\n'
+    path.write_text(f'[loop]\nrepo = {json.dumps(str(repo.repo))}\ntrust = "{trust}"\n{approval_line()}\n'
                     '[loop.execution]\nisolation = "none"\n')
     with pytest.raises(ValueError, match="Bubblewrap"):
         config(path)

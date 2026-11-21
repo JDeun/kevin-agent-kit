@@ -7,7 +7,8 @@ from pathlib import Path
 import re
 import stat
 
-from .config import ROOT, read_rules
+from . import install
+from .install import ROOT
 from .paths import directory, identity, private_temporary_directory, regular_at, trusted
 from .runtime import run
 
@@ -201,7 +202,7 @@ def probe():
         raise ValueError(f"Bubblewrap isolation unavailable: {detail}. {ISOLATION_HELP}")
 
 
-def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None, bundle=None):
+def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None, bundle=None, watch=None):
     with private_temporary_directory("kit-tools-") as temp:
         paths = {}
         for name, tool in command_tools(argv, policy).items():
@@ -211,10 +212,10 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
                     raise ValueError(f"sandbox tool changed: {tool.path}")
             path.chmod(0o500 if tool.executable else 0o400)
             paths[name] = path
-        # Mount the rule bytes the coordinator already validated, never the installed directory again.
+        # Mount the rule bytes of the install snapshot, never the installed directory again.
         documents = policy.get("rules")
         if documents is None:
-            documents = read_rules()
+            documents = install.rules()
         rules = temp / "rules"
         rules.mkdir(mode=0o700)
         for name, content in documents.items():
@@ -222,4 +223,5 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
                 target.write(content)
             (rules / name).chmod(0o400)
         cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle, rules=rules)
-        return run(cmd, "/", cancel, timeout, prompt=stdin, env=env, capture_failed_output=role == "reviewer")
+        return run(cmd, "/", cancel, timeout, prompt=stdin, env=env, capture_failed_output=role == "reviewer",
+                   watch=watch)

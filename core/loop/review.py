@@ -3,7 +3,8 @@ import json
 import re
 
 from ..verdict import BLOCKING, FINDING_ID, findings_by_id, nonempty, review_object, salvage
-from .config import PACKAGE_ROOT, read_rules, rules_text
+from . import install
+from .config import rules_text
 from .design import DESIGN_LENSES
 from .evidence import canonical
 
@@ -99,13 +100,13 @@ def observed_review(payload, request, closed):
 
 
 def rules():
-    return rules_text(read_rules())
+    return rules_text(install.rules())
 
 
 def prompt(request, previous, prior_round=(), *, model_verdict=False, rule_text=None):
     rule_text = rules() if rule_text is None else rule_text
     lens = request["lens"]
-    instructions = (PACKAGE_ROOT / "reviews" / "lenses" / f"{lens}.md").read_text(encoding="utf-8")
+    instructions = install.text(f"reviews/lenses/{lens}.md")
     design = request.get("kind") == "design-review"
     instruction = (
         adversarial_prompt("Review the committed Markdown file in request.paths. "

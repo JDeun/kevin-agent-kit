@@ -11,9 +11,11 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import tomllib
 from uuid import uuid4
 
-from .config import ROOT, profile_dir, profile_name, project, repository, state_root
+from . import install
+from .config import profile_dir, profile_name, project, read_profile, repository, state_root
 from .paths import directory, directory_at, identity, regular_at
 from .runtime import Busy, private_dir
 
@@ -192,16 +194,8 @@ def legacy_rules(block, name):
 
 
 def rule_snapshot(metadata):
-    rules = ROOT / "rules"
-    with directory(rules) as source:
-        names = sorted(name for name in os.listdir(source) if name.endswith(".md"))
-        documents = []
-        for name in names:
-            with regular_at(source, name) as document:
-                documents.append(document.read())
-    if not documents:
-        raise ValueError("installed rule documents are missing")
-    snapshot = b"\n\n".join(documents)
+    rules = install.rules()
+    snapshot = b"\n\n".join(rules[name] for name in sorted(rules))
     if not snapshot.endswith(b"\n"):
         snapshot += b"\n"
     snapshot.decode("utf-8")
@@ -335,13 +329,45 @@ def repository_profile(cwd, *, dry_run=False, agent=None):
     return destination
 
 
+APPROVAL = re.compile(r"(?m)^install_sha256[ \t]*=.*$")
+
+
+def approval_line():
+    return f'install_sha256 = "{install.snapshot().digest}"'
+
+
+def approve_install(path=None):
+    """Record the running install snapshot in an existing profile, after its user reviewed the install."""
+    if path is None:
+        repo, common, _ = repository(Path.cwd())
+        path = profile_dir() / profile_name(repo, common)
+    path, raw = read_profile(path)
+    source = raw.decode("utf-8")
+    if APPROVAL.search(source):
+        updated = APPROVAL.sub(approval_line(), source, count=1)
+    else:
+        updated = re.sub(r"(?m)^\[loop\][ \t]*$", lambda match: f"{match[0]}\n{approval_line()}", source, count=1)
+    try:
+        recorded = tomllib.loads(updated)["loop"]["install_sha256"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        recorded = None
+    if recorded != install.snapshot().digest:
+        raise ValueError(f"set {approval_line()} under [loop] in {path}")
+    with tempfile.TemporaryDirectory(dir=path.parent, prefix=".profile-") as temp:
+        staged = Path(temp) / path.name
+        staged.write_text(updated, encoding="utf-8")
+        staged.chmod(0o600)
+        os.replace(staged, path)
+    return path
+
+
 def agent_profile(repo, target, examples, agent):
     """Draft an unsigned profile for a separately installed broker client."""
     tool = f"{agent}-client"
     return [
         f"# Register your {agent} broker client below and set its reviewer socket before use.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
-        f"target = {json.dumps(target, ensure_ascii=False)}", 'trust = "local"',
+        f"target = {json.dumps(target, ensure_ascii=False)}", approval_line(), 'trust = "local"',
         'review_format = "verdict"', "design_gate = false",
         f'reviewer = ["/tools/{tool}", "review"]',
         '# Optional repair requires a worker broker and approved paths.',
@@ -359,7 +385,8 @@ def default_profile(repo, target, examples):
     lines = [
         "# Review this user-owned profile before starting the loop.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
-        f"target = {json.dumps(target, ensure_ascii=False)}", "reviewer = []", "review_observer = []",
+        f"target = {json.dumps(target, ensure_ascii=False)}", approval_line(),
+        "reviewer = []", "review_observer = []",
         'review_key = ""', "worker = []", "repair_paths = []",
         "design_gate = true", "repeat_class_rounds = 2", "",
         "[loop.lens_reviewers]", '# security = ["/tools/security-review"]',

@@ -1,5 +1,14 @@
 #!/usr/bin/python3 -I
-"""Standalone trust bootstrap, also embedded in launchers and module restarts."""
+"""Standalone trust bootstrap, also embedded in launchers and module restarts.
+
+It owns the one trust check of the kit. Every installed input that shapes
+policy is read once through directory descriptors into a snapshot, and kit
+modules are imported from those bytes.
+"""
+from contextlib import contextmanager
+import errno
+import hashlib
+import importlib.abc
 import importlib.util
 import os
 from pathlib import Path
@@ -9,48 +18,190 @@ import sys
 
 
 SOURCE_PACKAGES = ("core", "reviews", "guards", "verify", "wiki")
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def check_entry(path, kind, *, sticky=False, label="path"):
-    info = path.lstat()
+class Untrusted(ValueError):
+    pass
+
+
+class UntrustedKit(Untrusted):
+    def __init__(self, label, path):
+        super().__init__(f"untrusted kit {label}: {path}")
+
+
+def trusted(info, *, owner=None, sticky=False):
+    owners = {0, os.getuid()} if owner is None else {owner}
     protected = sticky and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
-    if (not kind(info.st_mode) or info.st_uid not in (0, os.getuid())
-            or (info.st_mode & 0o022 and not protected)
-            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
-        raise SystemExit(f"untrusted kit {label}: {path}")
-    return info.st_mode
+    return info.st_uid in owners and (not info.st_mode & 0o022 or protected)
 
 
-def trusted(path):
-    if path.anchor != "/" or ".." in path.parts:
-        raise SystemExit(f"untrusted kit path: {path}")
-    for parent in reversed(path.parents):
-        check_entry(parent, stat.S_ISDIR, sticky=True)
-    check_entry(path, stat.S_ISDIR)
+def open_directory(parent, name, label, *, create=False):
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    try:
+        return os.open(name, DIR_FLAGS, dir_fd=parent)
+    except OSError as error:
+        if error.errno in {errno.ENOTDIR, errno.ELOOP}:
+            raise Untrusted(f"untrusted directory: {label}") from None
+        raise
 
 
-def trusted_tree(root):
-    trusted(root)
-    pending = [root]
-    def regular_or_directory(mode):
-        return stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+@contextmanager
+def directory(path, *, create=False, owner=None, private=False):
+    if not path.is_absolute() or ".." in path.parts or path.anchor != "/":
+        raise Untrusted(f"trusted directory must be an absolute path: {path}")
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            child = open_directory(fd, part, path, create=create)
+            os.close(fd)
+            fd = child
+            if not trusted(os.fstat(fd), sticky=True):
+                raise Untrusted(f"untrusted directory: {path}")
+        info = os.fstat(fd)
+        if not trusted(info, owner=owner) or private and info.st_mode & 0o077:
+            raise Untrusted(f"untrusted directory: {path}")
+        yield fd
+    finally:
+        os.close(fd)
 
-    while pending:
-        for entry in pending.pop().iterdir():
-            mode = check_entry(entry, regular_or_directory, label="file")
-            if stat.S_ISDIR(mode):
-                pending.append(entry)
+
+@contextmanager
+def directory_at(parent, name, *, create=False, private=False, shared=False):
+    """Open a child directory owned by the user (or, when shared, by the user or root)."""
+    fd = open_directory(parent, name, name, create=create)
+    try:
+        info = os.fstat(fd)
+        if not trusted(info, owner=None if shared else os.getuid()) or private and info.st_mode & 0o077:
+            raise Untrusted(f"untrusted directory: {name}")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def regular_at(fd, name, *, flags=os.O_RDONLY, owner=None, single_link=False):
+    try:
+        opened = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=fd)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.EISDIR, errno.ENXIO}:
+            raise Untrusted(f"untrusted regular file: {name}") from None
+        raise
+    with os.fdopen(opened, "rb") as stream:
+        info = os.fstat(opened)
+        if (not stat.S_ISREG(info.st_mode) or not trusted(info, owner=owner)
+                or single_link and info.st_nlink != 1):
+            raise Untrusted(f"untrusted regular file: {name}")
+        yield stream
+
+
+class Snapshot:
+    """The bytes of every policy input, read once through trusted descriptors."""
+
+    def __init__(self, root, packages, files):
+        self.root, self.packages, self.files = root, tuple(packages), files
+        digest = hashlib.sha256()
+        for name in sorted(files):
+            for part in (os.fsencode(name), files[name]):
+                digest.update(len(part).to_bytes(8, "big"))
+                digest.update(part)
+        self.digest = digest.hexdigest()
+
+
+def read_tree(fd, prefix, files, root):
+    """Check every entry below a directory descriptor and keep the bytes of its files."""
+    for name in sorted(os.listdir(fd)):
+        try:
+            kind = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+            if stat.S_ISDIR(kind):
+                with directory_at(fd, name, shared=True) as child:
+                    # Bytecode caches are checked like any entry but are not policy input.
+                    read_tree(child, f"{prefix}{name}/", {} if name == "__pycache__" else files, root)
+            elif stat.S_ISREG(kind):
+                with regular_at(fd, name, single_link=True) as stream:
+                    files[prefix + name] = stream.read()
+            else:
+                raise Untrusted(name)
+        except UntrustedKit:
+            raise
+        except (Untrusted, OSError):
+            raise UntrustedKit("file", root / prefix / name) from None
+
+
+def snapshot(root, packages):
+    """Read project.toml, rules/ and the named packages below root as one snapshot."""
+    files = {}
+    try:
+        with directory(root) as fd:
+            for name in (*packages, "rules"):
+                try:
+                    with directory_at(fd, name, shared=True) as child:
+                        read_tree(child, f"{name}/", files, root)
+                except UntrustedKit:
+                    raise
+                except (Untrusted, OSError) as error:
+                    if name != "rules" or not isinstance(error, FileNotFoundError):
+                        raise UntrustedKit("file", root / name) from None
+            try:
+                with regular_at(fd, "project.toml", single_link=True) as stream:
+                    files["project.toml"] = stream.read()
+            except FileNotFoundError:
+                pass
+            except (Untrusted, OSError):
+                raise UntrustedKit("file", root / "project.toml") from None
+    except UntrustedKit:
+        raise
+    except (Untrusted, OSError):
+        raise UntrustedKit("path", root) from None
+    for name in packages:
+        if f"{name}/__init__.py" not in files:
+            raise UntrustedKit("file", root / name / "__init__.py")
+    return Snapshot(root, packages, files)
+
+
+class SnapshotImporter(importlib.abc.MetaPathFinder, importlib.abc.SourceLoader):
+    """Import kit modules from the snapshot bytes; the files are not read again."""
+
+    def __init__(self, kit_snapshot):
+        self.kit_snapshot = kit_snapshot
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.partition(".")[0] not in self.kit_snapshot.packages:
+            return None
+        relative = fullname.replace(".", "/")
+        for name, package in ((f"{relative}/__init__.py", True), (f"{relative}.py", False)):
+            if name in self.kit_snapshot.files:
+                location = str(self.kit_snapshot.root / name)
+                return importlib.util.spec_from_file_location(
+                    fullname, location, loader=self,
+                    submodule_search_locations=[os.path.dirname(location)] if package else None)
+        # A kit name absent from the snapshot must not fall through to the filesystem.
+        raise ModuleNotFoundError(f"no kit module in the trusted snapshot: {fullname}", name=fullname)
+
+    def get_filename(self, fullname):
+        return self.find_spec(fullname).origin
+
+    def get_data(self, path):
+        try:
+            return self.kit_snapshot.files[Path(path).relative_to(self.kit_snapshot.root).as_posix()]
+        except (KeyError, ValueError):
+            raise OSError(f"not in the trusted kit snapshot: {path}") from None
 
 
 def trusted_launcher():
     path = Path(__file__).absolute()
-    trusted(path.parent)
-    check_entry(path, stat.S_ISREG)
-    return path
+    try:
+        with directory(path.parent) as parent, regular_at(parent, path.name, single_link=True):
+            return path
+    except Untrusted:
+        raise SystemExit(f"untrusted kit path: {path}") from None
 
 
 def run_kit(root, module, *, source=False):
-    trusted(root)
     top = module.partition(".")[0]
     packages = SOURCE_PACKAGES if source and top in SOURCE_PACKAGES else (top,)
     for name in packages:
@@ -58,22 +209,13 @@ def run_kit(root, module, *, source=False):
             raise SystemExit(f"invalid kit package: {name}")
         if name in sys.modules:
             raise SystemExit(f"kit package name is already loaded: {name}")
-        package = root / name
-        trusted_tree(package)
-        check_entry(package / "__init__.py", stat.S_ISREG, label="file")
-
-    # Expose only the validated package directories. The checkout or install
-    # root can hold unrelated files with names matching Python dependencies.
-    class KitPackages:
-        @staticmethod
-        def find_spec(fullname, path, target=None):
-            if path is None and fullname in packages:
-                return importlib.util.spec_from_file_location(fullname, root / fullname / "__init__.py")
-            return None
-
+    try:
+        kit_snapshot = snapshot(root, packages)
+    except Untrusted as error:
+        raise SystemExit(str(error)) from None
     # Keep the validated tree intact even if the caller has a permissive umask.
     sys.dont_write_bytecode = True
-    sys.meta_path.insert(0, KitPackages)
+    sys.meta_path.insert(0, SnapshotImporter(kit_snapshot))
     runpy.run_module(module, run_name="__main__", alter_sys=True)
 
 

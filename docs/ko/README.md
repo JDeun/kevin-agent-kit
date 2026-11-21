@@ -5,7 +5,7 @@
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **실험 단계 v0.3.4.** 실제 리뷰·수정·검사에는 Linux Bubblewrap 네임스페이스가 필요합니다.
+> **실험 단계 v0.3.5.** 실제 리뷰·수정·검사에는 Linux Bubblewrap 네임스페이스가 필요합니다.
 > 모델 자격 증명은 운영자의 브로커가 보관합니다. 필수 검사는 후보 커밋에 고정된 새 읽기 전용 트리에서 실행합니다.
 > Bubblewrap을 사용할 수 없는 환경에서는 내장 데모를 실행할 수 있습니다. [알려진 문제](../known-issues.md)
 
@@ -25,6 +25,12 @@ Git을 설치하고, 배포 CLI가 사용할 Python 3.11 이상을 `/usr/bin/pyt
 확인하세요. 서명 모드에는 OpenSSL도 필요합니다. 다른 계정이 쓸 수 있거나 심볼릭 링크인
 설치 경로는 거부됩니다.
 신뢰할 수 있는 키트 체크아웃에서 설치합니다. 기본 설치 경로는 `~/.local`입니다.
+
+실행할 때마다 설치된 키트(`project.toml`, 키트 모듈, `rules/`)를 한 번 읽어 신뢰 스냅샷으로
+만듭니다. 다른 계정이 쓸 수 있는 파일·디렉터리, 링크, 특수 파일이 있으면 실행기가 멈춥니다.
+프로필은 승인한 스냅샷을 `install_sha256`으로 기록합니다(`init`이 써 줍니다). 업그레이드했거나
+설치본이 바뀌면 내용을 확인한 뒤 저장소마다 `kevin-agent-kit init --approve-install`을
+실행하세요. 그 전에는 루프가 해당 프로필을 불러오지 않고 `doctor`가 불일치를 알립니다.
 
 ```sh
 ./scripts/install.sh

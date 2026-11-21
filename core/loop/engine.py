@@ -11,7 +11,7 @@ import tempfile
 import time
 from uuid import uuid4
 
-from ..verdict import salvage
+from ..verdict import Scanner
 from .config import config, repo_id
 from .design import DESIGN_LENSES, approval_matches, document, validate_document, wiki_landed
 from .evidence import canonical, signed_receipt, source_id
@@ -30,6 +30,56 @@ class InterruptedAttempt(Exception):
     def __init__(self, cause, evidence):
         self.cause = cause
         self.evidence = evidence
+
+
+class UnsettledReview(InterruptedAttempt):
+    """A review attempt stays open: its output or its recording cannot be proven whole."""
+
+
+class ReviewOutput:
+    """Scan reviewer output as it arrives and hand each protected finding to `record` at once.
+
+    `record(text, findings)` commits the new output and the findings it completed.
+    `conclude` reads the final output once more, so a runner that reports only at the
+    end reaches the same record, and decides whether the attempt may close.
+    """
+
+    def __init__(self, record):
+        self.record = record
+        self.scanner = Scanner()
+        self.findings = []
+        self.reason = None
+
+    def __call__(self, text):
+        found = self.scanner.feed(text)
+        self.findings += found
+        self.record(text, found)
+
+    def conclude(self, output, error=None):
+        seen = self.scanner.text
+        rest = seen if output is None else output
+        if not rest.startswith(seen):
+            self.reason = "output changed between reads"
+        else:
+            found = self.scanner.feed(rest[len(seen):])
+            found += self.scanner.finish()
+            self.findings += found
+            self.record(rest[len(seen):], found)
+            if getattr(error, "output_truncated", False):
+                self.reason = "output truncated"
+            elif isinstance(error, sqlite3.Error):
+                self.reason = "review could not be recorded"
+            elif not self.scanner.settled:
+                self.reason = "output ended inside a JSON structure"
+        return self
+
+    @property
+    def settled(self):
+        return self.reason is None
+
+    @property
+    def digest(self):
+        return hashlib.sha256(self.scanner.text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def check_inputs(cfg, evidence):
@@ -105,7 +155,7 @@ class Engine:
         self.runs = {}
 
     def __enter__(self):
-        self.store.recover_pending_reviews()
+        self.store.interrupt_unsettled()
         return self
 
     def __exit__(self, exc_type, *_):
@@ -123,7 +173,7 @@ class Engine:
         if self.cancel.is_set():
             raise Cancelled
 
-    def command(self, role, argv, work, evidence, *, stdin, bundle=None):
+    def command(self, role, argv, work, evidence, *, stdin, bundle=None, watch=None):
         self.authority(evidence)
         limit = self.cfg["memory"]["test" if role in {"check", "verify"} else "review"]
         if not self.memory.allows(limit["max_anon_mib"] * 2**20, limit["min_available_mib"] * 2**20):
@@ -138,7 +188,8 @@ class Engine:
         started = time.monotonic()
         try:
             output = self.runner(argv, work, self.cancel, self.cfg["timeout_seconds"], role=role,
-                                 policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle)
+                                 policy=self.cfg["execution"], stdin=stdin, extra=extra, bundle=bundle,
+                                 **({"watch": watch} if watch else {}))
         except Exception as error:
             code = error.code if isinstance(error, CommandFailed) else None
             self.note(evidence, role, argv, code, type(error).__name__, started)
@@ -159,21 +210,46 @@ class Engine:
     def trace(self, evidence):
         return list(self.runs.get(evidence["run"], []))
 
-    def review_result(self, argv, work, evidence, request, previous=(), prior_round=()):
+    def review_result(self, argv, work, evidence, request, previous=(), prior_round=(), *, record):
+        """Run one reviewer and return its validated receipt.
+
+        Every protected finding reaches `record` as soon as the output completes it.
+        A failure carries `observed`, the scanned output that decides whether the
+        attempt settled, and `salvaged`, the protected findings recovered from it.
+        """
         model_verdict = self.cfg.get("review_format") == "verdict"
+        observed = ReviewOutput(record)
+
+        def conclude(output, error=None):
+            try:
+                observed.conclude(output, error)
+            except (OSError, sqlite3.Error):
+                observed.reason = "review could not be recorded"
+
         try:
-            output = self.command("reviewer", argv, work, evidence,
+            output = self.command("reviewer", argv, work, evidence, watch=observed,
                                   stdin=prompt(request, previous, prior_round, model_verdict=model_verdict,
                                                rule_text=self.cfg.get("rules_text")))
-        except (ValueError, Retry, Cancelled) as error:
-            error.salvaged = salvage(getattr(error, "output", ""))
+        except Exception as error:
+            conclude(getattr(error, "output", None), error)
+            error.observed, error.salvaged = observed, observed.findings
             raise
-        if model_verdict:
-            from ..agents import review_verdict
+        conclude(output)
+        try:
+            if model_verdict:
+                from ..agents import review_verdict
 
-            tool = self.cfg["execution"]["tools"][argv[0].removeprefix("/tools/")]
-            output = json.dumps(review_verdict(output, request, f"{tool.path.name}@{tool.digest}"))
-        return review_receipt(output, request, previous)
+                tool = self.cfg["execution"]["tools"][argv[0].removeprefix("/tools/")]
+                output = json.dumps(review_verdict(output, request, f"{tool.path.name}@{tool.digest}"))
+            review = review_receipt(output, request, previous)
+        except ValueError as error:
+            error.observed, error.salvaged = observed, observed.findings
+            raise
+        if not observed.settled:
+            error = ValueError(observed.reason)
+            error.observed, error.salvaged = observed, observed.findings
+            raise error
+        return review, observed
 
     def design_review(self, branch, head, path):
         with self.store.design_lock(branch):
@@ -212,14 +288,25 @@ class Engine:
                 request = {**evidence, "kind": "design-review", "paths": [path], "lens": lens,
                            "invocation": uuid4().hex}
                 previous = protected.get(lens, [])
-                try:
-                    review = self.review_result(adapters[lens], git.repo, evidence, request, previous)
-                except (ValueError, Retry, Cancelled) as error:
-                    if getattr(error, "salvaged", None):
+
+                def record(_, found, lens=lens, previous=previous, request=request):
+                    # The branch's design report is the journal of a design review.
+                    if found:
                         report["rejected_request"] = request
-                        protected[lens] = retain_design_findings(previous, error.salvaged)
+                        protected[lens] = retain_design_findings(protected.get(lens, previous), found)
+                        self.store.save_design(report)
+
+                try:
+                    review, _ = self.review_result(adapters[lens], git.repo, evidence, request, previous,
+                                                   record=record)
+                except Exception as error:
+                    observed = getattr(error, "observed", None)
+                    if observed is not None and not observed.settled:
+                        report["unsettled"] = {"request": request, "reason": observed.reason,
+                                               "output": observed.scanner.text}
                         self.store.save_design(report)
                     raise
+                report.pop("rejected_request", None)
                 report["reviews"].append(review)
                 protected[lens] = retain_design_findings(previous, review["findings"])
                 self.store.save_design(report)
@@ -247,10 +334,8 @@ class Engine:
                 argv = self.cfg["reviewer"] if lens == "general" else self.cfg["lens_reviewers"].get(lens)
                 if not argv:
                     raise ValueError(f"configure a dedicated review adapter for the {lens} lens")
-                self.store.begin_review(job_id, request)
-                review = self.review_result(argv, work, evidence, request, previous, prior_round)
-                self.store.record_protected(job_id, request, rounds,
-                                            [item for item in review["findings"] if item["risk"] in BLOCKING])
+                review = self.attempt(job_id, argv, work, evidence, request, previous, prior_round, rounds,
+                                      history, items)
                 if self.cfg.get("trust", "signed") == "local":
                     # No independent observer: record the reviewer's own result as unsigned.
                     review["observation"] = {"source": "local-unsigned", "status": "complete",
@@ -271,39 +356,51 @@ class Engine:
                 )
                 observed = observed_review(self.authenticate(output, key), observation, review["resolved"])
                 review["observation"] = {**observed, "source": source_id(key)}
-            except Cancelled as cause:
-                if review is None:
-                    self.settle_stopped_review(job_id, request, rounds, cause)
-                raise
             except (OSError, ValueError, Retry, sqlite3.Error) as cause:
                 found = review["findings"] if review is not None else getattr(cause, "salvaged", [])
-                if found:
-                    known = {item["id"] for item in items if item["lens"] == lens}
-                    items.extend({**item, "lens": lens} for item in found
-                                 if item["risk"] in BLOCKING and item["id"] not in known)
-                report = {**evidence, "reviews": history, "findings": items, "rounds": rounds,
-                          "runs": self.trace(evidence)}
-                raise InterruptedAttempt(cause, report) from cause
+                raise InterruptedAttempt(
+                    cause, self.failure_report(evidence, history, items, lens, found, rounds)) from cause
             review["collected_at"] = now()
             history.append(review)
             items = [item for item in items if item["lens"] != lens]
             items.extend({**item, "lens": lens} for item in review["findings"])
         return items
 
-    def settle_stopped_review(self, job_id, request, rounds, stop):
-        """Record protected findings a stopped reviewer already printed, or keep the pending row.
+    def failure_report(self, evidence, history, items, lens, found, rounds):
+        known = {item["id"] for item in items if item["lens"] == lens}
+        items = [*items, *({**item, "lens": lens} for item in found
+                           if item["risk"] in BLOCKING and item["id"] not in known)]
+        return {**evidence, "reviews": history, "findings": items, "rounds": rounds,
+                "runs": self.trace(evidence)}
 
-        The row survives whenever the stop cannot prove that every finding was recorded, so
-        the next start classifies the job as interrupted instead of re-running the review.
+    def attempt(self, job_id, argv, work, evidence, request, previous, prior_round, rounds, history, items):
+        """Run one journaled reviewer attempt and return its receipt.
+
+        The attempt closes only when its whole output was read, ended outside every JSON
+        structure and was recorded. Otherwise it stays open with its output, and the job
+        is interrupted. A settled stop leaves the job queued for the next start.
         """
-        stop.keep_pending = True
-        if getattr(stop, "output_truncated", False):
-            return
+        invocation = request["invocation"]
+        self.store.open_attempt(job_id, request, rounds)
         try:
-            self.store.record_protected(job_id, request, rounds, getattr(stop, "salvaged", []))
-        except (OSError, sqlite3.Error):
-            return
-        stop.keep_pending = False
+            review, observed = self.review_result(
+                argv, work, evidence, request, previous, prior_round,
+                record=lambda text, found: self.store.observe(invocation, text, found))
+            outcome, cause = "complete", None
+        except Exception as error:
+            observed, cause = error.observed, error
+            outcome = "stopped" if isinstance(error, Cancelled) else "rejected"
+        try:
+            self.store.settle(invocation, outcome if observed.settled else None, observed.digest, observed.reason)
+        except (OSError, sqlite3.Error) as error:
+            observed.reason, cause = "review could not be recorded", cause or error
+        if not observed.settled:
+            report = self.failure_report(evidence, history, items, request["lens"], observed.findings, rounds)
+            raise UnsettledReview(cause or ValueError(observed.reason),
+                                  {**report, "unsettled": observed.reason}) from cause
+        if cause is not None:
+            raise cause
+        return review
 
     def step(self, job, prior, forest, approval):
         base = self.git.head(self.cfg["target"])
@@ -452,9 +549,11 @@ class Engine:
     def collect(self, job, future):
         try:
             outcome = future.result()
-        except Cancelled as stop:
-            if not getattr(stop, "keep_pending", False):
-                self.store.cancel_review(job["id"])
+        except Cancelled:
+            return  # Every attempt of this job settled; it runs again after the next start.
+        except UnsettledReview as error:
+            self.store.update(job, "interrupted", detail=f"review attempt held: {error.evidence['unsettled']}",
+                              evidence=error.evidence)
             return
         except InterruptedAttempt as error:
             self.record_failure(job, error.cause, error.evidence)

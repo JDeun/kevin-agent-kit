@@ -462,14 +462,17 @@ def test_shutdown_collects_protected_evidence_after_a_journal_error(queue, monke
         return review_response(stdin, [finding])
 
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
-        monkeypatch.setattr(store, "record_protected", fail_journal)
+        monkeypatch.setattr(store, "observe", fail_journal)
         store.enqueue("feature", git.head("feature"))
         with Engine(cfg, store, runner=runner) as engine:
             engine.tick()
             assert attempted.wait(5)
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as reopened:
+        # The attempt never closed: the finding survives as evidence and the job is held.
         assert reopened.protected(1) == [{**finding, "lens": "general", "finding_class": "protected"}]
-        assert reopened.status()["counts"] == {"blocked": 1}
+        report = reopened.status()
+        assert report["counts"] == {"interrupted": 1}
+        assert report["jobs"][0]["pending_review"]["reason"] == "review could not be recorded"
 
 
 def test_restart_blocks_when_neither_observation_write_can_commit(queue, monkeypatch):
@@ -490,7 +493,8 @@ def test_restart_blocks_when_neither_observation_write_can_commit(queue, monkeyp
         return review_response(stdin, [finding])
 
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
-        monkeypatch.setattr(store, "record_protected", fail_write)
+        monkeypatch.setattr(store, "observe", fail_write)
+        monkeypatch.setattr(store, "settle", fail_write)
         monkeypatch.setattr(store, "update", fail_write)
         store.enqueue("feature", git.head("feature"))
         with pytest.raises(sqlite3.OperationalError, match="fixture unavailable"):
@@ -504,7 +508,8 @@ def test_restart_blocks_when_neither_observation_write_can_commit(queue, monkeyp
             report = reopened.status()
             assert report["counts"] == {"interrupted": 1}
             assert report["jobs"][0]["pending_review"] == {
-                key: requests[0][key] for key in ("run", "candidate", "lens", "invocation")
+                **{key: requests[0][key] for key in ("run", "candidate", "lens", "invocation")},
+                "reason": None, "journaled": 0, "output_bytes": 0,
             }
             with pytest.raises(ValueError, match="retry requires"):
                 reopened.retry(1)

@@ -84,7 +84,7 @@ def test_redesign_resolving_the_inherited_finding_reaches_a_candidate(queue, mon
         assert outcome["phase"] == "candidate", outcome["detail"]
 
 
-def test_inheritance_can_be_named_for_a_new_branch_and_must_target_a_held_job(queue):
+def test_inheritance_can_be_named_for_a_new_branch_and_follows_the_chain(queue):
     git, cfg = queue
     with store_of(cfg) as store:
         held = hold_for_redesign(store, git)
@@ -104,8 +104,17 @@ def test_inheritance_can_be_named_for_a_new_branch_and_must_target_a_held_job(qu
         store.enqueue("redesign-2", sha2, inherits=held)
         carried = store.inherited_protected(store.status()["jobs"][2])
         assert [item["id"] for item in carried] == ["sec-1"]
-        with pytest.raises(ValueError, match="forest redesign"):
-            store.enqueue("redesign-2", git.head("redesign"), inherits=2)
+        # A named parent need not be a forest hold, and its own sources follow transitively.
+        git.run("switch", "-c", "redesign-3", "redesign-2")
+        git.run("commit", "--quiet", "--allow-empty", "-m", "third")
+        sha3 = git.head("redesign-3")
+        git.run("switch", "main")
+        third = store.enqueue("redesign-3", sha3, inherits=3)
+        assert [item["id"] for item in store.inherited_protected(third)] == ["sec-1"]
+        with pytest.raises(ValueError, match="unknown job"):
+            store.enqueue("redesign-3", sha3, inherits=3 + 1)
+        with pytest.raises(ValueError, match="without that inheritance"):
+            store.enqueue("redesign", sha, inherits=held)
 
 
 def test_unclassified_queue_entry_can_be_reclassified_with_an_audit_row(queue):

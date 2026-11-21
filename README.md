@@ -5,7 +5,7 @@ bundle. The kit never merges: the repository owner applies the candidate.
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **Experimental v0.3.4.** Live reviews, repairs and checks require working Linux
+> **Experimental v0.3.5.** Live reviews, repairs and checks require working Linux
 > Bubblewrap namespaces. Model credentials stay in an operator-run broker. Each
 > required check receives a fresh read-only tree pinned to the candidate commit.
 > The fixture demo runs on machines without Bubblewrap. See [known issues](docs/known-issues.md).
@@ -26,6 +26,13 @@ commands must be available to the system interpreter. Run `kevin-agent-kit docto
 check namespace support. Signed evidence also requires OpenSSL. Use a trusted checkout of this
 kit. The installer defaults to `~/.local` and refuses a prefix, `bin` or `share` that another
 account can write or that is a symlink.
+
+Every start reads the installed kit once into a trusted snapshot: `project.toml`, the kit
+modules and `rules/`. A file or directory that another account can write, a link or a special
+file stops the launcher. A profile records the snapshot it approves as `install_sha256`
+(`init` writes it). After an upgrade or any change to the install, review it and run
+`kevin-agent-kit init --approve-install` in each repository; until then the loop refuses to
+load that profile and `doctor` reports the mismatch.
 
 ```sh
 ./scripts/install.sh

@@ -1,4 +1,4 @@
-# Known issues in v0.3.4
+# Known issues in v0.3.5
 
 ## Supported scope
 
@@ -18,7 +18,7 @@ The remaining audit items use the identifiers from the pre-release reports.
 | --- | --- |
 | H02 | The signed evidence does not carry an external policy revision, so a source that changes its checks behind the same key and socket does not invalidate existing candidates. |
 | H04, M15 | Candidate text can influence a model's conclusions. The sandbox confines the process. Review quality also depends on the broker client and the approved review source. |
-| M03, M07 | Retry retains SQLite evidence. State has no retention policy and arbitrary agent text can disclose secrets. Keep evidence private. |
+| M03, M07 | Retry retains SQLite evidence. State has no retention policy and arbitrary agent text can disclose secrets. An unsettled review attempt keeps up to 1 MiB of raw reviewer output until the state directory is removed. Keep evidence private. |
 | M06 | A disposable checkout's ignored scratch files are discarded. A wrapper must return the evidence it needs to retain. |
 | M09 | The sandbox withholds host refs, credentials, state and outbound network. Standalone command guards still use static rules and do not validate resource ownership for every destructive operation. |
 | M10 | Decision and acceptance records use operator-supplied attribution. Signed approval and approved-value checks are pending. |
@@ -34,7 +34,9 @@ The remaining audit items use the identifiers from the pre-release reports.
 | V04 | A design approval stays valid while its ancestry holds, even if integration assumptions changed. |
 | V08, V10 | The fitness scan reopens files by name after checking them and has no file-count or byte limit. The latency template has no per-call timeout or open-loop arrival rate. |
 | L01 | The CLI has no upgrade, rollback or uninstall command. The installer fails on an occupied prefix. |
-| stop with cut-off output | A stop whose reviewer output was truncated or whose recording failed leaves the job `interrupted`. The operator inspects the pending request and re-enqueues; no automatic retry exists. |
+| interrupted review | A finding cut inside one of its string values cannot be journaled. The job is `interrupted` and the raw output is kept; the operator reads it with `evidence` before `resume`. Prose that leaves a JSON bracket or quote open also interrupts the job. No automatic resume exists. |
+| install approval | The snapshot covers `project.toml`, the kit packages and `rules/`. The launcher file is checked for owner, mode and links but is not part of the digest, and the Python interpreter and system tools are outside it. Each profile is approved separately. A running daemon keeps the snapshot it started with until it is stopped. |
+| source checkout | `python3 -m core.loop` in a checkout imports modules through Python's file loader before it takes the snapshot. Only the generated launcher and the processes it starts import from snapshot bytes. Use the checkout path for development. |
 | local merge train | Not provided and not planned. The kit exports a verified candidate bundle and never updates the target branch. |
 
 The signed review contract requires independently signed coverage and protected closure
@@ -44,5 +46,6 @@ operator still approves which CI source and test policy are authoritative.
 
 Other open items from the v0.3.1 check: a concurrent wiki `ingest` can lose a manifest entry; the
 research-landing check reads only the changed path names; `retry` after a new commit retries the old
-SHA and goes stale (enqueue the new SHA instead); a new design branch needs `--inherit-from` to carry
-protected findings; the status count treats a running job as runnable.
+SHA and goes stale (enqueue the new SHA instead); work that moves to a new branch needs `--inherit-from`
+to carry protected findings (jobs on the same branch inherit them automatically); the status count
+treats a running job as runnable.

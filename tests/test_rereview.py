@@ -35,7 +35,9 @@ def test_global_rules_embed_an_immutable_copy(tmp_path, monkeypatch):
     text = b"# Fixture rule\n\nUse the approved text.\n"
     rule = rules / "fixture.md"
     rule.write_bytes(text)
-    monkeypatch.setattr(setup, "ROOT", source)
+    real = setup.install.snapshot()
+    files = {"project.toml": real.files["project.toml"], **setup.install.take(source, ()).files}
+    monkeypatch.setattr(setup.install, "snapshot", lambda: type(real)(source, (), files))
     setup.global_rules()
     rule.write_bytes(b"# Edited rule\n")
     installed = (tmp_path / ".claude/CLAUDE.md").read_bytes()

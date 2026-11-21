@@ -10,14 +10,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from core.loop.config import NAME, project
-from core.loop.bootstrap import EMBEDDED, SOURCE
+from core.loop import install as kit
+from core.loop.config import NAME, metadata
 
-bootstrap = {"__name__": "kit_bootstrap"}
-exec(SOURCE, bootstrap)
-trusted = bootstrap["trusted"]
-trusted_tree = bootstrap["trusted_tree"]
-RUNTIME = bootstrap["SOURCE_PACKAGES"]
+RUNTIME = kit.KIT["SOURCE_PACKAGES"]
 DOCUMENTS = ("reviews/persona/README.md", "verify/README.md")
 ENTRIES = (
     "project.toml", "LICENSE", "README.md", "CHANGELOG.md", "AGENTS.md", "docs", "agents",
@@ -73,7 +69,7 @@ def tracked_inputs(dirty=False):
 def write_launcher(command, module, relative_root):
     command.write_text(
         "#!/usr/bin/python3 -I\n"
-        f"{EMBEDDED}\n"
+        f"{kit.EMBEDDED}\n"
         f"root = trusted_launcher().parents[1] / {relative_root!r}\n"
         f"run_kit(root, {module!r})\n",
         encoding="utf-8",
@@ -82,7 +78,7 @@ def write_launcher(command, module, relative_root):
 
 
 def build(destination, dirty=False):
-    meta = project(ROOT)
+    meta = project()
     name = meta["name"]
     module = name.replace("-", "_")
     # Render the upstream brand in source docs and plugin templates, keeping its URL.
@@ -124,8 +120,20 @@ def build(destination, dirty=False):
     return destination
 
 
+def project():
+    return metadata((ROOT / "project.toml").read_bytes())
+
+
+def trusted(path):
+    try:
+        with kit.KIT["directory"](path):
+            pass
+    except kit.Untrusted:
+        raise ValueError(f"untrusted kit path: {path}") from None
+
+
 def install(prefix, dirty=False):
-    name = project(ROOT)["name"]
+    name = project()["name"]
     binary = prefix / "bin" / name
     destination = prefix / "share" / name
     if binary.exists() or binary.is_symlink() or destination.exists() or destination.is_symlink():
@@ -138,7 +146,8 @@ def install(prefix, dirty=False):
     trusted(binary.parent)
     trusted(destination.parent)
     target = build(destination, dirty=dirty)
-    trusted_tree(target)
+    # The installed tree must pass the same snapshot the launcher takes on every start.
+    kit.take(target, (name.replace("-", "_"),))
     created = target.lstat()
     try:
         with tempfile.TemporaryDirectory(dir=binary.parent, prefix=".install-") as temp:
@@ -158,7 +167,7 @@ def install(prefix, dirty=False):
 def rename(name):
     if len(name) > 64 or not NAME.fullmatch(name):
         raise ValueError("project name must be a lowercase slug of up to 64 characters")
-    current = project(ROOT)["name"]
+    current = project()["name"]
     path = ROOT / "project.toml"
     source = path.read_text(encoding="utf-8")
     line = f'name = "{current}"'
@@ -170,7 +179,7 @@ def rename(name):
     with tempfile.TemporaryDirectory(dir=ROOT, prefix=".rename-") as temp:
         staged = Path(temp)
         (staged / path.name).write_text(updated, encoding="utf-8")
-        if project(staged)["name"] != name:
+        if metadata((staged / path.name).read_bytes())["name"] != name:
             raise ValueError("updated metadata did not contain the requested name")
         (staged / path.name).chmod(path.stat().st_mode & 0o777)
         (staged / path.name).replace(path)

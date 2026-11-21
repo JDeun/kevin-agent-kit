@@ -10,13 +10,15 @@ import sys
 import tempfile
 import time
 
-from .config import MODULE_PREFIX, ROOT, config, project, repo_id
+from . import install
+from .config import config, project, repo_id
+from .install import MODULE_PREFIX, ROOT
 from .daemon import ensure_state, running, serve, start, stop, validate_execution
 from .design import TASK_KINDS
 from .engine import Engine, check_candidate, export_candidate
 from .git import Git
 from .runtime import Busy, Retry, module_command, run
-from .setup import global_rules, repository_profile
+from .setup import approve_install, global_rules, repository_profile
 from .store import SHA, Store
 
 
@@ -132,6 +134,11 @@ def doctor(profile):
     add("git", git, git or "git is not on PATH")
     trust = "signed"
     try:
+        add("install", True, f"trusted snapshot sha256={install.snapshot().digest}")
+    except (ValueError, OSError) as error:
+        add("install", False, str(error)[:250])
+        advice.append("reinstall the kit, or restore the owner and permissions of the reported path")
+    try:
         cfg = config(profile)
         trust = cfg["trust"]
         add("profile", True, f"valid; trust={trust}, isolation=bwrap")
@@ -140,7 +147,9 @@ def doctor(profile):
     except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
         add("profile", False, f"not usable yet: {str(error)[:200]}",
             required=profile is not None or not isinstance(error, FileNotFoundError))
-        advice.append("configure a trusted profile and register its broker clients before starting the loop")
+        advice.append("configure a trusted profile and register its broker clients before starting the loop"
+                      if "approve" not in str(error) else
+                      "the profile approves a different install; review it, then run `init --approve-install`")
     available, detail = isolation_status()
     add("bubblewrap isolation", available, detail)
     if not available:
@@ -168,7 +177,15 @@ def main(argv=None):
     if argv and argv[0] in modules:
         command = module_command(ROOT, MODULE_PREFIX + modules[argv[0]], *argv[1:])
         os.execv(command[0], command)
-    meta = project()
+    try:
+        meta = project()
+    except (ValueError, OSError) as error:
+        # An untrusted install cannot name itself; doctor still reports what it found.
+        if argv[:1] == ["doctor"]:
+            print(json.dumps(doctor(None), indent=2))
+        else:
+            print(error, file=sys.stderr)
+        return 1
     parser = argparse.ArgumentParser(prog=meta["name"], allow_abbrev=False)
     parser.add_argument("--version", action="version", version=meta["version"])
     parser.add_argument("--config", type=Path, help="user-owned execution profile")
@@ -179,6 +196,8 @@ def main(argv=None):
     setup.add_argument("--global", dest="global_rules", action="store_true")
     setup.add_argument("--dry-run", action="store_true")
     setup.add_argument("--uninstall", action="store_true")
+    setup.add_argument("--approve-install", action="store_true",
+                       help="record the installed kit snapshot in the existing profile after reviewing it")
     setup.add_argument("--agent", choices=("codex", "claude"),
                        help="draft an isolated unsigned profile for an operator-provided model broker client")
     setup.add_argument("--adopt-rules-sha256", action="append", default=[], metavar="SHA256",
@@ -188,13 +207,17 @@ def main(argv=None):
     enqueue.add_argument("sha")
     enqueue.add_argument("--kind", choices=TASK_KINDS, default="unclassified")
     enqueue.add_argument("--inherit-from", type=int, metavar="JOB_ID",
-                         help="carry the protected findings of a forest-held job into this redesign")
+                         help="carry the protected findings of another job into this one")
     design = commands.add_parser("design-review", help="review a design-only source revision before implementation")
     design.add_argument("branch")
     design.add_argument("sha")
     design.add_argument("--design", required=True, help="repository-relative Markdown path")
     retry = commands.add_parser("retry")
     retry.add_argument("job_id", type=int)
+    resume = commands.add_parser("resume", help="return an interrupted job to review with its journaled findings")
+    resume.add_argument("job_id", type=int)
+    held = commands.add_parser("evidence", help="print the unsettled review attempts of a job")
+    held.add_argument("job_id", type=int)
     candidate = commands.add_parser("candidate", help="export an exact ready candidate bundle")
     candidate.add_argument("job_id", type=int)
     candidate.add_argument("--output", type=Path, required=True)
@@ -212,6 +235,8 @@ def main(argv=None):
             if args.global_rules:
                 for path in global_rules(dry_run=args.dry_run, uninstall=args.uninstall, adopt=args.adopt_rules_sha256):
                     print(path)
+            elif args.approve_install:
+                print(approve_install(args.config))
             else:
                 print(repository_profile(Path.cwd(), dry_run=args.dry_run, agent=args.agent))
             return 0
@@ -240,13 +265,20 @@ def main(argv=None):
                     if (not SHA.fullmatch(args.sha) or args.branch == cfg["target"]
                             or git.head(args.branch) != args.sha):
                         raise ValueError("enqueue requires the exact current SHA of a distinct source branch")
-                    store.enqueue(args.branch, args.sha, kind=args.kind, inherits=args.inherit_from)
+                    job = store.enqueue(args.branch, args.sha, kind=args.kind, inherits=args.inherit_from)
+                    if job["phase"] == "interrupted":
+                        print(f"job {job['id']} is interrupted: read `evidence {job['id']}`, then "
+                              f"`resume {job['id']}` or enqueue a new SHA", file=sys.stderr)
                 elif args.action == "design-review":
                     report = Engine(cfg, store).design_review(args.branch, args.sha, args.design)
                     print(json.dumps(report, indent=2))
                     return int(report["status"] != "approved")
                 elif args.action == "retry":
                     store.retry(args.job_id)
+                elif args.action == "resume":
+                    store.resume(args.job_id)
+                elif args.action == "evidence":
+                    print(json.dumps(store.held(args.job_id), indent=2))
                 elif args.action == "candidate":
                     evidence = store.candidate(args.job_id)
                     export_candidate(cfg, evidence, args.output.absolute())

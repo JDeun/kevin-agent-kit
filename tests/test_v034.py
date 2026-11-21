@@ -7,6 +7,7 @@ import time
 import pytest
 
 from core.loop import config as loop_config
+from core.loop import install as kit
 from core.loop import sandbox
 from core.loop.engine import Engine
 from core.loop.review import prompt
@@ -16,17 +17,21 @@ from tests.test_loop import queue, review_response  # noqa: F401
 
 
 def install(tmp_path, monkeypatch):
+    """Point the loop at a separate kit tree with two rule documents."""
     root = tmp_path / "kit"
     rules = root / "rules"
     rules.mkdir(parents=True)
     (rules / "one.md").write_text("first rule\n")
     (rules / "two.md").write_text("second rule\n")
-    monkeypatch.setattr(loop_config, "ROOT", root)
+    real = kit.snapshot()
+    monkeypatch.setattr(kit, "snapshot", lambda: type(real)(
+        root, real.packages, {**{name: content for name, content in real.files.items()
+                                 if not name.startswith("rules/")}, **kit.take(root, ()).files}))
     return rules
 
 
 @pytest.mark.parametrize("unsafe", ["file-link", "file-mode", "directory-mode", "hard-link", "fifo",
-                                    "nested-directory", "directory-link"])
+                                    "nested-directory-mode", "directory-link"])
 def test_installed_rules_share_the_module_trust_check(tmp_path, monkeypatch, unsafe):
     rules = install(tmp_path, monkeypatch)
     outside = tmp_path / "outside.md"
@@ -41,31 +46,40 @@ def test_installed_rules_share_the_module_trust_check(tmp_path, monkeypatch, uns
         os.link(outside, rules / "alias.md")
     elif unsafe == "fifo":
         os.mkfifo(rules / "pipe.md")
-    elif unsafe == "nested-directory":
-        (rules / "nested").mkdir()
+    elif unsafe == "nested-directory-mode":
+        (rules / "nested").mkdir(mode=0o777)
+        (rules / "nested").chmod(0o777)
     else:
         moved = rules.with_name("elsewhere")
         rules.rename(moved)
         rules.symlink_to(moved, target_is_directory=True)
-    with pytest.raises(ValueError, match="untrusted"):
+    with pytest.raises(ValueError, match="untrusted kit file"):
         prompt({"lens": "general", "kind": "review"}, [])
-    with pytest.raises(ValueError, match="untrusted"):
-        loop_config.read_rules()
+    with pytest.raises(ValueError, match="untrusted kit file"):
+        kit.rules()
 
 
 def test_policy_prompt_and_mount_use_one_validated_snapshot(tmp_path, monkeypatch):
     rules = install(tmp_path, monkeypatch)
-    snapshot = loop_config.read_rules()
-    execution = {"tools": {}, "sockets": {}}
-    before = loop_config.policy_id(b"raw", execution, (), snapshot)
-    # Editing the installed file after validation changes neither the prompt nor the mount.
+    root = tmp_path / "kit"
+    taken = kit.snapshot()
+    monkeypatch.setattr(kit, "snapshot", lambda: taken)
+    snapshot = kit.rules()
+    original = kit.take(root, ())
+    # Editing the installed file after the snapshot changes neither the prompt nor the mount.
     (rules / "one.md").write_text("tampered rule\n")
-    text = loop_config.rules_text(snapshot)
     request = {"lens": "general", "kind": "review"}
-    assert "first rule" in prompt(request, [], rule_text=text)
-    assert "tampered" not in prompt(request, [], rule_text=text)
-    assert loop_config.policy_id(b"raw", execution, (), snapshot) == before
-    assert loop_config.policy_id(b"raw", execution, (), loop_config.read_rules()) != before
+    assert "first rule" in prompt(request, []) and "tampered" not in prompt(request, [])
+    assert kit.take(root, ()).digest != original.digest
+    # The same bytes under another file name are a different snapshot, hence a different policy.
+    (rules / "one.md").write_text("first rule\n")
+    assert kit.take(root, ()).digest == original.digest
+    (rules / "one.md").rename(rules / "one-renamed.md")
+    renamed = kit.take(root, ())
+    assert sorted(renamed.files.values()) == sorted(original.files.values())
+    execution = {"tools": {}, "sockets": {}}
+    assert (loop_config.policy_id(renamed.digest, b"raw", execution, ())
+            != loop_config.policy_id(original.digest, b"raw", execution, ()))
 
     seen = {}
 
@@ -77,7 +91,7 @@ def test_policy_prompt_and_mount_use_one_validated_snapshot(tmp_path, monkeypatc
     monkeypatch.setattr(sandbox, "run", fake_run)
     policy = {**sandbox.execution_policy({}), "rules": snapshot}
     sandbox.execute(["/usr/bin/true"], None, Event(), 5, role="verify", policy=policy)
-    assert seen == snapshot
+    assert seen == snapshot == {"one.md": b"first rule\n", "two.md": b"second rule\n"}
 
 
 def test_coordinator_config_carries_the_snapshot(queue):  # noqa: F811
@@ -152,7 +166,7 @@ def test_stop_with_failed_recording_keeps_the_pending_row(queue, monkeypatch):  
     def broken(self, *args):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(Store, "record_protected", broken)
+    monkeypatch.setattr(Store, "settle", broken)
     start_and_stop(cfg, git, stopping_reviewer(lambda stdin: review_response(stdin, [FINDING])))
     monkeypatch.undo()
     with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store, Engine(

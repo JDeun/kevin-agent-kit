@@ -5,20 +5,21 @@ import re
 import stat
 import tomllib
 
+from . import install
 from .paths import directory, regular_at
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-MODULE_PREFIX = __package__.removesuffix("core.loop")
-ROOT = PACKAGE_ROOT.parent if MODULE_PREFIX else PACKAGE_ROOT
 NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 
 
-def project(root=ROOT):
-    with (root / "project.toml").open("rb") as stream:
-        metadata = tomllib.load(stream)["project"]
-    if len(metadata["name"]) > 64 or not NAME.fullmatch(metadata["name"]):
+def metadata(raw):
+    data = tomllib.loads(raw.decode("utf-8"))["project"]
+    if len(data["name"]) > 64 or not NAME.fullmatch(data["name"]):
         raise ValueError("project name must be a lowercase slug of up to 64 characters")
-    return metadata
+    return data
+
+
+def project():
+    return metadata(install.project_bytes())
 
 
 def xdg(variable, default):
@@ -103,45 +104,20 @@ def validate_evidence(policy, checks):
             raise ValueError("evidence approval requires a bundle scope and nonnegative retention_seconds")
 
 
-def read_rules(root=None):
-    """Read the installed rule documents through one trusted directory descriptor.
-
-    Every entry must be a regular, singly linked file owned by the user or root
-    without group or other write access. The returned bytes are the only rule
-    input: the policy hash, the prompts and the sandbox mount all use them.
-    """
-    with directory((ROOT if root is None else root) / "rules") as source:
-        documents = {}
-        for name in sorted(os.listdir(source)):
-            if not stat.S_ISREG(os.lstat(name, dir_fd=source).st_mode):
-                raise ValueError(f"untrusted rules entry: {name}")
-            with regular_at(source, name, single_link=True) as document:
-                content = document.read()
-            if name.endswith(".md"):
-                documents[name] = content
-    if not documents:
-        raise ValueError("installed rule documents are missing")
-    return documents
-
-
 def rules_text(documents):
     return "\n".join(documents[name].decode("utf-8") for name in sorted(documents))
 
 
-def policy_id(raw, execution, keys, rules):
-    code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
-    code += sorted((PACKAGE_ROOT / "core/agents").glob("*.py"))
-    code += sorted((PACKAGE_ROOT / "core").glob("*.py"))
-    lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
-    prompts = PACKAGE_ROOT / "reviews/persona/prompts.py"
+def policy_id(installed, profile, execution, keys):
+    """Bind a policy to the approved install snapshot, the profile and its registered resources."""
     tools = [repr(tool).encode("utf-8", errors="surrogateescape") for tool in execution["tools"].values()]
     sockets = [repr(socket).encode("utf-8", errors="surrogateescape") for socket in execution["sockets"].values()]
-    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, prompts)), *(rules[name] for name in sorted(rules)), *tools, *sockets, *keys)
+    return fingerprint(installed.encode("ascii"), profile, *tools, *sockets, *keys)
 
 
 def config(path=None, *, control_only=False):
-    raw = (ROOT / "project.toml").read_bytes()
-    data = tomllib.loads(raw.decode())["loop"]
+    installed = install.snapshot()
+    data = tomllib.loads(install.project_bytes().decode())["loop"]
     if path is None:
         repo, common, _ = repository(Path.cwd())
         path = profile_dir() / profile_name(repo, common)
@@ -169,6 +145,10 @@ def config(path=None, *, control_only=False):
         raise ValueError("state must be outside the checkout and Git directory")
     if control_only:
         return {"state": state}
+    if data["install_sha256"] != installed.digest:
+        raise ValueError(
+            f"this profile does not approve the installed kit (sha256={installed.digest}); "
+            "review the install, then run `init --approve-install`")
     if data["trust"] not in ("signed", "local"):
         raise ValueError('trust must be "signed" or "local"')
     if type(data["design_gate"]) is not bool:
@@ -213,14 +193,14 @@ def config(path=None, *, control_only=False):
             raise ValueError(f"{role} has an invalid model or model ceiling")
         data[role] = [model if item == "{model}" else item for item in data[role]]
     for lens, command in data["lens_reviewers"].items():
-        if not (PACKAGE_ROOT / "reviews/lenses" / f"{lens}.md").is_file():
+        if not install.has(f"reviews/lenses/{lens}.md"):
             raise ValueError("lens reviewer must name an installed lens")
         data["lens_reviewers"][lens] = [data["reviewer_model"] if item == "{model}" else item for item in command]
     for section, expected in (("memory", dict), ("lenses", dict)):
         if not isinstance(data[section], expected):
             raise ValueError(f"{section} must be a table")
     for name, patterns in data["lenses"].items():
-        if not NAME.fullmatch(name) or not (PACKAGE_ROOT / "reviews/lenses" / f"{name}.md").is_file():
+        if not NAME.fullmatch(name) or not install.has(f"reviews/lenses/{name}.md"):
             raise ValueError("lens must name an installed review document")
         if name in ("general", "security", "architect", "sre"):
             raise ValueError(f"[loop.lenses] cannot select {name}: general and security always run on "
@@ -242,7 +222,7 @@ def config(path=None, *, control_only=False):
 
     forbidden = (repo, common, state.resolve())
     execution = execution_policy(data["execution"], forbidden=forbidden)
-    rules = read_rules()
+    rules = install.rules()
     execution["rules"] = rules
     review_key = b"" if data["review_key"] == "" else public_key(outside_path(data["review_key"], forbidden))
     check_keys = {name: public_key(outside_path(key, forbidden)) for name, key in data["check_keys"].items()}
@@ -277,6 +257,6 @@ def config(path=None, *, control_only=False):
         repo=repo, state=state, repo_id=identity, profile=path, execution=execution, memory=memory,
         review_key=review_key, check_keys=check_keys,
         rules_text=rules_text(rules),
-        policy_id=policy_id(raw + overrides, execution, (review_key, *check_keys.values()), rules),
+        policy_id=policy_id(installed.digest, overrides, execution, (review_key, *check_keys.values())),
     )
     return data

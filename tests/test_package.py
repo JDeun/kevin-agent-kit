@@ -37,7 +37,7 @@ def test_rename_drives_build_docs_manifest_cli_and_install(tmp_path):
     invoke(source, "build", result, "--allow-dirty")
     manifest = json.loads((result / "plugin/.claude-plugin/plugin.json").read_text())
     assert manifest["name"] == "different-kit"
-    assert manifest["version"] == original_config["project"]["version"] == "0.3.4"
+    assert manifest["version"] == original_config["project"]["version"] == "0.3.5"
     market = json.loads((result / ".claude-plugin/marketplace.json").read_text())
     assert market["name"] == market["plugins"][0]["name"] == "different-kit"
     assert market["plugins"][0]["source"] == "./plugin"

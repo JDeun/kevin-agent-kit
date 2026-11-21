@@ -1,6 +1,6 @@
 [project]
 name = "kevin-agent-kit"
-version = "0.3.4"
+version = "0.3.5"
 
 [loop]
 repo = ""
@@ -8,6 +8,7 @@ target = "main"
 max_rounds = 5
 design_gate = true
 trust = "signed"
+install_sha256 = ""
 review_format = "receipt"
 repeat_class_rounds = 2
 wiki_landing = true

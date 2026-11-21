@@ -34,7 +34,10 @@ Absolute, external, dangling or cyclic links and submodules prevent dispatch. Ea
 the tree and the direct execution. Signed evidence additionally binds this run
 to the external source.
 
-Stop the old daemon before upgrading. Replace any profile that selects
+Stop the old daemon before upgrading. After the upgrade, review the install and
+run `kevin-agent-kit init --approve-install` for each profile; a profile
+written before 0.3.5 has no `install_sha256` and does not load until then. The
+queue of 0.3.4 is migrated in place on first use. Replace any profile that selects
 `isolation = "none"`, forwards environment variables or embeds an old host
 launcher. The host-side `agent review` and `agent worker` commands were removed. Generate a new draft or configure the broker clients explicitly.
 Local results carry `source = "local-unsigned"`.
@@ -110,13 +113,17 @@ protected from other users' writes. Symlinks and hard links are rejected. The
 sandbox checks the approved file identity and bytes and mounts a read-only copy.
 Use `/usr/bin` for system interpreters. The default environment gives each
 invocation a fresh `HOME` and private temporary paths. The sandbox mounts
-the kit rules at `/rules` and the agent checkout at `/workspace`. The
-coordinator reads the installed `rules/` directory once, through a directory
-descriptor, and applies the module trust check to it: the owner must be the
-user or root, no group or other write bit, regular single-link files only, and
-no links or special files. The policy hash, the prompts and the `/rules` mount
-all use those same validated bytes; the mount is a private copy, never the
-installed directory. Reviewers
+the kit rules at `/rules` and the agent checkout at `/workspace`. Every
+process reads the install once into one snapshot: `project.toml`, the kit
+modules (code, lenses and prompts) and `rules/`. One trust check covers all of
+it through directory descriptors: the owner must be the user or root, no group
+or other write bit, directories and regular single-link files only. The
+launcher imports modules from the snapshot, and the defaults, the prompts, the
+policy ID and the `/rules` mount use the same bytes; the mount is a private
+copy, never the installed directory. The policy ID covers file names as well
+as contents. A profile approves one snapshot with `install_sha256`. When the
+install differs, loading the profile fails until you review the install and
+run `kevin-agent-kit init --approve-install`. Reviewers
 have read-only access to the checkout. A worker can edit the checkout
 and has read-only access to its isolated Git metadata. Reviewer and worker
 commands start from a fresh home directory. Use `AGENT_WORKSPACE` to address
@@ -291,11 +298,14 @@ propose a redesign. Later jobs on the branch enter `forest-held` until a fresh
 design-only approval recorded after the escalation matches their ancestry.
 Start the redesign from the current target. A new branch can carry a new
 design and implementation, with the original branch's hold preserved.
-Protected findings (safety, honesty, security) of the held job carry over: later jobs
-on the same branch inherit them automatically, and a redesign on a new branch names the
-held job with `enqueue BRANCH SHA --inherit-from JOB_ID`. The review then requires
-independent resolution evidence for each inherited finding, so a redesign cannot drop one
-silently. Repeat detection is scoped to the lens that raised the class. Re-running
+Protected findings (safety, honesty, security) stay open on a branch until a reviewer of
+the current SHA resolves them. A job inherits them from every other job on its branch that
+ended with findings open (any phase except `candidate`, `included`, `waiting` and
+`deferred`), whether that job was held for a redesign, blocked, stale or interrupted. Work
+that moves to a new branch names its source with `enqueue BRANCH SHA --inherit-from JOB_ID`;
+any job can be the source, and its own sources follow. The review then requires resolution
+evidence for each inherited finding (independent evidence in signed mode), so a new SHA
+cannot drop one silently. Repeat detection is scoped to the lens that raised the class. Re-running
 `enqueue --kind routine` on an unclassified SHA that is still in review or `design-needed`
 corrects the classification in place and records a `reclassified` evidence row.
 Inspect phases and counters with [status](observability.md).
@@ -318,16 +328,31 @@ new SHA explicitly. If the target or policy changes, or evidence expires,
 retry the existing job with `kevin-agent-kit retry JOB_ID`. Status
 distinguishes an externally included source from a verified candidate.
 
-The queue records safety, security, and honesty findings as soon as it
-validates their review receipt, before requesting independent observation.
-Restart and retry carry those findings forward for independent resolution.
-A review left open by an interruption before its observations can be recorded
-moves the job to `interrupted` on restart. A stop is not an exception: the
-coordinator recovers protected findings the reviewer had already printed, and
-records them before the job stops. When the output was cut off or the
-recording fails, the pending request stays, so the next start marks the job
-`interrupted` instead of running the review again. The queue keeps the pending request
-for diagnosis and blocks automatic or ordinary retry of that job.
+The queue journals safety, security, and honesty findings while the reviewer
+is still running: each finding is committed the moment its JSON object closes
+in the reviewer's output. The journal is append-only. Restart, retry and
+resume carry those findings forward for explicit resolution.
+
+A review attempt closes only when the coordinator read the whole output, the
+output ended outside every JSON object, array and string, and the close marker
+was written. A stop that meets all three leaves the job queued for the next
+start. A stop, timeout or size limit that cuts the output, an unreadable
+stream or a failed write keeps the attempt open with the raw output, and the
+job becomes `interrupted`. A coordinator that died mid-review is treated the
+same way on the next start. No command erases an open attempt, and an
+interrupted job is never dispatched or retried automatically.
+
+```sh
+kevin-agent-kit status                 # pending_review: lens, reason, journaled findings
+kevin-agent-kit evidence JOB_ID        # the kept reviewer output and findings
+kevin-agent-kit resume JOB_ID          # review the same SHA again
+kevin-agent-kit enqueue BRANCH NEW_SHA # or continue with a new commit
+```
+
+`resume` keeps the evidence and returns the job to review. The next reviewer
+receives every journaled finding as a prior protected finding. A new SHA on
+the same branch inherits them automatically; `--inherit-from JOB_ID` carries
+them to another branch and marks the interrupted job `superseded`.
 At the round cap, remaining safety, security, or honesty findings block the
 job and retain the evidence for the operator. Other findings create a human
 decision record. Inspect it with `accept-record ID` and record `revise`

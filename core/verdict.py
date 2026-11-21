@@ -80,8 +80,10 @@ def findings_by_id(items, require_class):
 # introduce a new finding.
 # Consume an unterminated string through EOF as well. Starting another match
 # at each escaped quote would repeatedly traverse the same malformed suffix.
-TOKENS = re.compile(r'"(?:[^"\\]++|\\[\s\S])*+(?:"|\\?\Z)|[][{}]')
+TOKENS = re.compile(r'"(?:[^"\\]++|\\[\s\S])*+(?:(")|\\?\Z)|[][{}]')
 ARRAY_START = re.compile(r'[ \t\r\n]*:[ \t\r\n]*(?=\[)')
+# After a key, more input may still turn the following text into an array start.
+UNDECIDED = re.compile(r'[ \t\r\n]*(?::[ \t\r\n]*)?\Z')
 
 
 @dataclass(slots=True)
@@ -91,56 +93,114 @@ class Container:
     parts: list[str]
 
 
-def recovered_objects(raw):
-    """Decode each container once, validating descendants even in a truncated document."""
-    stack = []
-    findings_array_at = None
-    cursor = 0
-    for match in TOKENS.finditer(raw):
-        token = match[0]
-        if token.startswith('"'):
-            after_key = ARRAY_START.match(raw, match.end())
-            if after_key and json_field_is_findings(token):
-                findings_array_at = after_key.end()
-            continue
-        if stack:
-            stack[-1].parts.append(raw[cursor:match.start()])
-        cursor = match.end()
-        if token in ("{", "["):
-            is_finding = token == "{" and bool(stack) and stack[-1].findings_array
-            stack.append(Container(token == "[" and match.start() == findings_array_at, is_finding, [token]))
-        elif stack:
-            frame = stack.pop()
-            frame.parts.append(token)
-            # The parent needs only the type and validity of this child. All
-            # protected finding fields are strings. Replacing a consumed child
-            # keeps work linear for findings arrays nested inside one another.
+def protected_entry(item):
+    """The stored form of a valid safety, honesty or security finding, or None."""
+    try:
+        entry = finding(item)
+    except ValueError:
+        return None
+    if entry["risk"] not in BLOCKING:
+        return None
+    if valid_class(item.get("finding_class")):
+        entry["finding_class"] = item["finding_class"]
+    return entry
+
+
+def decode(text):
+    return json.loads(text, object_pairs_hook=unique_fields, parse_constant=invalid_constant)
+
+
+class Scanner:
+    """Recover protected findings from reviewer output while it is still arriving.
+
+    Each container is decoded once, validating descendants even in a truncated
+    document. `feed` returns the findings completed by the new text. After
+    `finish`, `settled` tells whether the output ended outside every JSON
+    object, array and string; only then is the recovered list known to be whole.
+    """
+
+    def __init__(self):
+        self.text = ""
+        self.settled = False
+        self._position = 0
+        self._cursor = 0
+        self._stack = []
+        self._findings_array_at = None
+
+    def feed(self, text):
+        self.text += text
+        return self._advance(final=False)
+
+    def finish(self):
+        found = self._advance(final=True)
+        self.settled = not self._stack and not self._open_string
+        if self._stack and self._stack[-1].finding_object and not self._open_string:
+            # The output stopped inside a finding whose fields are already complete.
+            frame = self._stack[-1]
+            rest = self.text[self._cursor:].rstrip(" \t\r\n").removesuffix(",")
             try:
-                value = json.loads("".join(frame.parts), object_pairs_hook=unique_fields,
-                                   parse_constant=invalid_constant)
+                entry = protected_entry(decode("".join(frame.parts) + rest + "}"))
             except ValueError:
-                replacement = "invalid"
-            else:
-                replacement = "{}" if isinstance(value, dict) else "[]"
-                if frame.finding_object:
-                    yield value
+                entry = None
+            if entry:
+                found.append(entry)
+        return found
+
+    def _advance(self, final):
+        raw, stack, found = self.text, self._stack, []
+        self._open_string = False
+        for match in TOKENS.finditer(raw, self._position):
+            token = match[0]
+            if token.startswith('"'):
+                if match[1] is None:
+                    # Unterminated: wait for the rest, or report it at the end.
+                    self._open_string = True
+                    break
+                after_key = ARRAY_START.match(raw, match.end())
+                if not after_key and not final and UNDECIDED.match(raw, match.end()):
+                    break
+                if after_key and json_field_is_findings(token):
+                    self._findings_array_at = after_key.end()
+                self._position = match.end()
+                continue
+            self._position = match.end()
             if stack:
-                stack[-1].parts.append(replacement)
+                stack[-1].parts.append(raw[self._cursor:match.start()])
+            self._cursor = match.end()
+            if token in ("{", "["):
+                is_finding = token == "{" and bool(stack) and stack[-1].findings_array
+                stack.append(Container(token == "[" and match.start() == self._findings_array_at,
+                                       is_finding, [token]))
+            elif stack:
+                frame = stack.pop()
+                frame.parts.append(token)
+                # The parent needs only the type and validity of this child. All
+                # protected finding fields are strings. Replacing a consumed child
+                # keeps work linear for findings arrays nested inside one another.
+                try:
+                    value = decode("".join(frame.parts))
+                except ValueError:
+                    replacement = "invalid"
+                else:
+                    replacement = "{}" if isinstance(value, dict) else "[]"
+                    if frame.finding_object and (entry := protected_entry(value)):
+                        found.append(entry)
+                if stack:
+                    stack[-1].parts.append(replacement)
+        return found
+
+
+def scan(raw):
+    """Return (protected findings, settled) for one complete reading of reviewer output."""
+    scanner = Scanner()
+    found = scanner.feed(raw)
+    found += scanner.finish()
+    return found, scanner.settled
 
 
 def salvage(raw):
     """Keep valid protected fields, including entries before the truncation point."""
-    kept = []
-    for item in recovered_objects(raw):
-        try:
-            entry = finding(item)
-        except ValueError:
-            continue
-        if entry["risk"] in BLOCKING:
-            if valid_class(item.get("finding_class")):
-                entry["finding_class"] = item["finding_class"]
-            kept.append(entry)
-    return kept
+    return scan(raw)[0]
 
 
 def json_field_is_findings(token):
