@@ -23,13 +23,14 @@ The attestor has its own process and cannot lend its socket to a check.
 A model review is one top-level JSON object. An ambiguous, nested or malformed
 verdict yields a partial receipt. Valid protected findings survive rejection
 and require an explicit resolution. Only a validated complete receipt can
-advance the candidate. A failed reviewer can still emit valid protected findings
-before exiting. Preserve those observations across retries and design re-reviews.
+advance the candidate. A failed or stopped reviewer can still emit valid protected
+findings. The [finding journal](stop-integrity-and-install-trust.md) records them
+as they appear and decides when an attempt may close.
 
 Every generated launcher and internal module restart embeds the same trusted
-bootstrap. Before adding a package to the import path it checks the path
-components, module directory and loadable contents for type, owner, symlinks
-and group or other write access. Trust starts outside the modules being loaded.
+bootstrap. Trust starts outside the modules being loaded. The bootstrap reads
+the install once into the [install snapshot](stop-integrity-and-install-trust.md)
+and every later consumer uses those bytes.
 
 ## Failure modes and rollback
 
