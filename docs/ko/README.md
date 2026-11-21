@@ -5,13 +5,9 @@
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **상태: 실험 단계 (v0.3.2).** 아직 보안 경계로 의존하지 마세요.
-> - 로컬 신뢰 모드(`init --agent`)는 비격리·무서명입니다. 모델 CLI와 필수 검사가 계정의 파일과
->   네트워크로 실행되고 후보의 규칙·텍스트가 리뷰어에 영향을 줄 수 있으니, 일회용 호스트와
->   신뢰하는 후보에만 쓰세요.
-> - 격리·서명 모드는 Linux Bubblewrap과 외부 브로커가 필요하며 여기서는 검증되지 않았습니다.
->   검사 대상 저장소 안에 정의한 CI 작업은 게이트가 아니라 참고용입니다.
-> - 실제 모델 검증은 Codex CLI 로컬 모드만 했습니다. [알려진 문제](../known-issues.md)
+> **실험 단계 v0.3.3.** 실제 리뷰·수정·검사에는 Linux Bubblewrap 네임스페이스가 필요합니다.
+> 모델 자격 증명은 운영자의 브로커가 보관합니다. 필수 검사는 후보 커밋에 고정된 새 읽기 전용 트리에서 실행합니다.
+> Bubblewrap을 사용할 수 없는 환경에서는 내장 데모를 실행할 수 있습니다. [알려진 문제](../known-issues.md)
 
 [English](../../README.md) · [저장소](https://github.com/JDeun/kevin-agent-kit.git)
 
@@ -25,10 +21,8 @@
 
 Git을 설치하고, 배포 CLI가 사용할 Python 3.11 이상을 `/usr/bin/python3`에 준비합니다.
 실행기는 Python 격리 모드를 사용합니다. 설치한 명령의 선택 의존성은 시스템 Python에서
-불러올 수 있어야 합니다. 격리·서명 증거 방식의 루프에는
-OpenSSL과 Bubblewrap의 비특권 네임스페이스를 사용할 수 있는 Linux가 필요합니다.
-`kevin-agent-kit doctor`로 이 컴퓨터가 지원하는지 먼저 확인하고, Bubblewrap이 없으면(컨테이너 등)
-2단계의 비격리 실제 CLI 모드를 사용합니다. 다른 계정이 쓸 수 있거나 심볼릭 링크인
+불러올 수 있어야 합니다. `kevin-agent-kit doctor`로 네임스페이스 지원 여부를
+확인하세요. 서명 모드에는 OpenSSL도 필요합니다. 다른 계정이 쓸 수 있거나 심볼릭 링크인
 설치 경로는 거부됩니다.
 신뢰할 수 있는 키트 체크아웃에서 설치합니다. 기본 설치 경로는 `~/.local`입니다.
 
@@ -73,12 +67,11 @@ Claude Code에서 마켓플레이스를 추가하고, 플러그인을 설치할 
 검증의 서명 출처를 설정하고 어댑터별 번들 범위와 보존 기간을 승인합니다.
 자동 수정에는 작업자 명령과 수정 경로를 승인합니다.
 
-서명·브로커 없이 실제 `codex` 또는 `claude` CLI를 작업자와 리뷰어로 쓰려면
-`kevin-agent-kit init --agent codex`(또는 `claude`)를 실행합니다. 생성된 프로필은
-`trust = "local"`, `isolation = "none"`이며 CLI가 이 계정의 파일·네트워크·자격 증명을
-그대로 쓰므로 일회용 호스트나 컨테이너에서 실행하세요. 키트는 각 명령의 종료 코드와
-리뷰 결과를 기록하고 필수 검증을 후보 체크아웃에서 직접 실행합니다. 이 증거는 서명되지
-않습니다. 독립 증명이 필요하면 격리·서명 방식을 사용합니다.
+무서명 증거를 사용하려면 `kevin-agent-kit init --agent codex` 또는 `claude`로 프로필
+초안을 만드세요. 직접 준비한 브로커 클라이언트 실행 파일과 역할별 소켓을 등록하고
+감지된 검사 명령을 검토합니다. 서명·무서명 모드 모두 같은 격리를 적용합니다.
+업그레이드할 때는 이전 데몬을 정지하고 호스트 CLI용 프로필을 교체하세요. 서명 모드는
+각 서명 검사에 대응하는 직접 실행 명령을 `[loop.check_commands]`에 등록해야 합니다.
 
 설정은 `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`에 생성됩니다.
 [프로필과 래퍼 설정](../loop.md)
@@ -117,10 +110,10 @@ kevin-agent-kit init --global --uninstall
 제거 명령은 설치 기록과 일치하는 관리 블록을 걷어냅니다. Claude Code 플러그인은
 `/plugin uninstall kevin-agent-kit@kevin-agent-kit`으로 제거합니다.
 
-키트 체크아웃에서는 `python3 -m core.loop`를 쓸 수 있습니다.
+신뢰하는 소스 체크아웃에서 개발용 데모를 실행하려면 `python3 -m core.loop demo`를 사용합니다.
 빌드는 커밋된 `HEAD` 트리를 패키징하며 작업 트리가 다르면 거부합니다
 (개발용 `--allow-dirty`). `./scripts/build.sh`로 설치 파일을 만들고, `./scripts/rename.sh NEW`로 빌드할
-CLI와 플러그인 이름을 바꿀 수 있습니다. Python 모듈 이름은 밑줄을 사용합니다.
+CLI와 플러그인 이름을 바꿀 수 있습니다. 배포본은 생성된 `bin/kevin-agent-kit` 실행기로 시작합니다.
 [아키텍처](../architecture.md) · [호스팅 어댑터](../hosting.md) · [알려진 이슈](../known-issues.md)
 
 - [작업자 규칙](../../agents/worker-rules.md)은 브랜치 범위와 리소스 소유권을 다룹니다.

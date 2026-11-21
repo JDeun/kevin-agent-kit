@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3
+
+- Require Bubblewrap for live work in both trust modes. Keep provider credentials
+  in scoped brokers. Replace host-CLI profiles with registered broker clients.
+- Pin the candidate tree before each required command and mount its committed
+  files read-only in a fresh workspace. Signed checks also bind this direct run
+  to an independent attestation. Configure matching `[loop.check_commands]`.
+- Require exactly one top-level review verdict. Preserve valid protected findings
+  when a response contains conflicting objects or invalid fields.
+- Share package and module trust checks across the launcher and child processes,
+  including the daemon. Validate load paths and permissions before importing.
+
 ## 0.3.2
 
 - Installed files take their permissions from the Git file type (0644 or 0755), never from

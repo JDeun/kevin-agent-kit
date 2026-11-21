@@ -6,42 +6,38 @@ namespaces and the `--disable-userns` option. Startup probes this boundary
 before starting any configured commands. The built-in `demo` uses only
 embedded fixtures and can run without Bubblewrap.
 
-Run `kevin-agent-kit doctor` before writing a profile. It reports Python, Git, OpenSSL,
-whether Bubblewrap can create its namespaces (and why not), which agent CLIs are
-installed, and whether the current profile loads. It exits nonzero when something the
-profile's mode requires is missing, and prints the alternative below when isolation fails.
+Run `kevin-agent-kit doctor` to check the profile and namespace capability.
 
-## Real agent CLIs without brokers (local trust)
+## Unsigned evidence with a model broker
 
-Containers often cannot run Bubblewrap, and `codex` or `claude` need network and
-credentials that the isolated mode withholds. `kevin-agent-kit init --agent codex` (or
-`claude`) writes a profile with `trust = "local"` and `isolation = "none"` under
-`[loop.execution]`. Both keys are required together, and only the trusted profile can set
-them. In this mode:
+`kevin-agent-kit init --agent codex` or `--agent claude` drafts a local-trust
+profile. Install your broker client outside the repository and register its
+path under `[loop.execution.tools]`. Configure a reviewer socket and, if repair
+is enabled, a scoped worker socket. The client receives the role as its first
+argument and the prompt on stdin. It starts in an empty home, reads committed
+code via `AGENT_WORKSPACE`, and contacts the provider through
+`AGENT_MODEL_SOCKET`. The broker owns credentials and must keep host execution
+and file access outside its client protocol.
 
-- the reviewer, security lens and worker run through `kevin-agent-kit agent review|worker
-  --cli codex|claude`, which calls `codex exec` or `claude -p` with read-only or edit
-  permissions, extracts the model's JSON verdict from its output and builds the exact
-  receipt the loop requires. A missing verdict or a rate limit fails the command with exit
-  status 3 or 75 (retry). A verdict is complete only with an explicit `status` of `complete`,
-  a `findings` array whose every item has a valid id, risk and detail, and a `resolved`
-  object; anything else becomes a `partial` receipt that the loop rejects while keeping its
-  well-formed protected findings. Profiles written by `init --agent` pass `--unsandboxed`,
-  so Codex runs with `--sandbox danger-full-access` for both roles (its own sandbox needs
-  user namespaces, which are the reason this mode exists) and the read-only reviewer is
-  read-only by instruction only;
-- required checks run in the candidate checkout with their real exit status and an empty
-  `HOME`. The checkout must equal the candidate commit before the run, and HEAD and the
-  tracked files must be unchanged after it, or the check fails; a repair counts only if the
-  worker left HEAD where it was and changed only staged paths inside `repair_paths`;
-- every command's exit code, duration and output hash are stored under `runs`, and each check
-  under `checks` with `source = "local-unsigned"`; the candidate record carries
-  `trust = "local"`.
+The generated profile selects `review_format = "verdict"`. On stdout, emit one
+JSON object with `status`, `findings` and `resolved`. Extra objects, nested
+verdicts and invalid field types produce partial evidence. The coordinator
+preserves valid protected findings and rejects the review. For a successful
+repair the client edits only the paths approved in `repair_paths`.
 
-The commands run with this account's files, network and credentials and the evidence is
-unsigned, because the kit produced it itself. Treat a local-trust candidate as the work of a
-trusted operator's own agents, not as independently attested. Use a disposable host or
-container as the boundary. The default `signed` trust is unchanged.
+In local mode `[loop.checks]` contains direct check commands. In signed mode,
+`[loop.check_commands]` supplies direct commands for the same names as the
+attestation adapters in `[loop.checks]`. Every command gets a fresh read-only
+tree containing raw committed file bytes, with its Git tree ID pinned before
+dispatch. Write artifacts to private `/tmp` or `HOME`. Relative symbolic links must resolve inside the tree.
+Absolute, external, dangling or cyclic links and submodules prevent dispatch. Each receipt identifies
+the tree and the direct execution. Signed evidence additionally binds this run
+to the external source.
+
+Stop the old daemon before upgrading. Replace any profile that selects
+`isolation = "none"`, forwards environment variables or embeds an old host
+launcher. The host-side `agent review` and `agent worker` commands were removed. Generate a new draft or configure the broker clients explicitly.
+Local results carry `source = "local-unsigned"`.
 
 ## Profile setup
 
@@ -75,6 +71,9 @@ db = ["/tools/db-review"]
 
 [loop.checks]
 unit = ["/tools/check-evidence"]
+
+[loop.check_commands]
+unit = ["python3", "-m", "unittest"]
 
 [loop.check_keys]
 unit = "/home/example/kit-keys/check-source.pem"
@@ -121,15 +120,9 @@ all staged changes against the approved paths, makes one repair commit, and
 rebuilds a clean checkout from that commit before the next review. Path
 patterns use Python shell-style matching, where a wildcard can match a slash.
 
-For model work, configure a trusted wrapper around the installed client.
-For Codex, use `codex exec --ignore-user-config --ignore-rules --sandbox read-only`
-for a reviewer and use `--sandbox workspace-write --add-dir /workspace`
-for a worker when the client supports those flags. For Claude Code, use
-`claude -p --setting-sources user --strict-mcp-config` and expose only the
-needed tools. Keep the client's working directory outside `/workspace`.
-Consult the installed
-client's help for supported options. The coordinator's outer sandbox applies
-to both. Model names can be set in `models`, `max_model`, `reviewer_model`,
+Model broker clients should keep project instruction and plugin discovery
+disabled. Use `AGENT_WORKSPACE` only for the requested review or repair.
+Model names can be set in `models`, `max_model`, `reviewer_model`,
 and `worker_model`. The coordinator replaces an exact `{model}` argv
 element and sets `AGENT_MODEL` for the wrapper.
 
@@ -138,17 +131,15 @@ operator-run Unix-socket broker scoped to the provider and the permitted
 role. For example, set `reviewer = "/absolute/path/to/model.sock"` in
 `[loop.execution.sockets]`. The wrapper connects to `AGENT_MODEL_SOCKET`.
 The broker holds the provider credentials and enforces request and data
-limits. Provide the broker and client adapter for your setup. Keep any
-optional `[loop.execution.env]` arrays role-specific, such as
-`reviewer = ["MODEL_PROFILE"]`. Keep provider credentials in the broker
-and limit its capabilities to the named role. Evidence adapters get their own
+limits. Provide the broker and client adapter for your setup.
+Host environment forwarding is rejected for every role. Evidence adapters get their own
 separate broker sockets through `AGENT_EVIDENCE_SOCKET` and run with a
 fresh environment.
 
 ## Review receipts
 
-The general and security lenses always use separate registered adapters.
-Additional installed lenses selected by path rules also need dedicated
+Signed profiles require separate registered general and security adapters.
+Additional installed lenses selected by path rules also need configured
 adapters. Set `reviewer` for the general lens and use
 `[loop.lens_reviewers]` for each other lens.
 Use the scope, stable finding IDs, and JSON output contract printed in the
@@ -205,7 +196,9 @@ the request, bundle, and derived material such as checkouts and logs. A value of
 limit how long it may be kept after completion.
 See [evidence data scope](adr/evidence-data-scope.md).
 
-For required checks, run the approved check policy in a separate execution
+For required checks, verify the pinned `request.tree` and `request.direct_run`,
+including the approved command, invocation ID, exit code and output digest.
+Run the approved check policy in a separate execution
 environment. Observe execution and results from a trusted supervisor or CI
 control plane. Keep the check definition, run telemetry, and signing key
 outside candidate-writable storage and candidate processes. Use repository
@@ -252,7 +245,7 @@ receipt fields before authorizing export. It records the public key fingerprint
 and external execution ID with the evidence.
 
 Replace legacy `[loop.attestors]` configurations with signed check sources
-in `[loop.checks]` and keys in `[loop.check_keys]`. The local demo uses
+in `[loop.checks]`, matching commands in `[loop.check_commands]` and keys in `[loop.check_keys]`. The local demo uses
 embedded fixture sources.
 
 ## Design-first admission
@@ -269,7 +262,9 @@ The command uses two distinct registered reviewer adapters under
 `lens_reviewers.architect` and `lens_reviewers.sre`. Each receives the
 `design-review` request and uses the review receipt format for the named
 Markdown file. Both complete receipts must have zero findings. Use the JSON
-findings to revise and rerun a review. The accepted design-only SHA becomes
+findings to revise and rerun a review. A new attempt invalidates the previous approval.
+Each lens must resolve its outstanding protected findings explicitly, including
+findings recovered before an earlier reviewer failed. The accepted design-only SHA becomes
 an ancestor of the implementation. Keep the approved document in that
 revision's descendants and in the resulting candidate. A policy change
 requires a fresh approval.

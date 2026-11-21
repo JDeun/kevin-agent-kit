@@ -29,8 +29,10 @@ flowchart TD
     Review -->|Protected finding at cap| Blocked["Block and retain evidence"]
     Review -->|Ordinary finding at cap| Record["Human decision record"]
     Record -->|Revise| Queue
-    Review -->|Signed coverage and clean review| Verify["Required checks from signed sources"]
-    Verify -->|Current evidence| Bundle["Exportable candidate bundle"]
+    Review -->|Clean review| Verify["Required commands on fresh read-only trees"]
+    Verify -->|Signed mode| Attest["Independent check attestation"]
+    Attest -->|Current evidence| Bundle
+    Verify -->|Unsigned mode| Bundle["Exportable candidate bundle"]
     Bundle --> Release{"Repository owner approval"}
 ```
 
@@ -40,7 +42,9 @@ Each agent or check runs under a role with its own filesystem, process, and
 network namespace. The coordinator owns the state directory and imports only
 the approved Git objects into private repositories. Approved scoped repairs
 remain in the candidate history. Review and verification of a repair use a
-clean checkout of its committed content.
+clean checkout of its committed content. Each required command gets a separate read-only
+input with a tree ID fixed before execution. The signing adapter receives a scoped
+bundle and the direct run evidence. See the [execution contract](design/candidate-execution.md).
 
 The coordinator records the repository, target, source head, merge base,
 candidate, policy, and exact execution evidence. A ref or policy change

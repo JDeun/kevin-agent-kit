@@ -15,12 +15,12 @@ if __package__ == "reviews.persona":
     from core.loop.config import read_profile, repository
     from core.loop.review import rules
     from core.loop.runtime import Retry
-    from core.loop.sandbox import execute, execution_policy, redact
+    from core.loop.sandbox import execute, execution_policy
 else:
     from ...core.loop.config import read_profile, repository
     from ...core.loop.review import rules
     from ...core.loop.runtime import Retry
-    from ...core.loop.sandbox import execute, execution_policy, redact
+    from ...core.loop.sandbox import execute, execution_policy
 
 
 REVIEW_PROMPTS = {
@@ -80,7 +80,7 @@ def _invoke(command, role, instruction, timeout, policy, **inputs):
             raise ValueError(f"{role} failed: {error}") from error
     if not result.strip():
         raise ValueError(f"{role} returned an empty artifact")
-    return redact(result.strip(), policy["env"].get("persona", []))
+    return result.strip()
 
 
 def _write(path, contents):

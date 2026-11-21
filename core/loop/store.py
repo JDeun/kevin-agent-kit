@@ -1,5 +1,6 @@
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,8 @@ import stat
 import time
 
 from .design import TASK_KINDS
+from .runtime import Busy, lock
+from ..verdict import BLOCKING
 
 SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
@@ -147,11 +150,28 @@ class Store:
         row = self.db.execute("SELECT body FROM design_reviews WHERE branch=?", (branch,)).fetchone()
         return json.loads(row["body"]) if row else None
 
+    @contextmanager
+    def design_lock(self, branch):
+        name = hashlib.sha256(branch.encode("utf-8")).hexdigest()
+        try:
+            with lock(self.path.parent / f"design-{name}.lock"):
+                yield
+        except Busy:
+            raise ValueError("a design review is already running on this branch") from None
+
+    def design_protected(self, branch):
+        previous = self.design(branch) or {}
+        if "open_protected" in previous:
+            return previous["open_protected"]
+        # Older reports record the findings only in each complete lens receipt.
+        return {review["request"]["lens"]: [item for item in review["findings"] if item["risk"] in BLOCKING]
+                for review in previous.get("reviews", [])}
+
     def save_design(self, report):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             forest = self.latest_forest(report["branch"])
-            if (forest["id"] if forest else None) != report["forest_job"]:
+            if report["status"] != "incomplete" and (forest["id"] if forest else None) != report["forest_job"]:
                 raise ValueError("branch hold changed during design review; review the new redesign")
             self.db.execute(
                 "INSERT OR REPLACE INTO design_reviews (branch,body) VALUES (?,?)",

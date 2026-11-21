@@ -13,9 +13,9 @@ import stat
 import tempfile
 from uuid import uuid4
 
-from .config import MODULE_PREFIX, ROOT, profile_dir, profile_name, project, repository, state_root
+from .config import ROOT, profile_dir, profile_name, project, repository, state_root
 from .paths import directory, directory_at, identity, regular_at
-from .runtime import Busy, module_command, private_dir
+from .runtime import Busy, private_dir
 
 START = b"<!-- kevin-agent-kit:rules:start -->"
 END = b"<!-- kevin-agent-kit:rules:end -->"
@@ -336,25 +336,22 @@ def repository_profile(cwd, *, dry_run=False, agent=None):
 
 
 def agent_profile(repo, target, examples, agent):
-    """A working profile that drives a real agent CLI directly, without Bubblewrap or signing."""
-    def adapter(role):
-        return json.dumps(module_command(ROOT, MODULE_PREFIX + "core.agents", role, "--cli", agent, "--unsandboxed"))
-
-    checks = [f"tests = {json.dumps(examples[0])}"] if examples else [
-        '# tests = ["python3", "-m", "pytest", "-q"]  # add the command that proves a change works']
+    """Draft an unsigned profile for a separately installed broker client."""
+    tool = f"{agent}-client"
     return [
-        f"# Profile for the {agent} CLI. Review it before starting the loop.",
-        '# trust = "local" and isolation = "none": adapters run with this account\'s files, network and',
-        "# credentials, and evidence is unsigned (exit codes and results the kit collected itself).",
-        "# Run the loop on a disposable host or in a container you accept as the boundary.",
+        f"# Register your {agent} broker client below and set its reviewer socket before use.",
         "[loop]", f"repo = {json.dumps(str(repo), ensure_ascii=False)}",
         f"target = {json.dumps(target, ensure_ascii=False)}", 'trust = "local"',
-        "design_gate = false", f"reviewer = {adapter('review')}", f"worker = {adapter('worker')}",
-        '# Narrow this to the paths a repair may touch.', 'repair_paths = ["**/*"]', "",
-        "[loop.lens_reviewers]", f"security = {adapter('review')}", "",
-        "[loop.checks]", *checks, "",
-        "[loop.execution]", 'isolation = "none"',
-        "# API-key setups can forward variables by name:", '# env = { reviewer = ["OPENAI_API_KEY"] }',
+        'review_format = "verdict"', "design_gate = false",
+        f'reviewer = ["/tools/{tool}", "review"]',
+        '# Optional repair requires a worker broker and approved paths.',
+        f'# worker = ["/tools/{tool}", "worker"]', '# repair_paths = ["src/**"]',
+        "", "[loop.lens_reviewers]", f'security = ["/tools/{tool}", "review"]',
+        "", "[loop.checks]",
+        *(["tests = " + json.dumps(examples[0])] if examples else ['# tests = ["make", "test"]']),
+        "", "[loop.execution.tools]", f'# {tool} = "/absolute/path/to/{tool}"',
+        "", "[loop.execution.sockets]", '# reviewer = "/absolute/path/to/review.sock"',
+        '# worker = "/absolute/path/to/worker.sock"',
     ]
 
 
@@ -369,6 +366,7 @@ def default_profile(repo, target, examples):
         '# architect = ["/tools/architect-review"]', '# sre = ["/tools/sre-review"]', "",
         "[loop.checks]", '# smoke = ["/tools/check-evidence"]',
     ]
+    lines += ["", "[loop.check_commands]", '# smoke = ["make", "test"]']
     lines += [f"# Detected test command idea: {json.dumps(argv)}" for argv in examples]
     lines += ["", "[loop.check_keys]", '# smoke = "/absolute/path/to/check-source.pem"']
     lines += [

@@ -1,3 +1,4 @@
+from collections import deque
 from contextlib import contextmanager
 import hashlib
 import os
@@ -17,6 +18,38 @@ class MergeFailure(Conflict):
         self.reason = reason
 
 
+def install_check_links(root, links):
+    # Resolve components with the committed link targets before creating any
+    # symlink. Even a chain that would leave the root and re-enter is rejected.
+    for link in links:
+        current = link.parent
+        pending = deque([link.name])
+        hops = 0
+        while pending:
+            if not current.is_dir():
+                raise Conflict("unsupported symlink through a non-directory")
+            part = pending.popleft()
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if current == root:
+                    raise Conflict("unsupported symlink outside the candidate tree")
+                current = current.parent
+                continue
+            entry = current / part
+            if entry not in links:
+                current = entry
+                continue
+            hops += 1
+            if hops > 40:
+                raise Conflict("unsupported symlink cycle or excessive link depth")
+            pending.extendleft(reversed(links[entry].split("/")))
+        if not current.exists():
+            raise Conflict("unsupported dangling candidate symlink")
+    for path, target in links.items():
+        path.symlink_to(target)
+
+
 def git_env():
     return {
         "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
@@ -32,14 +65,15 @@ class Git:
     def __init__(self, repo):
         self.repo = repo
 
-    def run(self, *args, input=None, allowed=(0,), stdin=None, stdout=None):
+    def run(self, *args, input=None, allowed=(0,), stdin=None, stdout=None, binary=False):
         result = subprocess.run(
             ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false",
              "-c", "core.quotePath=false", *args],
             cwd=self.repo, env=git_env(), input=input,
             stdin=stdin if stdin is not None or input is not None else subprocess.DEVNULL,
             stdout=stdout or subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="surrogateescape", timeout=90,
+            stderr=subprocess.PIPE, text=not binary, encoding=None if binary else "utf-8",
+            errors=None if binary else "surrogateescape", timeout=90,
         )
         if result.returncode not in allowed:
             raise Conflict(f"git {args[0]} failed ({result.returncode})")
@@ -112,14 +146,64 @@ class Git:
         if self.run("status", "--porcelain", "-z", "--untracked-files=all").stdout:
             raise Conflict("the candidate checkout has uncommitted or untracked changes")
 
-    def unchanged(self, commit):
-        """After a command ran: HEAD and every tracked file are still `commit`."""
-        if self.resolve() != commit or self.run("diff", "--quiet", "--ignore-submodules=none", commit,
-                                                allowed=(0, 1)).returncode:
-            raise Conflict("a command changed the candidate checkout")
-
     def tree(self, commit):
         return self.run("rev-parse", "--verify", f"{commit}^{{tree}}").stdout.strip()
+
+    def write_check_files(self, files):
+        # Read objects in one Git invocation. Batch headers report the stored type
+        # without peeling tags or applying any working-tree conversion.
+        links = {}
+        with tempfile.TemporaryFile(dir=self.repo.parent) as blobs:
+            self.run("cat-file", "--batch", input=b"".join(oid + b"\n" for oid, _, _ in files),
+                     stdout=blobs, binary=True)
+            blobs.seek(0)
+            for oid, path, mode in files:
+                fields = blobs.readline().split()
+                if len(fields) != 3 or fields[:2] != [oid, b"blob"]:
+                    raise Conflict("unsupported object in candidate check tree")
+                remaining = int(fields[2])
+                if mode == b"120000":
+                    if not 0 < remaining < 4096 or path in links:
+                        raise Conflict("unsupported symlink in candidate tree")
+                    target = os.fsdecode(blobs.read(remaining))
+                    if target.startswith("/") or "\0" in target:
+                        raise Conflict("unsupported symlink target in candidate tree")
+                    links[path] = target
+                else:
+                    with path.open("xb") as stream:
+                        while remaining:
+                            chunk = blobs.read(min(remaining, 1024 * 1024))
+                            if not chunk:
+                                raise Conflict("incomplete candidate blob")
+                            stream.write(chunk)
+                            remaining -= len(chunk)
+                    path.chmod(0o755 if mode == b"100755" else 0o644)
+                if blobs.read(1) != b"\n":
+                    raise Conflict("incomplete candidate blob")
+        return links
+
+    @contextmanager
+    def check_tree(self, tree):
+        """Export raw objects into a new private directory for a single read-only mount."""
+        entries = self.run("ls-tree", "--full-tree", "-rtz", tree, binary=True).stdout
+        with tempfile.TemporaryDirectory(prefix="check-", dir=self.repo.parent) as directory:
+            work = Path(directory)
+            files = []
+            for entry in entries.split(b"\0")[:-1]:
+                metadata, name = entry.split(b"\t", 1)
+                mode, kind, oid = metadata.split()
+                if any(part.lower() in {b"", b".", b"..", b".git"} for part in name.split(b"/")):
+                    raise Conflict("unsupported path in candidate check tree")
+                path = work / os.fsdecode(name)
+                if mode == b"040000" and kind == b"tree":
+                    path.mkdir()
+                elif mode in {b"100644", b"100755", b"120000"} and kind == b"blob":
+                    files.append((oid, path, mode))
+                else:
+                    raise Conflict(f"unsupported entry mode {os.fsdecode(mode)} in candidate check tree")
+            links = self.write_check_files(files)
+            install_check_links(work, links)
+            yield work
 
     def repair(self, allowed_paths, expected=None):
         from .review import matches

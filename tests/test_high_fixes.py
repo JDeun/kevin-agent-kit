@@ -7,7 +7,6 @@ import shutil
 import stat
 import subprocess
 import sys
-from threading import Event
 
 import pytest
 
@@ -19,7 +18,6 @@ import package
 from core import agents
 from core.loop.engine import Conflict
 from core.loop.git import Git
-from core.loop.sandbox import execute, execution_policy
 from wiki import WikiError, ingest, init, lint
 from wiki.external import audit
 
@@ -119,15 +117,11 @@ def test_w01_task_out_never_overwrites(tmp_path):
 
 # R01 -------------------------------------------------------------------------------------
 REQUEST = {"paths": ["a.txt"], "lens": "general"}
-PROMPT = "instructions\n" + json.dumps({"request": REQUEST}) + "\n"
 GOOD = {"id": "bad-1", "risk": "security", "detail": "Unsafe.", "finding_class": "unsafe-input"}
 
 
-def reply(monkeypatch, verdict):
-    text = "thinking\n" + json.dumps(verdict)
-    monkeypatch.setattr(agents, "invoke", lambda *args, **kwargs: text)
-    monkeypatch.setattr(agents, "version", lambda cli: "1.0")
-    return agents.review("codex", PROMPT, ".")
+def reply(verdict):
+    return agents.review_verdict(json.dumps(verdict), REQUEST, "fixture")
 
 
 @pytest.mark.parametrize("verdict", [
@@ -139,13 +133,13 @@ def reply(monkeypatch, verdict):
     {"status": "complete", "findings": [{"id": "x", "risk": "other", "detail": "d"}] * 2, "resolved": {}},
     {"status": "partial", "findings": [], "resolved": {}},
 ])
-def test_r01_malformed_verdicts_are_never_a_complete_clean_review(monkeypatch, verdict):
-    receipt = reply(monkeypatch, verdict)
+def test_r01_malformed_verdicts_are_never_a_complete_clean_review(verdict):
+    receipt = reply(verdict)
     assert receipt["status"] != "complete" and receipt["diagnostics"]
 
 
-def test_r01_incomplete_verdict_keeps_its_protected_findings(monkeypatch):
-    receipt = reply(monkeypatch, {"status": "partial", "findings": [GOOD], "resolved": {}})
+def test_r01_incomplete_verdict_keeps_its_protected_findings():
+    receipt = reply({"status": "partial", "findings": [GOOD], "resolved": {}})
     assert receipt["status"] == "partial"
     assert [item["id"] for item in receipt["findings"]] == ["bad-1"]
     from core.loop.review import review_receipt
@@ -155,8 +149,8 @@ def test_r01_incomplete_verdict_keeps_its_protected_findings(monkeypatch):
     assert [item["id"] for item in error.value.salvaged] == ["bad-1"]
 
 
-def test_r01_well_formed_verdict_is_complete(monkeypatch):
-    receipt = reply(monkeypatch, {"status": "complete", "findings": [GOOD], "resolved": {}})
+def test_r01_well_formed_verdict_is_complete():
+    receipt = reply({"status": "complete", "findings": [GOOD], "resolved": {}})
     assert receipt["status"] == "complete" and receipt["findings"][0]["id"] == "bad-1"
 
 
@@ -173,82 +167,110 @@ def test_r02_repair_rejects_a_worker_commit(tmp_path):
     assert git.repair(["**/*"], start) != start
 
 
-def test_r02_candidate_must_be_pristine_before_and_unchanged_after(tmp_path):
+def test_r02_repair_requires_pristine_candidate(tmp_path):
     git = repository(tmp_path / "repo")
     commit = git.resolve()
     git.pristine(commit)
-    git.unchanged(commit)
     (git.repo / "stray.txt").write_text("x\n")
     with pytest.raises(Conflict):
         git.pristine(commit)
     (git.repo / "stray.txt").unlink()
-    (git.repo / "a.txt").write_text("changed by a check\n")
+    (git.repo / "a.txt").write_text("uncommitted edit\n")
     with pytest.raises(Conflict):
-        git.unchanged(commit)
+        git.pristine(commit)
     git.run("checkout", "--quiet", "--", "a.txt")
-    git.unchanged(commit)
     git.run("commit", "--quiet", "--allow-empty", "-m", "moved")
     with pytest.raises(Conflict):
-        git.unchanged(commit)
+        git.pristine(commit)
 
 
-def test_r02_local_check_fails_when_the_check_edits_tracked_files(tmp_path, monkeypatch):
+def test_r02_check_reads_fresh_raw_git_tree_for_every_command(tmp_path):
     from core.loop import engine as engine_module
 
     git = repository(tmp_path / "repo")
+    (git.repo / ".gitattributes").write_text("a.txt export-ignore\n")
+    binary = git.repo / "script\rname"
+    binary.write_bytes(b"\xff\x00\r\n")
+    binary.chmod(0o755)
+    git.run("add", "-A")
+    git.run("commit", "-qm", "fixture modes and attributes")
     commit = git.resolve()
-    evidence = {"candidate": commit, "run": "r1"}
+    tree = git.tree(commit)
+    (git.repo / "a.txt").write_text("workspace copy\n")
+    (git.repo / "scratch.txt").write_text("job scratch\n")
+    evidence = {"candidate": commit, "tree": tree, "command": ["x"]}
     runner = engine_module.Engine.__new__(engine_module.Engine)
-    runner.command = lambda role, argv, work, ev, stdin=None: (work / "a.txt").write_text("mutated\n") or ""
-    with pytest.raises(ValueError, match="exact candidate"):
-        runner.local_check("t", ["x"], git, evidence)
-    git.run("checkout", "--quiet", "--", "a.txt")
-    runner.command = lambda role, argv, work, ev, stdin=None: "ok"
-    receipt = runner.local_check("t", ["x"], git, evidence)
-    assert receipt["tree"] == git.tree(commit) and receipt["status"] == "passed"
+    workspaces = []
+
+    def inspect(role, argv, work, ev, stdin):
+        assert role == "check"
+        assert json.loads(stdin)["request"]["tree"] == tree
+        assert {p.name for p in work.iterdir()} == {"a.txt", ".gitattributes", binary.name}
+        assert (work / "a.txt").read_text() == "one\n"
+        assert (work / binary.name).read_bytes() == b"\xff\x00\r\n"
+        assert (work / binary.name).stat().st_mode & stat.S_IXUSR
+        assert not (work / "a.txt").stat().st_mode & stat.S_IXUSR
+        workspaces.append(work)
+        return "passed"
+
+    runner.command = inspect
+    for name in ("first", "second"):
+        receipt = runner.direct_check(git, {**evidence, "check": name, "invocation": name})
+        assert receipt["tree"] == tree and receipt["status"] == "passed"
+    assert len(set(workspaces)) == 2
+    assert all(not path.exists() for path in workspaces)
+
+
+def test_r02_check_tree_preserves_in_tree_links_and_directory_traversal(tmp_path):
+    git = repository(tmp_path / "repo")
+    (git.repo / "links").mkdir()
+    (git.repo / "links" / "up").symlink_to("..")
+    (git.repo / "alias").symlink_to("links/up/a.txt")
+    (git.repo / "another").symlink_to("alias")
+    git.run("add", "-A")
+    git.run("commit", "-qm", "linked fixture")
+    with git.check_tree(git.tree("HEAD")) as work:
+        assert os.readlink(work / "links" / "up") == ".."
+        assert os.readlink(work / "alias") == "links/up/a.txt"
+        assert (work / "another").read_bytes() == b"one\n"
+
+
+@pytest.mark.parametrize("target", ["/outside", "missing", "link", "a.txt/../a.txt", "dir/up/../sibling"])
+def test_r02_unresolved_or_external_links_refuse_check_dispatch(tmp_path, target):
+    from core.loop.engine import Engine
+
+    git = repository(tmp_path / "repo")
+    (git.repo / "dir").mkdir()
+    (git.repo / "dir" / "up").symlink_to("..")
+    (git.repo / "link").symlink_to(target)
+    git.run("add", "-A")
+    git.run("commit", "-qm", "link fixture")
+    runner = Engine.__new__(Engine)
+    runner.command = lambda *args, **kwargs: pytest.fail("unsupported input reached command")
+    with pytest.raises(Conflict, match="unsupported"):
+        runner.direct_check(git, {"tree": git.tree("HEAD"), "command": ["x"]})
+
+
+def test_r02_submodule_requires_unavailable_external_tree(tmp_path):
+    git = repository(tmp_path / "repo")
+    git.run("update-index", "--add", "--cacheinfo", f"160000,{git.resolve()},module")
+    git.run("commit", "-qm", "gitlink fixture")
+    with pytest.raises(Conflict, match="unsupported"):
+        with git.check_tree(git.tree("HEAD")):
+            pytest.fail("unsupported gitlink was materialized")
 
 
 # R03 -------------------------------------------------------------------------------------
-def test_r03_required_checks_get_an_empty_home(tmp_path, monkeypatch):
-    (tmp_path / "real-home").mkdir()
-    monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
-    script = tmp_path / "tool.py"
-    script.write_text("#!/usr/bin/python3\nimport os\nprint(os.environ['HOME'], len(os.listdir(os.environ['HOME'])))\n")
-    script.chmod(0o755)
-    work = tmp_path / "work"
-    work.mkdir()
-    policy = execution_policy({"isolation": "none", "tools": {"probe": str(script)}})
-    check = execute(["/tools/probe"], work, Event(), 10, role="verify", policy=policy).split()
-    reviewer = execute(["/tools/probe"], work, Event(), 10, role="reviewer", policy=policy).split()
-    assert check[0] != str(tmp_path / "real-home") and check[1] == "0"
-    assert reviewer[0] == str(tmp_path / "real-home")
-
-
-def test_r03_signed_trust_cannot_run_unisolated(tmp_path, monkeypatch):
+@pytest.mark.parametrize("trust", ["local", "signed"])
+def test_old_profiles_refuse_host_execution(tmp_path, monkeypatch, trust):
     from core.loop.config import config
-
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    git = repository(tmp_path / "repo")
-    from core.loop.setup import repository_profile
-
-    profile = repository_profile(git.repo, agent="codex")
-    profile.write_text(profile.read_text().replace('trust = "local"', 'trust = "signed"'))
-    with pytest.raises(ValueError):
-        config(profile)
-
-
-# R04 -------------------------------------------------------------------------------------
-def test_r04_unisolated_profiles_do_not_start_the_cli_sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(agents.shutil, "which", lambda name: f"/usr/bin/{name}")
-    for mode in ("read", "write"):
-        native = agents.command("codex", mode, tmp_path)
-        assert native[native.index("--sandbox") + 1] == ("read-only" if mode == "read" else "workspace-write")
-        open_ = agents.command("codex", mode, tmp_path, unsandboxed=True)
-        assert open_[open_.index("--sandbox") + 1] == "danger-full-access"
     from core.loop.setup import repository_profile
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    git = repository(tmp_path / "repo")
-    assert "--unsandboxed" in repository_profile(git.repo, agent="codex").read_text()
+    repo = repository(tmp_path / "repo")
+    path = repository_profile(repo.repo)
+    path.write_text(f'[loop]\nrepo = {json.dumps(str(repo.repo))}\ntrust = "{trust}"\n'
+                    '[loop.execution]\nisolation = "none"\n')
+    with pytest.raises(ValueError, match="Bubblewrap"):
+        config(path)

@@ -1,14 +1,90 @@
 #!/usr/bin/python3 -I
+"""Standalone trust bootstrap, also embedded in launchers and module restarts."""
+import importlib.util
+import os
 from pathlib import Path
 import runpy
+import stat
 import sys
 
-root = Path(__file__).resolve().parents[1]
-module = "guards"
-if not (root / "project.toml").is_file():
-    module = f"{root.name}.guards"
-    root = root.parent
 
-sys.path.insert(0, str(root))
-sys.argv[1:1] = ["agent-sec", "scan"]
-runpy.run_module(module, run_name="__main__", alter_sys=True)
+SOURCE_PACKAGES = ("core", "reviews", "guards", "verify", "wiki")
+
+
+def check_entry(path, kind, *, sticky=False, label="path"):
+    info = path.lstat()
+    protected = sticky and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if (not kind(info.st_mode) or info.st_uid not in (0, os.getuid())
+            or (info.st_mode & 0o022 and not protected)
+            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
+        raise SystemExit(f"untrusted kit {label}: {path}")
+    return info.st_mode
+
+
+def trusted(path):
+    if path.anchor != "/" or ".." in path.parts:
+        raise SystemExit(f"untrusted kit path: {path}")
+    for parent in reversed(path.parents):
+        check_entry(parent, stat.S_ISDIR, sticky=True)
+    check_entry(path, stat.S_ISDIR)
+
+
+def trusted_tree(root):
+    trusted(root)
+    pending = [root]
+    def regular_or_directory(mode):
+        return stat.S_ISREG(mode) or stat.S_ISDIR(mode)
+
+    while pending:
+        for entry in pending.pop().iterdir():
+            mode = check_entry(entry, regular_or_directory, label="file")
+            if stat.S_ISDIR(mode):
+                pending.append(entry)
+
+
+def trusted_launcher():
+    path = Path(__file__).absolute()
+    trusted(path.parent)
+    check_entry(path, stat.S_ISREG)
+    return path
+
+
+def run_kit(root, module, *, source=False):
+    trusted(root)
+    top = module.partition(".")[0]
+    packages = SOURCE_PACKAGES if source and top in SOURCE_PACKAGES else (top,)
+    for name in packages:
+        if not name.isidentifier():
+            raise SystemExit(f"invalid kit package: {name}")
+        if name in sys.modules:
+            raise SystemExit(f"kit package name is already loaded: {name}")
+        package = root / name
+        trusted_tree(package)
+        check_entry(package / "__init__.py", stat.S_ISREG, label="file")
+
+    # Expose only the validated package directories. The checkout or install
+    # root can hold unrelated files with names matching Python dependencies.
+    class KitPackages:
+        @staticmethod
+        def find_spec(fullname, path, target=None):
+            if path is None and fullname in packages:
+                return importlib.util.spec_from_file_location(fullname, root / fullname / "__init__.py")
+            return None
+
+    # Keep the validated tree intact even if the caller has a permissive umask.
+    sys.dont_write_bytecode = True
+    sys.meta_path.insert(0, KitPackages)
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+
+
+def agent_sec():
+    package = trusted_launcher().parents[1]
+    sys.argv[1:1] = ["agent-sec", "scan"]
+    if (package / "project.toml").is_file():
+        run_kit(package, "guards", source=True)
+    else:
+        run_kit(package.parent, f"{package.name}.guards")
+
+
+if __name__ == "__main__" and not globals().get("_kit_embedded"):
+    agent_sec()

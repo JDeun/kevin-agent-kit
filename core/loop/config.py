@@ -105,6 +105,8 @@ def validate_evidence(policy, checks):
 
 def policy_id(raw, execution, keys):
     code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
+    code += sorted((PACKAGE_ROOT / "core/agents").glob("*.py"))
+    code += sorted((PACKAGE_ROOT / "core").glob("*.py"))
     lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
     prompts = PACKAGE_ROOT / "reviews/persona/prompts.py"
     rules = sorted((ROOT / "rules").glob("*.md"))
@@ -161,13 +163,19 @@ def config(path=None, *, control_only=False):
             raise ValueError(f"{key} must be a positive integer")
     for key in ("reviewer", "review_observer", "worker", "repair_paths", "models"):
         strings(data[key], key)
-    for key in ("checks", "lens_reviewers"):
+    for key in ("checks", "check_commands", "lens_reviewers"):
         if not isinstance(data[key], dict):
             raise ValueError(f"{key} must be a table of named argv arrays")
         for name, command in data[key].items():
             if not NAME.fullmatch(name) or not strings(command, name):
                 raise ValueError(f"invalid {key} name or command")
     local = data["trust"] == "local"
+    if data["review_format"] not in ("receipt", "verdict"):
+        raise ValueError("review_format must be receipt or verdict")
+    if local and data["check_commands"]:
+        raise ValueError("configure local commands under checks")
+    if not local and data["checks"].keys() != data["check_commands"].keys():
+        raise ValueError("each signed check needs a matching direct command in check_commands")
     if not local and (not isinstance(data["check_keys"], dict) or data["checks"].keys() != data["check_keys"].keys()):
         raise ValueError("each required check needs an approved public key")
     if local and (data["check_keys"] or data["review_key"] or data["review_observer"] or data["evidence"]):
@@ -210,12 +218,6 @@ def config(path=None, *, control_only=False):
 
     forbidden = (repo, common, state.resolve())
     execution = execution_policy(data["execution"], forbidden=forbidden)
-    if not local and execution["isolation"] == "none":
-        raise ValueError('isolation = "none" is only valid with trust = "local"; signed evidence '
-                         "needs the sandbox")
-    if local and execution["isolation"] != "none":
-        raise ValueError('trust = "local" runs adapters directly; also set isolation = "none" under '
-                         "[loop.execution] to acknowledge that they are not isolated")
     review_key = b"" if data["review_key"] == "" else public_key(outside_path(data["review_key"], forbidden))
     check_keys = {name: public_key(outside_path(key, forbidden)) for name, key in data["check_keys"].items()}
     if review_key and review_key in check_keys.values():
@@ -225,12 +227,12 @@ def config(path=None, *, control_only=False):
     review_tools = []
     adapters = [data["reviewer"], *data["lens_reviewers"].values(), data["review_observer"]]
     for argv in adapters:
-        if argv and not local:
+        if argv:
             tools = command_tools(argv, execution)
             tool = tools.get(argv[0].removeprefix("/tools/"))
             if not argv[0].startswith("/tools/") or not tool or not tool.executable:
                 raise ValueError("review commands need an executable registered under /tools")
-            if any(tool.inode == other.inode or tool.digest == other.digest for other in review_tools):
+            if not local and any(tool.inode == other.inode or tool.digest == other.digest for other in review_tools):
                 raise ValueError("each lens and the review observer need distinct review adapters")
             review_tools.append(tool)
     for argv in data["checks"].values():
@@ -242,6 +244,8 @@ def config(path=None, *, control_only=False):
             raise ValueError("check commands need an executable registered under /tools")
         if any(tool.inode == other.inode or tool.digest == other.digest for other in review_tools):
             raise ValueError("check and review adapters must be separate")
+    for argv in (data["checks"] if local else data["check_commands"]).values():
+        command_tools(argv, execution)
     command_tools(data["worker"], execution)
     data.update(
         repo=repo, state=state, repo_id=identity, profile=path, execution=execution, memory=memory,

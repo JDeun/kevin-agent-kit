@@ -11,13 +11,14 @@ import tempfile
 import time
 from uuid import uuid4
 
+from ..verdict import salvage
 from .config import config, repo_id
 from .design import DESIGN_LENSES, approval_matches, document, validate_document, wiki_landed
 from .evidence import canonical, signed_receipt, source_id
 from .git import Conflict, Git, MergeFailure
 from .review import BLOCKING, brief, lenses, observed_review, prompt, review_receipt, verified_check
 from .runtime import Cancelled, CommandFailed, MemoryGate, Retry, private_dir
-from .sandbox import execute, redact
+from .sandbox import execute
 from .store import SHA, now
 
 
@@ -82,6 +83,14 @@ def candidate_bundle(git, root, evidence, scope):
     }
 
 
+def retain_design_findings(previous, findings):
+    retained = {item["id"]: item for item in previous}
+    for item in findings:
+        if item["risk"] in BLOCKING:
+            retained.setdefault(item["id"], item)
+    return list(retained.values())
+
+
 class Engine:
     def __init__(self, cfg, store, cancel=None, *, runner=execute, authenticate=signed_receipt):
         self.cfg = cfg
@@ -116,7 +125,7 @@ class Engine:
 
     def command(self, role, argv, work, evidence, *, stdin, bundle=None):
         self.authority(evidence)
-        limit = self.cfg["memory"]["test" if role == "verify" else "review"]
+        limit = self.cfg["memory"]["test" if role in {"check", "verify"} else "review"]
         if not self.memory.allows(limit["max_anon_mib"] * 2**20, limit["min_available_mib"] * 2**20):
             raise Retry("stage memory limit")
         extra = {
@@ -151,18 +160,25 @@ class Engine:
         return list(self.runs.get(evidence["run"], []))
 
     def review_result(self, argv, work, evidence, request, previous=(), prior_round=()):
-        output = self.command("reviewer", argv, work, evidence, stdin=prompt(request, previous, prior_round))
-        review = review_receipt(output, request, previous)
-        env_names = self.cfg["execution"].get("env", {}).get("reviewer", [])
-        review["tool_version"] = redact(review["tool_version"], env_names)
-        review["resolved"] = {key: redact(value, env_names) for key, value in review["resolved"].items()}
-        for item in review["findings"]:
-            item["detail"] = redact(item["detail"], env_names)
-            if "finding_class" in item and redact(item["finding_class"], env_names) != item["finding_class"]:
-                raise ValueError("finding_class contains a protected value")
-        return review
+        model_verdict = self.cfg.get("review_format") == "verdict"
+        try:
+            output = self.command("reviewer", argv, work, evidence,
+                                  stdin=prompt(request, previous, prior_round, model_verdict=model_verdict))
+        except (ValueError, Retry) as error:
+            error.salvaged = salvage(getattr(error, "output", ""))
+            raise
+        if model_verdict:
+            from ..agents import review_verdict
+
+            tool = self.cfg["execution"]["tools"][argv[0].removeprefix("/tools/")]
+            output = json.dumps(review_verdict(output, request, f"{tool.path.name}@{tool.digest}"))
+        return review_receipt(output, request, previous)
 
     def design_review(self, branch, head, path):
+        with self.store.design_lock(branch):
+            return self._design_review(branch, head, path)
+
+    def _design_review(self, branch, head, path):
         base = self.git.head(self.cfg["target"])
         if not base or branch == self.cfg["target"] or not SHA.fullmatch(head) or self.git.head(branch) != head:
             raise ValueError("design-review requires the exact current SHA of a distinct source branch")
@@ -177,27 +193,42 @@ class Engine:
             raise ValueError("a branch hold requires a new design commit")
         blob = document(self.git, head, path)
         validate_document(self.git, blob)
-        adapters = self.cfg["lens_reviewers"]
-        if not all(adapters.get(lens) for lens in DESIGN_LENSES):
-            raise ValueError("configure distinct architect and sre review adapters in the trusted profile")
         evidence = {
             "repo_id": self.cfg["repo_id"], "target": self.cfg["target"], "base": base, "head": head,
             "branch": branch, "candidate": head, "policy": self.cfg["policy_id"], "run": uuid4().hex,
             "design_blob": blob,
         }
-        reviews = []
+        protected = self.store.design_protected(branch)
+        report = {**evidence, "path": path, "blob": blob, "forest_job": forest["id"] if forest else None,
+                  "reviews": [], "open_protected": protected, "status": "incomplete"}
+        self.store.save_design(report)
+        adapters = self.cfg["lens_reviewers"]
+        if not all(adapters.get(lens) for lens in DESIGN_LENSES):
+            raise ValueError("configure distinct architect and sre review adapters in the trusted profile")
         with self.git.snapshot(self.cfg["state"], base, head) as (git, _):
             git.run("checkout", "--quiet", "--detach", head)
             for lens in DESIGN_LENSES:
                 request = {**evidence, "kind": "design-review", "paths": [path], "lens": lens,
                            "invocation": uuid4().hex}
-                reviews.append(self.review_result(adapters[lens], git.repo, evidence, request))
+                previous = protected.get(lens, [])
+                try:
+                    review = self.review_result(adapters[lens], git.repo, evidence, request, previous)
+                except (ValueError, Retry) as error:
+                    if getattr(error, "salvaged", None):
+                        report["rejected_request"] = request
+                        protected[lens] = retain_design_findings(previous, error.salvaged)
+                        self.store.save_design(report)
+                    raise
+                report["reviews"].append(review)
+                protected[lens] = retain_design_findings(previous, review["findings"])
+                self.store.save_design(report)
         self.authority(evidence)
-        report = {
-            **evidence, "path": path, "blob": blob, "reviews": reviews, "reviewed_at": now(),
-            "forest_job": forest["id"] if forest else None,
-            "status": "changes-requested" if any(review["findings"] for review in reviews) else "approved",
-        }
+        # Commit closures only after both receipts and the branch authority check.
+        report["open_protected"] = {review["request"]["lens"]: [item for item in review["findings"]
+                                                                if item["risk"] in BLOCKING]
+                                    for review in report["reviews"]}
+        report["reviewed_at"] = now()
+        report["status"] = "changes-requested" if any(review["findings"] for review in report["reviews"]) else "approved"
         self.store.save_design(report)
         return report
 
@@ -334,19 +365,27 @@ class Engine:
                     raise InterruptedAttempt(cause, report) from cause
 
             receipts = []
+            tree = git.tree(evidence["candidate"])
             for name, argv in sorted(self.cfg["checks"].items()):
+                command = argv if local else self.cfg["check_commands"][name]
+                request = {**evidence, "tree": tree, "kind": "required-check", "check": name,
+                           "command": command, "invocation": uuid4().hex}
+                try:
+                    direct = self.direct_check(git, request)
+                except (OSError, ValueError, Retry) as cause:
+                    failed = {"request": request, "tree": tree, "check": name, "status": "failed",
+                              "source": "local-unsigned" if local else "coordinator",
+                              "exit_code": getattr(cause, "code", None)}
+                    raise InterruptedAttempt(cause, {**report, "checks": [*receipts, failed],
+                                                     "runs": self.trace(evidence)}) from cause
                 if local:
-                    try:
-                        receipts.append(self.local_check(name, argv, git, evidence))
-                    except (OSError, ValueError, Retry) as cause:
-                        failed = {"check": name, "status": "failed", "source": "local-unsigned",
-                                  "exit_code": getattr(cause, "code", None)}
-                        raise InterruptedAttempt(
-                            cause, {**report, "checks": [*receipts, failed], "runs": self.trace(evidence)}) from cause
+                    receipts.append({**direct, "source": "local-unsigned"})
                     continue
                 adapter = approvals["checks"][name]
                 staged, scope = packages[adapter["bundle"]]
-                request = {**evidence, **scope, "retention_seconds": adapter["retention_seconds"],
+                direct_run = {key: direct[key] for key in ("command", "execution_id", "exit_code", "output_sha256")}
+                request = {**evidence, **scope, "tree": direct["tree"], "direct_run": direct_run,
+                           "retention_seconds": adapter["retention_seconds"],
                            "kind": "required-check", "check": name, "invocation": uuid4().hex}
                 try:
                     output = self.command("verify", argv, None, evidence, bundle=staged,
@@ -357,7 +396,8 @@ class Engine:
                         "collected_at": now(), "source": source_id(key),
                     })
                 except (OSError, ValueError, Retry) as cause:
-                    raise InterruptedAttempt(cause, {**report, "checks": receipts}) from cause
+                    raise InterruptedAttempt(cause, {**report, "checks": receipts,
+                                                     "runs": self.trace(evidence)}) from cause
             if not receipts:
                 raise Conflict("configure mandatory checks before preparing candidates")
             self.authority(evidence)
@@ -376,28 +416,17 @@ class Engine:
                 "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
 
-    def local_check(self, name, argv, git, evidence):
-        """Run a required check directly in the candidate checkout and keep its exit code.
-
-        The result counts only if the checkout was exactly the candidate commit before the run
-        and the run left HEAD and the tracked files untouched, so the tree the check saw is the
-        tree the exported bundle carries.
-        """
+    def direct_check(self, git, request):
+        """Dispatch the command on its pinned input using the read-only check role."""
         started = time.monotonic()
-        candidate = evidence["candidate"]
-        request = {**evidence, "kind": "required-check", "check": name, "invocation": uuid4().hex}
-        try:
-            git.pristine(candidate)
-            output = self.command("verify", argv, git.repo, evidence, stdin=json.dumps({"request": request}))
-            git.unchanged(candidate)
-        except Conflict as error:
-            raise ValueError(f"required check {name} did not run on the exact candidate: {error}") from error
+        with git.check_tree(request["tree"]) as work:
+            output = self.command("check", request["command"], work, request, stdin=json.dumps({"request": request}))
         return {
-            "request": request, "tree": git.tree(candidate), "check": name, "status": "passed", "executed": True, "exit_code": 0,
+            "request": request, "tree": request["tree"], "check": request["check"], "command": request["command"],
+            "status": "passed", "executed": True, "exit_code": 0,
             "duration_seconds": round(time.monotonic() - started, 3),
             "output_sha256": hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest(),
-            "tool_version": "local", "execution_id": uuid4().hex, "collected_at": now(),
-            "source": "local-unsigned",
+            "tool_version": "local", "execution_id": request["invocation"], "collected_at": now(),
         }
 
     def collect(self, job, future):

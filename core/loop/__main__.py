@@ -53,6 +53,10 @@ import sys
 assert "Use the expected text." in sys.stdin.read()
 Path("example.txt").write_text("correct" + chr(10))
 """
+    check = """
+from pathlib import Path
+assert Path("example.txt").read_bytes() == b"correct\\n"
+"""
     def demo_runner(argv, cwd, cancel, timeout, *, role, stdin, extra, bundle, **_):
         if role in {"verify", "review-observer"}:
             request = json.loads(stdin)["request"]
@@ -63,6 +67,7 @@ Path("example.txt").write_text("correct" + chr(10))
                 sha = request["candidate"]
                 result = dict(request=request, tool_version="demo", execution_id=request["invocation"])
                 if role == "verify":
+                    assert checked.tree(sha) == request["tree"] and request["direct_run"]["exit_code"] == 0
                     assert checked.run("show", f"{sha}:example.txt").stdout.strip() == "correct"
                     return json.dumps(dict(result, status="passed", executed=True))
                 paths = sorted(checked.paths(request["base"], sha))
@@ -81,6 +86,7 @@ Path("example.txt").write_text("correct" + chr(10))
                   "checks": {"example": {"bundle": "incremental", "retention_seconds": 0}}},
         worker=[sys.executable, "-I", "-c", worker], worker_model="demo",
         checks={"example": ["check-fixture"]}, repair_paths=["example.txt"],
+        check_commands={"example": [sys.executable, "-I", "-c", check]},
         lenses={}, lens_reviewers={"security": review_command}, execution={}, max_jobs=1, max_rounds=3, timeout_seconds=10,
         evidence_ttl_seconds=60, retry_limit=1, retry_initial_seconds=1, retry_max_seconds=1,
         design_gate=False, repeat_class_rounds=2, wiki_landing=False, wiki_dir="docs/research",
@@ -114,8 +120,6 @@ Path("example.txt").write_text("correct" + chr(10))
 
 def doctor(profile):
     """Diagnose this machine before a profile or a daemon exists. Never raises."""
-    from ..agents import CLIS, version
-
     from .sandbox import ISOLATION_HELP, isolation_status
 
     checks, advice = [], []
@@ -126,31 +130,27 @@ def doctor(profile):
     add("python", sys.version_info >= (3, 11), sys.version.split()[0])
     git = shutil.which("git")
     add("git", git, git or "git is not on PATH")
-    isolation = "bwrap"
     trust = "signed"
     try:
         cfg = config(profile)
-        isolation = cfg["execution"]["isolation"]
         trust = cfg["trust"]
-        add("profile", True, f"valid; trust={trust}, isolation={isolation}")
+        add("profile", True, f"valid; trust={trust}, isolation=bwrap")
         add("reviewer and checks", bool(cfg["reviewer"] and cfg["checks"]),
             "configured" if cfg["reviewer"] and cfg["checks"] else "set reviewer and [loop.checks]")
     except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
-        add("profile", False, f"not usable yet: {str(error)[:200]}", required=False)
-        advice.append("create one with `init` (or `init --agent codex|claude` for real CLIs, no signing)")
+        add("profile", False, f"not usable yet: {str(error)[:200]}",
+            required=profile is not None or not isinstance(error, FileNotFoundError))
+        advice.append("configure a trusted profile and register its broker clients before starting the loop")
     available, detail = isolation_status()
-    add("bubblewrap isolation", available, detail, required=isolation == "bwrap")
+    add("bubblewrap isolation", available, detail)
     if not available:
         advice.append(ISOLATION_HELP)
     if trust == "signed":
         from .evidence import OPENSSL
 
         add("openssl", os.access(OPENSSL, os.X_OK), str(OPENSSL))
-    for cli in CLIS:
-        found = version(cli)
-        add(f"{cli} cli", found, found or "not installed", required=False)
     ok = all(item["ok"] for item in checks if item["required"])
-    mode = ("isolated" if isolation == "bwrap" else "unisolated") + f"/{trust}-evidence"
+    mode = f"isolated/{trust}-evidence"
     return {"ok": ok, "mode": mode, "checks": checks, "advice": advice}
 
 
@@ -164,7 +164,6 @@ def main(argv=None):
         "fitness": "guards.fitness",
         "wiki": "wiki",
         "screenshot": "verify.screenshot",
-        "agent": "core.agents",
     }
     if argv and argv[0] in modules:
         command = module_command(ROOT, MODULE_PREFIX + modules[argv[0]], *argv[1:])
@@ -181,7 +180,7 @@ def main(argv=None):
     setup.add_argument("--dry-run", action="store_true")
     setup.add_argument("--uninstall", action="store_true")
     setup.add_argument("--agent", choices=("codex", "claude"),
-                       help="draft a working unisolated, local-trust profile for that agent CLI")
+                       help="draft an isolated unsigned profile for an operator-provided model broker client")
     setup.add_argument("--adopt-rules-sha256", action="append", default=[], metavar="SHA256",
                        help="approve the exact bytes of a reviewed legacy global rules block")
     enqueue = commands.add_parser("enqueue")

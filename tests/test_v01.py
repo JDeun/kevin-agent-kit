@@ -103,12 +103,10 @@ def test_role_environment_is_deny_by_default(monkeypatch):
     monkeypatch.setenv("SSH_AUTH_SOCK", "/a/socket")
     monkeypatch.setenv("PYTHONPATH", "/a/project")
     monkeypatch.setenv("HOME", "/actual/home")
-    assert environment([])["HOME"] == "/home/agent"
-    assert not {"KEVIN_TEST_TOKEN", "SSH_AUTH_SOCK", "PYTHONPATH"} & environment([]).keys()
-    assert environment(["KEVIN_TEST_TOKEN"])["KEVIN_TEST_TOKEN"] == "present"
-    for name in ("HOME", "AGENT_HEAD", "PYTHONPATH", "SSH_AUTH_SOCK"):
-        with pytest.raises(ValueError):
-            environment([name])
+    assert environment()["HOME"] == "/home/agent"
+    assert not {"KEVIN_TEST_TOKEN", "SSH_AUTH_SOCK", "PYTHONPATH"} & environment().keys()
+    with pytest.raises(ValueError, match="coordinator environment"):
+        environment({"HOME": "/host"})
 
 
 def test_review_requires_complete_coverage_and_explicit_protected_resolution():
@@ -132,11 +130,11 @@ def test_review_requires_complete_coverage_and_explicit_protected_resolution():
 def test_verification_requires_fresh_executed_check_receipt():
     from core.loop.review import verified_check
 
-    request = {"check": "required", "candidate": "current", "run": "fresh"}
+    request = {"check": "required", "candidate": "current", "run": "fresh", "exit_code": 0}
     good = dict(request=request, status="passed", executed=True, tool_version="fixture-1", execution_id="run-1")
     assert verified_check(good, request)["executed"]
     for bad in ({}, {**good, "executed": False}, {**good, "execution_id": ""},
-                {**good, "request": {**request, "run": "previous"}}):
+                {**good, "request": {**request, "run": "previous"}}, {**good, "request": {**request, "exit_code": False}}):
         with pytest.raises(ValueError):
             verified_check(bad, request)
 
@@ -151,7 +149,7 @@ def test_sandbox_has_no_host_home_mount_or_verify_credentials(tmp_path, monkeypa
     private.mkdir()
     monkeypatch.setenv("HOME", str(private))
     monkeypatch.setenv("KEVIN_TEST_TOKEN", "fixture")
-    policy = execution_policy({"env": {"reviewer": ["KEVIN_TEST_TOKEN"]}})
+    policy = execution_policy({})
     review, reviewer_env = command_line(["python3"], workspace, "reviewer", policy)
     worker, worker_env = command_line(["python3"], workspace, "worker", policy)
     verify, verify_env = command_line(["python3"], None, "verify", policy, bundle=tmp_path / "candidate.bundle")
@@ -164,10 +162,10 @@ def test_sandbox_has_no_host_home_mount_or_verify_credentials(tmp_path, monkeypa
     assert verify[verify.index("/candidate.bundle") - 2] == "--ro-bind"
     assert "--unshare-all" in verify and "--share-net" not in verify
     assert all(str(private) not in args for args in (review, worker, verify))
-    assert reviewer_env["KEVIN_TEST_TOKEN"] == "fixture"
+    assert "KEVIN_TEST_TOKEN" not in reviewer_env
     assert "KEVIN_TEST_TOKEN" not in worker_env and "KEVIN_TEST_TOKEN" not in verify_env
     assert not any("AGENT_QUEUE" in env for env in (reviewer_env, worker_env, verify_env))
-    with pytest.raises(ValueError, match="limited to agent"):
+    with pytest.raises(ValueError, match="broker"):
         execution_policy({"env": {"verify": ["KEVIN_TEST_TOKEN"]}})
 
 

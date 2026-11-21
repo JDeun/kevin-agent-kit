@@ -116,19 +116,10 @@ def ensure_state(state):
     return private_dir(state)
 
 
-UNISOLATED_WARNING = (
-    "WARNING: isolation = none. Reviewer, worker and check commands run with the files, network "
-    "and credentials of this account. Use a disposable host or container as the boundary."
-)
-
-
 def validate_execution(cfg):
     if not cfg["reviewer"] or not cfg["checks"]:
         raise ValueError("configure a reviewer and required checks in the trusted profile")
-    if cfg.get("execution", {}).get("isolation") == "none":
-        print(UNISOLATED_WARNING, file=sys.stderr)
-    else:
-        probe()
+    probe()
     if cfg.get("trust") == "local":
         if not cfg["lens_reviewers"].get("security"):
             raise ValueError("configure a security reviewer (it may reuse the reviewer command)")

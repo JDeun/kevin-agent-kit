@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,7 +74,7 @@ def queue(tmp_path, monkeypatch):
     cfg.update(profile=None, design_gate=False, reviewer=["review-fixture"], worker=["worker-fixture"],
                lens_reviewers={"security": ["security-fixture"]}, review_observer=["observe-fixture"],
                review_key=b"review-source", checks={"required": ["verify-fixture"]},
-               check_keys={"required": b"check-source"},
+               check_commands={"required": ["unit-fixture"]}, check_keys={"required": b"check-source"},
                evidence={"observer": {"bundle": "incremental", "retention_seconds": 0},
                          "checks": {"required": {"bundle": "incremental", "retention_seconds": 0}}},
                max_rounds=2, repair_paths=["file.txt"],
@@ -113,15 +114,21 @@ def review_response(stdin, findings=(), resolved=None):
 def clean_run(argv, cwd, cancel, timeout, *, role, stdin, bundle=None, **_):
     if role == "reviewer":
         return review_response(stdin)
+    if role == "check":
+        assert bundle is None and cwd.is_dir() and not (cwd / ".git").exists()
+        assert argv == ["unit-fixture"] and json.loads(stdin)["request"]["tree"]
+        return "unit output"
     assert cwd is None and bundle.is_file()
     data = json.loads(stdin)
     request = data["request"]
     payload = dict(request=request, execution_id="fixture-run", tool_version="fixture")
     if role == "verify":
         assert set(data) == {"request"}
+        assert request["tree"] and request["direct_run"]["exit_code"] == 0
+        assert request["direct_run"]["command"] == ["unit-fixture"]
+        assert request["direct_run"]["output_sha256"] == hashlib.sha256(b"unit output").hexdigest()
         return json.dumps(dict(payload, status="passed", executed=True))
     assert role == "review-observer"
-    import hashlib
     from core.loop.evidence import canonical
 
     review_input = {key: data[key] for key in ("review", "prior_protected")}
@@ -168,7 +175,7 @@ def test_evidence_uses_each_adapters_approved_scope(queue, tmp_path):
     saw = set()
 
     def inspect(argv, cwd, cancel, timeout, *, role, stdin, bundle=None, **kwargs):
-        if role != "reviewer" and role not in saw:
+        if role in {"review-observer", "verify"} and role not in saw:
             request = json.loads(stdin)["request"]
             assert request["bundle_sha256"] == hashlib.sha256(bundle.read_bytes()).hexdigest()
             isolated = tmp_path / role
@@ -356,6 +363,32 @@ def test_plain_exit_zero_cannot_verify_candidate(queue):
     assert not (cfg["state"] / "candidates").exists()
 
 
+@pytest.mark.parametrize("trust", ["signed", "local"])
+def test_direct_check_failure_records_pinned_input_and_blocks_candidate(queue, trust):
+    from core.loop.runtime import CommandFailed
+
+    git, cfg = queue
+    cfg["trust"] = trust
+    if trust == "local":
+        cfg["checks"] = {"required": ["unit-fixture"]}
+    direct_requests = []
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        if role == "check":
+            direct_requests.append(json.loads(stdin)["request"])
+            raise CommandFailed(23)
+        assert role != "verify"
+        return clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
+
+    job = engine_run(cfg, "feature", git.head("feature"), runner)["jobs"][0]
+    assert job["phase"] == "blocked"
+    failed = job["evidence"]["checks"][-1]
+    assert failed["status"] == "failed" and failed["exit_code"] == 23
+    assert [failed["request"]] == direct_requests
+    assert failed["request"]["tree"] == git.tree("feature")
+    assert not (cfg["state"] / "candidates").exists()
+
+
 def test_primary_reviewer_cannot_close_protected_finding_on_its_own(queue):
     git, cfg = queue
     finding = {"id": "protected", "risk": "security", "detail": "Fixture protection"}
@@ -477,7 +510,8 @@ def test_restart_blocks_when_neither_observation_write_can_commit(queue, monkeyp
                 reopened.retry(1)
 
 
-@pytest.mark.parametrize("result", ["valid", "unsigned", "wrong-source", "wrong-candidate", "wrong-coverage"])
+@pytest.mark.parametrize("result", ["valid", "unsigned", "wrong-source", "wrong-candidate", "wrong-coverage",
+                                    "wrong-tree", "wrong-direct-run"])
 def test_live_signature_gate_for_required_checks(queue, tmp_path, result):
     import base64
     from core.loop.evidence import canonical, public_key, signed_receipt
@@ -493,12 +527,16 @@ def test_live_signature_gate_for_required_checks(queue, tmp_path, result):
 
     def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
         output = clean_run(argv, cwd, cancel, timeout, role=role, stdin=stdin, **kwargs)
-        if role == "reviewer" or role == "verify" and result == "unsigned":
+        if role in {"reviewer", "check"} or role == "verify" and result == "unsigned":
             return output
         payload = json.loads(output)
         key = keys["check"][0] if role == "verify" and result != "wrong-source" else keys["review"][0]
         if role == "verify" and result == "wrong-candidate":
             payload["request"]["candidate"] = payload["request"]["base"]
+        if role == "verify" and result == "wrong-tree":
+            payload["request"]["tree"] = "0" * 40
+        if role == "verify" and result == "wrong-direct-run":
+            payload["request"]["direct_run"]["output_sha256"] = "0" * 64
         if role == "review-observer" and result == "wrong-coverage":
             payload["coverage_sha256"] = "0" * 64
         message = tmp_path / "message"
@@ -783,3 +821,75 @@ def test_research_task_needs_a_wiki_synthesis_page_to_land(queue, case, phase):
     assert result["counts"] == {phase: 1}
     if phase == "wiki-needed":
         assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["offline", "partial", "concurrent", "legacy"])
+def test_design_retry_keeps_protected_findings_and_invalidates_previous_approval(queue, failure):
+    git, cfg = queue
+    cfg["lens_reviewers"].update(architect=["architect-fixture"], sre=["sre-fixture"])
+    git.run("switch", "-c", "planned", "main")
+    design = git.repo / "design.md"
+    design.write_text("\n".join(f"## {title}\nFixture content." for title in (
+        "Canonical design", "Failure modes and rollback", "Latency budget", "Memory budget", "Test plan")))
+    git.run("add", design.name)
+    git.run("commit", "-m", "propose design")
+    sha = git.head("planned")
+    finding = {"id": "scope", "risk": "safety", "detail": "Clarify the affected files."}
+    mode = "clean"
+    seen = {}
+
+    def runner(argv, cwd, cancel, timeout, *, role, stdin, **kwargs):
+        nonlocal mode
+        data = json.loads(stdin.splitlines()[-1])
+        lens = data["request"]["lens"]
+        seen[lens] = data["prior_protected"]
+        if mode == "concurrent":
+            mode = "clean"
+            with pytest.raises(ValueError, match="already running"):
+                review()
+        if mode == "partial" and lens == "sre":
+            partial = json.loads(review_response(stdin, [finding]))
+            return json.dumps({**partial, "status": "partial"})
+        if mode == "legacy" and lens == "sre":
+            return review_response(stdin, [finding])
+        if mode == "resolve" and lens == "sre":
+            return review_response(stdin, resolved={"scope": "The revised scope names the affected files."})
+        if mode == "offline":
+            raise OSError("Fixture reviewer unavailable")
+        return review_response(stdin)
+
+    def review():
+        with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+            with Engine(cfg, store, runner=runner) as engine:
+                return engine.design_review("planned", sha, design.name)
+
+    assert review()["status"] == "approved"
+    mode = failure
+    if mode == "legacy":
+        legacy = review()
+        assert legacy["status"] == "changes-requested"
+        legacy.pop("open_protected", None)
+        with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+            store.save_design(legacy)
+    if failure == "concurrent":
+        assert review()["status"] == "approved"
+        return
+    if failure != "legacy":
+        with pytest.raises(OSError if failure == "offline" else ValueError):
+            review()
+    with Store(cfg["state"], cfg["repo_id"], cfg["target"]).connect() as store:
+        assert store.design("planned")["status"] != "approved"
+    if failure == "offline":
+        return
+    mode = "clean"
+    with pytest.raises(ValueError, match="explicit resolution"):
+        review()
+    assert seen == {"architect": [], "sre": [finding]}
+    design.write_text(design.read_text() + "\nRevised scope.\n")
+    git.run("commit", "-am", "revise design scope")
+    sha = git.head("planned")
+    mode = "resolve"
+    result = review()
+    assert result["status"] == "approved" and result["head"] == sha
+    assert seen == {"architect": [], "sre": [finding]}
+    assert result["reviews"][1]["resolved"] == {"scope": "The revised scope names the affected files."}

@@ -11,8 +11,13 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from core.loop.config import NAME, project
+from core.loop.bootstrap import EMBEDDED, SOURCE
 
-RUNTIME = ("core", "reviews", "guards", "verify", "wiki")
+bootstrap = {"__name__": "kit_bootstrap"}
+exec(SOURCE, bootstrap)
+trusted = bootstrap["trusted"]
+trusted_tree = bootstrap["trusted_tree"]
+RUNTIME = bootstrap["SOURCE_PACKAGES"]
 DOCUMENTS = ("reviews/persona/README.md", "verify/README.md")
 ENTRIES = (
     "project.toml", "LICENSE", "README.md", "CHANGELOG.md", "AGENTS.md", "docs", "agents",
@@ -65,44 +70,12 @@ def tracked_inputs(dirty=False):
         yield relative, entry in RUNTIME, mode
 
 
-# The same check runs at install time here and at every launch inside the launcher.
-TRUST_CHECK = """\
-def trusted(path):
-    import os, stat
-    uid = os.getuid()
-    for entry in (path, *path.parents):
-        info = entry.lstat()
-        sticky = bool(info.st_mode & stat.S_ISVTX) and entry != path
-        if info.st_uid not in (0, uid) or (info.st_mode & 0o022 and not sticky):
-            raise SystemExit(f"untrusted kit path (owner or write access): {entry}")
-
-
-def trusted_tree(root):
-    import os, stat
-    uid = os.getuid()
-    for base, dirs, files in os.walk(root):
-        for name in (*dirs, *files):
-            info = os.lstat(os.path.join(base, name))
-            if stat.S_ISLNK(info.st_mode) or info.st_uid not in (0, uid) or info.st_mode & 0o022:
-                raise SystemExit(f"untrusted kit file (symlink, owner or write access): {os.path.join(base, name)}")
-"""
-exec(TRUST_CHECK)
-
-
 def write_launcher(command, module, relative_root):
     command.write_text(
         "#!/usr/bin/python3 -I\n"
-        "from pathlib import Path\n"
-        "import runpy\n"
-        "import sys\n\n"
-        f"{TRUST_CHECK}\n"
-        f"root = (Path(__file__).resolve().parents[1] / {relative_root!r}).resolve()\n"
-        "trusted(root)\n"
-        f"trusted_tree(root / {module!r})\n"
-        f"if not (root / {module!r} / '__init__.py').is_file():\n"
-        "    raise SystemExit(f'kit package is missing from {root}')\n"
-        "sys.path.insert(0, str(root))\n"
-        f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)\n",
+        f"{EMBEDDED}\n"
+        f"root = trusted_launcher().parents[1] / {relative_root!r}\n"
+        f"run_kit(root, {module!r})\n",
         encoding="utf-8",
     )
     command.chmod(0o755)

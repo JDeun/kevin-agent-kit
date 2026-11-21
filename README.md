@@ -5,13 +5,10 @@ bundle. The kit never merges: the repository owner applies the candidate.
 
 > one human holds the decision gate; an agent fleet does the rest
 
-> **Status: experimental (v0.3.2).** Expect rough edges; do not rely on it as a security boundary yet.
-> - Local trust mode (`init --agent`) is unisolated and unsigned: model CLIs and required checks run with
->   your account's files and network, and candidate rules or text can influence a reviewer. Use a
->   disposable host and only trusted candidates.
-> - The isolated, signed mode needs Linux Bubblewrap and external brokers that are not verified here;
->   a CI job defined inside the repository it checks is advisory, not a gate.
-> - Real-model checks covered the Codex CLI in local mode only; see [known issues](docs/known-issues.md).
+> **Experimental v0.3.3.** Live reviews, repairs and checks require working Linux
+> Bubblewrap namespaces. Model credentials stay in an operator-run broker. Each
+> required check receives a fresh read-only tree pinned to the candidate commit.
+> The fixture demo runs on machines without Bubblewrap. See [known issues](docs/known-issues.md).
 
 [한국어](docs/ko/README.md) · [Repository](https://github.com/JDeun/kevin-agent-kit.git)
 
@@ -25,10 +22,8 @@ issues in isolated worktrees, and gathers verification evidence.
 
 Install Git and Python 3.11 or later at `/usr/bin/python3` for the packaged CLI.
 The launcher uses isolated Python startup. Optional packages for installed
-commands must be available to the system interpreter. The isolated, signed-evidence loop also
-needs OpenSSL and Linux with working unprivileged Bubblewrap namespaces; run
-`kevin-agent-kit doctor` first to learn whether this machine has them. Without Bubblewrap
-(many containers), use the unisolated real-CLI mode in step 2. Use a trusted checkout of this
+commands must be available to the system interpreter. Run `kevin-agent-kit doctor` to
+check namespace support. Signed evidence also requires OpenSSL. Use a trusted checkout of this
 kit. The installer defaults to `~/.local` and refuses a prefix, `bin` or `share` that another
 account can write or that is a symlink.
 
@@ -78,13 +73,11 @@ for independent review and required checks. Approve each evidence adapter's
 bundle scope and retention in the profile.
 Repair is optional and needs both a worker command and an approved path scope.
 
-To drive the real `codex` or `claude` CLI as worker and reviewer without brokers or
-signing, run `kevin-agent-kit init --agent codex` (or `claude`). The generated profile sets
-`trust = "local"` and `isolation = "none"`: the CLIs run with this account's files, network
-and credentials, so use a disposable host or container. The kit then records each command's
-exit code and the reviewer's verdict, and runs your required checks itself, in the candidate
-checkout. That evidence is unsigned. Use the isolated, signed mode when you need independent
-attestation. `kevin-agent-kit doctor` shows which mode this machine supports.
+For unsigned evidence, `kevin-agent-kit init --agent codex` (or `claude`) drafts
+a profile for a broker client you supply. Register its executable and scoped socket,
+then review the detected check command. Both trust modes enforce the same sandbox.
+When upgrading, stop the old daemon and replace host-CLI profiles. Signed profiles
+also need a direct command for each attested check under `[loop.check_commands]`.
 
 The profile lives under `${XDG_CONFIG_HOME:-$HOME/.config}/kevin-agent-kit/profiles/`.
 See [profile and wrapper setup](docs/loop.md).
@@ -126,14 +119,12 @@ kevin-agent-kit init --global --uninstall
 The uninstall command removes the kit's intact, recorded blocks. To remove the Claude Code
 plugin, use `/plugin uninstall kevin-agent-kit@kevin-agent-kit`.
 
-From the kit checkout, use `python3 -m core.loop` in place of the installed
-command. Use `./scripts/build.sh` to produce a standalone artifact.
+For development in a trusted source checkout, run `python3 -m core.loop demo`. Use `./scripts/build.sh` to produce a standalone artifact.
 The build packages the committed `HEAD` tree and refuses a working tree that differs from it
 (`--allow-dirty` packages working-tree bytes for development). The installed launcher refuses to
 run from a directory another account can write. Scan the generated directory with the source.
 `./scripts/rename.sh NEW` changes the CLI and plugin names at build time.
-The Python module uses underscores, as in `python3 -m kevin_agent_kit` with
-the build directory on `PYTHONPATH`. See the [architecture](docs/architecture.md),
+Use the generated `bin/kevin-agent-kit` launcher for the packaged runtime. See the [architecture](docs/architecture.md),
 [hosting adapters](docs/hosting.md), and [known issues](docs/known-issues.md).
 
 - [Worker rules](agents/worker-rules.md) cover branch scope and resource ownership.

@@ -13,7 +13,7 @@ def test_personas_produce_artifacts_before_the_decision(tmp_path, monkeypatch, c
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
 
     def fixture_runner(argv, cwd, cancel, timeout, *, role, policy, stdin):
-        assert role == "persona" and policy["env"] == {}
+        assert role == "persona" and policy["isolation"] == "bwrap"
         return run(argv, cwd, cancel, timeout, prompt=stdin, env={"LANG": "C.UTF-8"})
 
     monkeypatch.setattr(persona, "execute", fixture_runner)

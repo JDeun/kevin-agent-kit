@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import stat
 
-from .config import ROOT, strings
+from .config import ROOT
 from .paths import directory, identity, private_temporary_directory, regular_at, trusted
 from .runtime import run
 
@@ -17,7 +17,6 @@ PUBLIC_FILES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/ld.so.cache")
 BWRAP = "/usr/bin/bwrap"
 ROLES = ("reviewer", "worker", "persona")
 EVIDENCE_ROLES = ("review-observer", "verify")
-NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 TOOL_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*\Z")
 
 
@@ -60,7 +59,7 @@ def socket_identity(path):
         return identity(info)
 
 
-def environment(allowed, extra=None):
+def environment(extra=None):
     env = {
         "PATH": "/tools:/usr/bin:/bin", "HOME": "/home/agent",
         "XDG_CONFIG_HOME": "/home/agent/.config", "XDG_STATE_HOME": "/home/agent/.local/state",
@@ -69,35 +68,29 @@ def environment(allowed, extra=None):
         "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0", "PYTHONNOUSERSITE": "1",
     }
-    for name in allowed:
-        if (not NAME.fullmatch(name) or name in env or name in {"SSH_AUTH_SOCK", "BASH_ENV", "ENV", "CDPATH"}
-                or name.startswith(("AGENT_", "LD_", "DYLD_", "PYTHON", "GIT_", "XDG_"))):
-            raise ValueError(f"reserved or invalid environment name: {name}")
-        if name in os.environ:
-            env[name] = os.environ[name]
+    if extra and any(name not in {"AGENT_BASE", "AGENT_HEAD", "AGENT_CANDIDATE", "AGENT_TARGET",
+                                  "AGENT_BRANCH", "AGENT_MODEL"} for name in extra):
+        raise ValueError("unknown coordinator environment field")
     env.update(extra or {})
     return env
 
 
 def execution_policy(settings, forbidden=()):
     if not isinstance(settings, dict) or settings.keys() - {"tools", "env", "sockets", "isolation"}:
-        raise ValueError("execution settings accept tools, env, sockets and isolation")
-    if settings.get("isolation", "bwrap") not in ("bwrap", "none"):
-        raise ValueError('isolation must be "bwrap" or "none"')
-    policy = {"tools": {}, "env": {}, "sockets": {}, "isolation": settings.get("isolation", "bwrap")}
+        raise ValueError("execution settings accept tools, sockets and Bubblewrap isolation")
+    if settings.get("isolation", "bwrap") != "bwrap":
+        raise ValueError("live execution requires Bubblewrap isolation")
+    if settings.get("env", {}) != {}:
+        raise ValueError("environment forwarding is disabled; keep credentials in a scoped broker")
+    policy = {"tools": {}, "sockets": {}, "isolation": "bwrap"}
     ambient = (*(Path(path) for path in (*SYSTEM_MOUNTS, *PUBLIC_FILES)), ROOT / "rules")
     forbidden = (*forbidden, *ambient)
-    if any(not isinstance(settings.get(section, {}), dict) for section in ("tools", "env", "sockets")):
-        raise ValueError("tools, env and sockets must be tables")
+    if any(not isinstance(settings.get(section, {}), dict) for section in ("tools", "sockets")):
+        raise ValueError("tools and sockets must be tables")
     for name, value in settings.get("tools", {}).items():
         if not TOOL_NAME.fullmatch(name):
             raise ValueError("invalid tool mount name")
         policy["tools"][name] = read_tool(outside_path(value, forbidden))
-    for role, names in settings.get("env", {}).items():
-        if role not in ROLES:
-            raise ValueError("credential forwarding is limited to agent roles")
-        policy["env"][role] = strings(names, role)
-        environment(names)
     for role, value in settings.get("sockets", {}).items():
         if role not in (*ROLES, *EVIDENCE_ROLES):
             raise ValueError("broker socket must name a sandbox role")
@@ -124,43 +117,17 @@ def command_tools(argv, policy):
     return selected
 
 
-def unisolated_command(argv, cwd, role, policy, extra, tools, bundle):
-    """Run without Bubblewrap. The command has this account's full file and network access."""
-    tools = tools or {}
-    mapped = []
-    for part in argv:
-        name = part.removeprefix("/tools/")
-        if part.startswith("/tools/"):
-            if name not in tools:
-                raise ValueError(f"unknown sandbox tool: {name}")
-            part = str(tools[name])
-        mapped.append(part)
-    env = {
-        "PATH": ":".join([*(str(path.parent) for path in list(tools.values())[:1]), os.environ.get("PATH", "/usr/bin:/bin")]),
-        "HOME": os.environ.get("HOME", "/"), "LANG": "C.UTF-8", "GIT_TERMINAL_PROMPT": "0",
-        "TERM": "dumb",
-    }
-    reserved = {"SSH_AUTH_SOCK", "BASH_ENV", "ENV", "CDPATH"}
-    for name in policy["env"].get(role, []):
-        if (not NAME.fullmatch(name) or name in reserved or name.startswith(("AGENT_", "LD_", "DYLD_"))):
-            raise ValueError(f"reserved or invalid environment name: {name}")
-        if name in os.environ:
-            env[name] = os.environ[name]
-    env.update(extra or {})
-    if cwd is not None:
-        env["AGENT_WORKSPACE"] = str(cwd)
-    if bundle is not None:
-        env["AGENT_CANDIDATE_BUNDLE"] = str(bundle)
-    return mapped, env
-
-
 def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None):
     if not argv:
         raise ValueError(f"configure the {role} command in the trusted profile")
-    if policy.get("isolation") == "none":
-        return unisolated_command(argv, cwd, role, policy, extra, tools, bundle)
-    forward = environment(policy["env"].get(role, []), extra)
-    cmd = [BWRAP, "--unshare-user", "--unshare-all", "--disable-userns", "--die-with-parent",
+    if policy.get("isolation") != "bwrap" or policy.get("env"):
+        raise ValueError("live execution requires Bubblewrap isolation and a clean environment")
+    if role not in (*ROLES, *EVIDENCE_ROLES, "check"):
+        raise ValueError("unknown sandbox role")
+    if role == "check" and (cwd is None or role in policy["sockets"]):
+        raise ValueError("required checks need a tree and cannot access a broker")
+    forward = environment(extra)
+    cmd = [BWRAP, "--unshare-user", "--unshare-all", "--disable-userns", "--die-with-parent", "--new-session",
            "--cap-drop", "ALL", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
            "--dir", "/home", "--tmpfs", "/home/agent", "--dir", "/tools"]
     for path in SYSTEM_MOUNTS:
@@ -205,20 +172,9 @@ def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None
     return [*cmd, "--", *argv], forward
 
 
-def redact(text, env_names):
-    for name in env_names:
-        value = os.environ.get(name, "")
-        if len(value) >= 8:
-            text = text.replace(value, "[redacted]")
-    return text
-
-
 ISOLATION_HELP = (
-    "Bubblewrap cannot create its mount namespace here (a container without user namespaces, or an "
-    "AppArmor or seccomp profile, usually causes this). Run the kit on a host or VM where "
-    "`bwrap --unshare-all --ro-bind / / true` works, or inside a container you accept as the isolation "
-    'boundary and set `isolation = "none"` under [loop.execution] with `trust = "local"` in the trusted '
-    "profile. That mode gives every adapter this account's files, network and credentials."
+    "Run the live loop on a Linux host with working Bubblewrap user and mount namespaces. "
+    "Use doctor to verify the boundary there."
 )
 
 
@@ -254,11 +210,5 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
                     raise ValueError(f"sandbox tool changed: {tool.path}")
             path.chmod(0o500 if tool.executable else 0o400)
             paths[name] = path
-        unisolated = policy.get("isolation") == "none"
-        if unisolated and role == "verify":
-            # Required checks never see the account's model credentials: they get an empty HOME.
-            home = temp / "home"
-            home.mkdir(mode=0o700)
-            extra = {**(extra or {}), "HOME": str(home)}
         cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle)
-        return run(cmd, str(cwd) if unisolated and cwd is not None else "/", cancel, timeout, prompt=stdin, env=env)
+        return run(cmd, "/", cancel, timeout, prompt=stdin, env=env, capture_failed_output=role == "reviewer")

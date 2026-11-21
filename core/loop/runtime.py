@@ -11,6 +11,9 @@ import sys
 import tempfile
 import time
 
+from .bootstrap import EMBEDDED
+from .config import MODULE_PREFIX
+
 
 class Busy(Exception):
     pass
@@ -32,30 +35,10 @@ class Cancelled(Exception):
     pass
 
 
-_RUN_MODULE = """\
-import os
-from pathlib import Path
-import runpy
-import stat
-import sys
-
-root, module = sys.argv[1:3]
-uid = os.getuid()
-for entry in (Path(root), *Path(root).parents):
-    info = entry.lstat()
-    sticky = bool(info.st_mode & stat.S_ISVTX) and str(entry) != root
-    if info.st_uid not in (0, uid) or (info.st_mode & 0o022 and not sticky):
-        raise SystemExit(f"untrusted kit path (owner or write access): {entry}")
-if not (Path(root) / module.partition(".")[0] / "__init__.py").is_file():
-    raise SystemExit(f"kit module is missing from {root}: {module}")
-sys.path.insert(0, root)
-del sys.argv[:2]
-runpy.run_module(module, run_name="__main__", alter_sys=True)
-"""
-
-
 def module_command(root, module, *args):
-    return [sys.executable, "-I", "-c", _RUN_MODULE, str(root), module, *args]
+    start = ("root, module = sys.argv[1:3]\ndel sys.argv[:2]\n"
+             f"run_kit(Path(root), module, source={not MODULE_PREFIX})\n")
+    return [sys.executable, "-I", "-c", EMBEDDED + start, str(root), module, *args]
 
 
 def private_dir(path):
@@ -134,11 +117,28 @@ while True:
 """
 
 
-def run(argv, cwd, cancel, timeout, *, prompt=None, env=None):
+OUTPUT_LIMIT = 1024 * 1024
+
+
+@contextmanager
+def failed_stdout(stream, capture):
+    try:
+        yield
+    except (ValueError, Retry) as error:
+        if capture:
+            stream.seek(0)
+            text = stream.read(OUTPUT_LIMIT).decode("utf-8", errors="surrogateescape")
+            # Literal NUL is illegal even inside a JSON string. A damaged entry
+            # stays invalid while complete, well-formed siblings remain readable.
+            error.output = re.sub(r"[\udc80-\udcff]+", "\0", text)
+        raise
+
+
+def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_output=False):
     if cancel.is_set():
         raise Cancelled
-    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout, \
-            tempfile.TemporaryFile() as stderr:
+    with (tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout,
+          tempfile.TemporaryFile() as stderr, failed_stdout(stdout, capture_failed_output)):
         if prompt is not None:
             stdin.write(prompt.encode("utf-8"))
             stdin.seek(0)
@@ -159,13 +159,12 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None):
         finally:
             os.close(read_fd)
         stdout.seek(0)
-        stderr.seek(0)
         if code == 75:
             raise Retry("command reported a temporary failure")
         if code:
             raise CommandFailed(code)
-        output = stdout.read(1024 * 1024 + 1)
-        if len(output) > 1024 * 1024:
+        output = stdout.read(OUTPUT_LIMIT + 1)
+        if len(output) > OUTPUT_LIMIT or os.fstat(stderr.fileno()).st_size > OUTPUT_LIMIT:
             raise ValueError("command output exceeded 1 MiB")
         try:
             return output.decode("utf-8", errors="strict")
@@ -176,7 +175,7 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None):
 def wait_for_status(fd, cancel, timeout, outputs):
     deadline = time.monotonic() + timeout
     while not cancel.is_set():
-        if any(os.fstat(stream.fileno()).st_size > 1024 * 1024 for stream in outputs):
+        if any(os.fstat(stream.fileno()).st_size > OUTPUT_LIMIT for stream in outputs):
             raise ValueError("command output exceeded 1 MiB")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
