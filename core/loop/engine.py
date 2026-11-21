@@ -163,8 +163,9 @@ class Engine:
         model_verdict = self.cfg.get("review_format") == "verdict"
         try:
             output = self.command("reviewer", argv, work, evidence,
-                                  stdin=prompt(request, previous, prior_round, model_verdict=model_verdict))
-        except (ValueError, Retry) as error:
+                                  stdin=prompt(request, previous, prior_round, model_verdict=model_verdict,
+                                               rule_text=self.cfg.get("rules_text")))
+        except (ValueError, Retry, Cancelled) as error:
             error.salvaged = salvage(getattr(error, "output", ""))
             raise
         if model_verdict:
@@ -213,7 +214,7 @@ class Engine:
                 previous = protected.get(lens, [])
                 try:
                     review = self.review_result(adapters[lens], git.repo, evidence, request, previous)
-                except (ValueError, Retry) as error:
+                except (ValueError, Retry, Cancelled) as error:
                     if getattr(error, "salvaged", None):
                         report["rejected_request"] = request
                         protected[lens] = retain_design_findings(previous, error.salvaged)
@@ -270,6 +271,10 @@ class Engine:
                 )
                 observed = observed_review(self.authenticate(output, key), observation, review["resolved"])
                 review["observation"] = {**observed, "source": source_id(key)}
+            except Cancelled as cause:
+                if review is None:
+                    self.settle_stopped_review(job_id, request, rounds, cause)
+                raise
             except (OSError, ValueError, Retry, sqlite3.Error) as cause:
                 found = review["findings"] if review is not None else getattr(cause, "salvaged", [])
                 if found:
@@ -284,6 +289,21 @@ class Engine:
             items = [item for item in items if item["lens"] != lens]
             items.extend({**item, "lens": lens} for item in review["findings"])
         return items
+
+    def settle_stopped_review(self, job_id, request, rounds, stop):
+        """Record protected findings a stopped reviewer already printed, or keep the pending row.
+
+        The row survives whenever the stop cannot prove that every finding was recorded, so
+        the next start classifies the job as interrupted instead of re-running the review.
+        """
+        stop.keep_pending = True
+        if getattr(stop, "output_truncated", False):
+            return
+        try:
+            self.store.record_protected(job_id, request, rounds, getattr(stop, "salvaged", []))
+        except (OSError, sqlite3.Error):
+            return
+        stop.keep_pending = False
 
     def step(self, job, prior, forest, approval):
         base = self.git.head(self.cfg["target"])
@@ -353,7 +373,7 @@ class Engine:
                 try:
                     git.pristine(evidence["candidate"])
                     self.command("worker", self.cfg["worker"], git.repo, evidence,
-                                 stdin=brief(evidence, items, self.cfg["repair_paths"]))
+                                 stdin=brief(evidence, items, self.cfg["repair_paths"], self.cfg.get("rules_text")))
                     repaired = git.repair(self.cfg["repair_paths"], evidence["candidate"])
                     with ExitStack() as next_checkout:
                         git, _ = next_checkout.enter_context(git.snapshot(self.cfg["state"], base, repaired))
@@ -432,8 +452,9 @@ class Engine:
     def collect(self, job, future):
         try:
             outcome = future.result()
-        except Cancelled:
-            self.store.cancel_review(job["id"])
+        except Cancelled as stop:
+            if not getattr(stop, "keep_pending", False):
+                self.store.cancel_review(job["id"])
             return
         except InterruptedAttempt as error:
             self.record_failure(job, error.cause, error.evidence)

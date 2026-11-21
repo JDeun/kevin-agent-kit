@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4
+
+- Check the installed `rules/` directory and files with the same trust check as
+  kit modules (owner, write bits, type, links, directory descriptors). The policy
+  hash, the prompts and the sandbox `/rules` mount use the same validated bytes.
+- Recover and record protected findings from reviewer output when the queue is
+  stopped. If the output is cut off or recording fails, keep the pending review
+  so the next start marks the job `interrupted` and does not rerun it.
+
 ## 0.3.3
 
 - Require Bubblewrap for live work in both trust modes. Keep provider credentials

@@ -1,4 +1,4 @@
-# Known issues in v0.3.3
+# Known issues in v0.3.4
 
 ## Supported scope
 
@@ -34,6 +34,7 @@ The remaining audit items use the identifiers from the pre-release reports.
 | V04 | A design approval stays valid while its ancestry holds, even if integration assumptions changed. |
 | V08, V10 | The fitness scan reopens files by name after checking them and has no file-count or byte limit. The latency template has no per-call timeout or open-loop arrival rate. |
 | L01 | The CLI has no upgrade, rollback or uninstall command. The installer fails on an occupied prefix. |
+| stop with cut-off output | A stop whose reviewer output was truncated or whose recording failed leaves the job `interrupted`. The operator inspects the pending request and re-enqueues; no automatic retry exists. |
 | local merge train | Not provided and not planned. The kit exports a verified candidate bundle and never updates the target branch. |
 
 The signed review contract requires independently signed coverage and protected closure

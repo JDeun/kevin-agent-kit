@@ -124,13 +124,22 @@ OUTPUT_LIMIT = 1024 * 1024
 def failed_stdout(stream, capture):
     try:
         yield
-    except (ValueError, Retry) as error:
+    except (ValueError, Retry, Cancelled) as error:
         if capture:
-            stream.seek(0)
-            text = stream.read(OUTPUT_LIMIT).decode("utf-8", errors="surrogateescape")
-            # Literal NUL is illegal even inside a JSON string. A damaged entry
-            # stays invalid while complete, well-formed siblings remain readable.
-            error.output = re.sub(r"[\udc80-\udcff]+", "\0", text)
+            # A stop reads the same final bytes as a failure: the supervisor has
+            # already ended the process group. Anything cut off or unreadable
+            # leaves the stop unable to prove it saw every finding.
+            try:
+                stream.seek(0)
+                raw = stream.read(OUTPUT_LIMIT + 1)
+            except (OSError, ValueError):
+                error.output_truncated = True
+            else:
+                error.output_truncated = len(raw) > OUTPUT_LIMIT
+                text = raw[:OUTPUT_LIMIT].decode("utf-8", errors="surrogateescape")
+                # Literal NUL is illegal even inside a JSON string. A damaged entry
+                # stays invalid while complete, well-formed siblings remain readable.
+                error.output = re.sub(r"[\udc80-\udcff]+", "\0", text)
         raise
 
 

@@ -103,16 +103,40 @@ def validate_evidence(policy, checks):
             raise ValueError("evidence approval requires a bundle scope and nonnegative retention_seconds")
 
 
-def policy_id(raw, execution, keys):
+def read_rules(root=None):
+    """Read the installed rule documents through one trusted directory descriptor.
+
+    Every entry must be a regular, singly linked file owned by the user or root
+    without group or other write access. The returned bytes are the only rule
+    input: the policy hash, the prompts and the sandbox mount all use them.
+    """
+    with directory((ROOT if root is None else root) / "rules") as source:
+        documents = {}
+        for name in sorted(os.listdir(source)):
+            if not stat.S_ISREG(os.lstat(name, dir_fd=source).st_mode):
+                raise ValueError(f"untrusted rules entry: {name}")
+            with regular_at(source, name, single_link=True) as document:
+                content = document.read()
+            if name.endswith(".md"):
+                documents[name] = content
+    if not documents:
+        raise ValueError("installed rule documents are missing")
+    return documents
+
+
+def rules_text(documents):
+    return "\n".join(documents[name].decode("utf-8") for name in sorted(documents))
+
+
+def policy_id(raw, execution, keys, rules):
     code = sorted((PACKAGE_ROOT / "core/loop").glob("*.py"))
     code += sorted((PACKAGE_ROOT / "core/agents").glob("*.py"))
     code += sorted((PACKAGE_ROOT / "core").glob("*.py"))
     lenses = sorted((PACKAGE_ROOT / "reviews/lenses").glob("*.md"))
     prompts = PACKAGE_ROOT / "reviews/persona/prompts.py"
-    rules = sorted((ROOT / "rules").glob("*.md"))
     tools = [repr(tool).encode("utf-8", errors="surrogateescape") for tool in execution["tools"].values()]
     sockets = [repr(socket).encode("utf-8", errors="surrogateescape") for socket in execution["sockets"].values()]
-    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, *rules, prompts)), *tools, *sockets, *keys)
+    return fingerprint(raw, *(path.read_bytes() for path in (*code, *lenses, prompts)), *(rules[name] for name in sorted(rules)), *tools, *sockets, *keys)
 
 
 def config(path=None, *, control_only=False):
@@ -218,6 +242,8 @@ def config(path=None, *, control_only=False):
 
     forbidden = (repo, common, state.resolve())
     execution = execution_policy(data["execution"], forbidden=forbidden)
+    rules = read_rules()
+    execution["rules"] = rules
     review_key = b"" if data["review_key"] == "" else public_key(outside_path(data["review_key"], forbidden))
     check_keys = {name: public_key(outside_path(key, forbidden)) for name, key in data["check_keys"].items()}
     if review_key and review_key in check_keys.values():
@@ -250,6 +276,7 @@ def config(path=None, *, control_only=False):
     data.update(
         repo=repo, state=state, repo_id=identity, profile=path, execution=execution, memory=memory,
         review_key=review_key, check_keys=check_keys,
-        policy_id=policy_id(raw + overrides, execution, (review_key, *check_keys.values())),
+        rules_text=rules_text(rules),
+        policy_id=policy_id(raw + overrides, execution, (review_key, *check_keys.values()), rules),
     )
     return data

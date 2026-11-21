@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import stat
 
-from .config import ROOT
+from .config import ROOT, read_rules
 from .paths import directory, identity, private_temporary_directory, regular_at, trusted
 from .runtime import run
 
@@ -117,7 +117,7 @@ def command_tools(argv, policy):
     return selected
 
 
-def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None):
+def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None, rules=None):
     if not argv:
         raise ValueError(f"configure the {role} command in the trusted profile")
     if policy.get("isolation") != "bwrap" or policy.get("env"):
@@ -135,7 +135,8 @@ def command_line(argv, cwd, role, policy, extra=None, *, tools=None, bundle=None
     for path in PUBLIC_FILES:
         if Path(path).is_file():
             cmd.extend(("--ro-bind", path, path))
-    cmd.extend(("--ro-bind", str(ROOT / "rules"), "/rules"))
+    if rules is not None:
+        cmd.extend(("--ro-bind", str(rules), "/rules"))
     if role in EVIDENCE_ROLES and cwd is not None:
         raise ValueError("evidence adapters cannot mount the candidate checkout")
     if cwd is not None:
@@ -210,5 +211,15 @@ def execute(argv, cwd, cancel, timeout, *, role, policy, stdin=None, extra=None,
                     raise ValueError(f"sandbox tool changed: {tool.path}")
             path.chmod(0o500 if tool.executable else 0o400)
             paths[name] = path
-        cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle)
+        # Mount the rule bytes the coordinator already validated, never the installed directory again.
+        documents = policy.get("rules")
+        if documents is None:
+            documents = read_rules()
+        rules = temp / "rules"
+        rules.mkdir(mode=0o700)
+        for name, content in documents.items():
+            with (rules / name).open("xb") as target:
+                target.write(content)
+            (rules / name).chmod(0o400)
+        cmd, env = command_line(argv, cwd, role, policy, extra, tools=paths, bundle=bundle, rules=rules)
         return run(cmd, "/", cancel, timeout, prompt=stdin, env=env, capture_failed_output=role == "reviewer")

@@ -110,7 +110,13 @@ protected from other users' writes. Symlinks and hard links are rejected. The
 sandbox checks the approved file identity and bytes and mounts a read-only copy.
 Use `/usr/bin` for system interpreters. The default environment gives each
 invocation a fresh `HOME` and private temporary paths. The sandbox mounts
-the kit rules at `/rules` and the agent checkout at `/workspace`. Reviewers
+the kit rules at `/rules` and the agent checkout at `/workspace`. The
+coordinator reads the installed `rules/` directory once, through a directory
+descriptor, and applies the module trust check to it: the owner must be the
+user or root, no group or other write bit, regular single-link files only, and
+no links or special files. The policy hash, the prompts and the `/rules` mount
+all use those same validated bytes; the mount is a private copy, never the
+installed directory. Reviewers
 have read-only access to the checkout. A worker can edit the checkout
 and has read-only access to its isolated Git metadata. Reviewer and worker
 commands start from a fresh home directory. Use `AGENT_WORKSPACE` to address
@@ -316,7 +322,11 @@ The queue records safety, security, and honesty findings as soon as it
 validates their review receipt, before requesting independent observation.
 Restart and retry carry those findings forward for independent resolution.
 A review left open by an interruption before its observations can be recorded
-moves the job to `interrupted` on restart. The queue keeps the pending request
+moves the job to `interrupted` on restart. A stop is not an exception: the
+coordinator recovers protected findings the reviewer had already printed, and
+records them before the job stops. When the output was cut off or the
+recording fails, the pending request stays, so the next start marks the job
+`interrupted` instead of running the review again. The queue keeps the pending request
 for diagnosis and blocks automatic or ordinary retry of that job.
 At the round cap, remaining safety, security, or honesty findings block the
 job and retain the evidence for the operator. Other findings create a human
