@@ -36,6 +36,29 @@ class UnsettledReview(InterruptedAttempt):
     """A review attempt stays open: its output or its recording cannot be proven whole."""
 
 
+def unread_findings(invocation, texts):
+    return [{
+        "id": f"unread-{hashlib.sha256((invocation + text).encode('utf-8', 'replace')).hexdigest()[:16]}",
+        "risk": "honesty", "finding_class": "unread-review-output",
+        "detail": "The coordinator could not read this finding from an earlier review of this change. "
+                  "Review the affected code again before resolving it. Printed text: " + text[:1000],
+    } for text in texts]
+
+
+def rescan_open_attempts(store):
+    """Journal what the stored output of every open attempt holds.
+
+    A coordinator that was killed never ran `conclude`, so a finding printed up to
+    the last poll sits only in the stored output. Reading it again, whole, journals
+    each complete finding and turns each cut-off one into an obligation. Findings
+    already journaled are kept as they are.
+    """
+    for invocation, text in store.open_outputs():
+        scanner = Scanner()
+        found = scanner.feed(text) + scanner.finish()
+        store.observe(invocation, "", found + unread_findings(invocation, scanner.unread))
+
+
 class ReviewOutput:
     """Scan reviewer output as it arrives and hand each protected finding to `record` at once.
 
@@ -69,12 +92,7 @@ class ReviewOutput:
         The next review must resolve each one explicitly, so an operator resume
         cannot drop a finding that was cut off or malformed.
         """
-        return [{
-            "id": f"unread-{hashlib.sha256((self.invocation + text).encode('utf-8', 'replace')).hexdigest()[:16]}",
-            "risk": "honesty", "finding_class": "unread-review-output",
-            "detail": "The coordinator could not read this finding from an earlier review of this change. "
-                      "Review the affected code again before resolving it. Printed text: " + text[:1000],
-        } for text in self.scanner.unread]
+        return unread_findings(self.invocation, self.scanner.unread)
 
     def conclude(self, output, error=None):
         seen = self.scanner.text
@@ -116,16 +134,32 @@ def check_inputs(cfg, evidence):
         raise Conflict("execution policy changed; restart and retry")
 
 
-def check_candidate(cfg, evidence):
+def check_candidate(cfg, evidence, store=None):
     check_inputs(cfg, evidence)
+    if store is not None:
+        check_lineage(store, evidence)
     if cfg.get("profile") and config(cfg["profile"])["policy_id"] != evidence["policy"]:
         raise Conflict("execution policy changed; restart and retry")
     if evidence["expires_at"] <= time.time():
         raise Conflict("candidate evidence expired; retry the job")
 
 
-def export_candidate(cfg, evidence, destination):
-    check_candidate(cfg, evidence)
+def check_lineage(store, evidence):
+    """Read the inherited findings again: a candidate stands only while its lineage has settled."""
+    job = evidence.get("job")
+    if job is None:
+        raise Conflict("candidate evidence has no lineage record; retry the job")
+    parent = store.unsettled_parent(job)
+    if parent is not None:
+        raise Conflict(f"job {parent} that this job inherits from is still in review; retry after it settles")
+    gap = store.lineage_gap(job, evidence.get("lineage_reviewed", []))
+    if gap:
+        raise Conflict("lineage findings this review never saw were recorded since: "
+                       + ", ".join(f"{lens}:{name}" for lens, name in gap) + "; retry the job")
+
+
+def export_candidate(cfg, evidence, destination, store=None):
+    check_candidate(cfg, evidence, store)
     path = cfg["state"] / "candidates" / f"{evidence['run']}.bundle"
     with path.open("rb") as source:
         if hashlib.file_digest(source, "sha256").hexdigest() != evidence["bundle_sha256"]:
@@ -138,7 +172,7 @@ def export_candidate(cfg, evidence, destination):
             with staged.open("xb") as target:
                 staged.chmod(0o600)
                 shutil.copyfileobj(source, target)
-            check_candidate(cfg, evidence)
+            check_candidate(cfg, evidence, store)
             destination.hardlink_to(staged)
 
 
@@ -177,6 +211,7 @@ class Engine:
         self.runs = {}
 
     def __enter__(self):
+        rescan_open_attempts(self.store)
         self.store.interrupt_unsettled()
         return self
 
@@ -554,6 +589,7 @@ class Engine:
             staged.replace(bundle)
             return "candidate", "awaiting repository owner", {
                 **report, **export_scope, "checks": receipts, "runs": self.trace(evidence),
+                "job": job["id"], "lineage_reviewed": sorted([lens, name] for lens, name in seen),
                 "trust": self.cfg.get("trust", "signed"),
                 "expires_at": time.time() + self.cfg["evidence_ttl_seconds"],
             }
@@ -588,6 +624,13 @@ class Engine:
             return
         if outcome is not None:
             phase, detail, evidence = outcome
+            if phase == "candidate":
+                try:
+                    check_lineage(self.store, evidence)
+                except Conflict as error:
+                    # The lineage moved while this review ran; review again against its current journal.
+                    self.store.update(job, "review", detail=f"lineage changed: {error}")
+                    return
             self.store.update(job, phase, detail=detail, evidence=evidence)
 
     def record_failure(self, job, error, evidence):

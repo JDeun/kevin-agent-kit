@@ -111,7 +111,7 @@ assert Path("example.txt").read_bytes() == b"correct\\n"
             raise ValueError(f"demo did not prepare a candidate: {report['counts']}")
         evidence = store.candidate(1)
         bundle = root / "ready.bundle"
-        export_candidate(cfg, evidence, bundle)
+        export_candidate(cfg, evidence, bundle, store)
     assert git.head("main") == base and git.head("change") == initial
     git.run("bundle", "unbundle", str(bundle))
     return {
@@ -281,7 +281,7 @@ def main(argv=None):
                     print(json.dumps(store.held(args.job_id), indent=2))
                 elif args.action == "candidate":
                     evidence = store.candidate(args.job_id)
-                    export_candidate(cfg, evidence, args.output.absolute())
+                    export_candidate(cfg, evidence, args.output.absolute(), store)
                     print(evidence["candidate"])
                 elif args.action == "decide":
                     store.decide(args.record_id, args.disposition, args.source)
@@ -298,7 +298,7 @@ def main(argv=None):
                         if job["phase"] != "candidate":
                             continue
                         try:
-                            check_candidate(cfg, job["evidence"])
+                            check_candidate(cfg, job["evidence"], store)
                         except ValueError as error:
                             job["phase"] = "stale"
                             job["detail"] = str(error)

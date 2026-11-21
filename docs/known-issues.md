@@ -1,4 +1,4 @@
-# Known issues in v0.3.5
+# Known issues in v0.3.6
 
 ## Supported scope
 
@@ -34,7 +34,7 @@ The remaining audit items use the identifiers from the pre-release reports.
 | V04 | A design approval stays valid while its ancestry holds, even if integration assumptions changed. |
 | V08, V10 | The fitness scan reopens files by name after checking them and has no file-count or byte limit. The latency template has no per-call timeout or open-loop arrival rate. |
 | L01 | The CLI has no upgrade, rollback or uninstall command. The installer fails on an occupied prefix. |
-| interrupted review | A reviewer that fails after printing text around its JSON document, or a code fence, leaves the job `interrupted` instead of retrying it. No automatic resume exists. A stand-in `unread-…` finding quotes at most 1,000 characters of the text it replaces; the full output is in `evidence`. |
+| interrupted review | A reviewer whose output has any text around its JSON document, or a code fence, leaves the job `interrupted` even when it exits with code 0, so a broker client that mixes prose into its output needs `resume` after every review. The job is held rather than rerun. No automatic resume exists. A stand-in `unread-…` finding quotes at most 1,000 characters of the text it replaces; the full output is in `evidence`. |
 | install approval | The snapshot covers `project.toml`, the kit packages and `rules/`. The launcher file is checked for owner, mode and links but is not part of the digest, and the Python interpreter and system tools are outside it. Root-level `plugin/`, `agents/` and `docs/` are not read by the kit and are outside the walk and the digest. Each profile is approved separately. A running daemon keeps the snapshot it started with until it is stopped. Commands without a profile (`demo`, `guard`, `fitness`, `wiki`, `init --global`) need a trusted install but no approval, so review an upgrade before `init --global` copies its rules. If the trust walk fails, the launcher refuses `stop` too: restore the reported path or send the daemon SIGTERM. Nested directories and non-Markdown files under `rules/` change the digest but are not rules. |
 | source checkout | `python3 -m core.loop` in a checkout imports modules through Python's file loader before it takes the snapshot. Only the generated launcher and the processes it starts import from snapshot bytes. Use the checkout path for development. |
 | local merge train | Not provided and not planned. The kit exports a verified candidate bundle and never updates the target branch. |
@@ -47,5 +47,7 @@ operator still approves which CI source and test policy are authoritative.
 Other open items from the v0.3.1 check: a concurrent wiki `ingest` can lose a manifest entry; the
 research-landing check reads only the changed path names; `retry` after a new commit retries the old
 SHA and goes stale (enqueue the new SHA instead); work that moves to a new branch needs `--inherit-from`
-to carry protected findings (jobs on the same branch inherit them automatically); the status count
+to carry protected findings (jobs on the same branch inherit them automatically, and a job that
+inherits waits for its parent's review to settle); a coordinator killed by SIGKILL loses reviewer output it
+had not yet polled; the status count
 treats a running job as runnable.

@@ -229,11 +229,43 @@ class Store:
                              0, 0, escalation)
 
     def ready(self):
-        # A job with an unsettled review attempt is never dispatched again.
-        return self.db.execute(
+        # A job with an unsettled review attempt is never dispatched again, and a job
+        # that inherits from a lineage still under review waits for it to settle.
+        rows = self.db.execute(
             f"SELECT * FROM jobs WHERE phase='review' AND next_at <= ? AND NOT EXISTS ({OPEN_ATTEMPT}) "
             "ORDER BY id", (time.time(),),
         ).fetchall()
+        return [row for row in rows if self.unsettled_parent(row["id"]) is None]
+
+    def unsettled_parent(self, job_id):
+        """The nearest job up the `--inherit-from` chain that is still being reviewed, or None.
+
+        Its protected findings are not final until it settles, so a child cannot be
+        dispatched or exported meanwhile. An interrupted parent counts: its output
+        is held for an operator, and its findings may not all be journaled yet.
+        """
+        seen = {job_id}
+        row = self.db.execute("SELECT inherits FROM jobs WHERE id=?", (job_id,)).fetchone()
+        while row is not None and row["inherits"] is not None and row["inherits"] not in seen:
+            seen.add(row["inherits"])
+            parent = self.db.execute("SELECT id,phase,inherits FROM jobs WHERE id=?", (row["inherits"],)).fetchone()
+            if parent is None:
+                return None
+            if parent["phase"] in ("review", "interrupted"):
+                return parent["id"]
+            row = parent
+        return None
+
+    def lineage_gap(self, job_id, reviewed):
+        """Protected findings of the inherited lineage that the job's review never saw.
+
+        `reviewed` is the (lens, id) list its candidate evidence recorded at dispatch.
+        The journals of the parent chain and of the branch are read again on every call.
+        """
+        job = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        own = {(item["lens"], item["id"]) for item in self.protected(job_id)}
+        known = {tuple(key) for key in reviewed}
+        return sorted({(item["lens"], item["id"]) for item in self.inherited_protected(dict(job))} - own - known)
 
     def update(self, job, phase, *, detail="", attempts=0, next_at=0, evidence=None):
         with self.db:
@@ -278,6 +310,11 @@ class Store:
             "ORDER BY opened_at, invocation", (job_id,)).fetchall()
         return [{**dict(row), "output": self._output(row["invocation"]),
                  "findings": self._journaled(row["invocation"])} for row in rows]
+
+    def open_outputs(self):
+        """(invocation, output) of every review attempt that never closed."""
+        return [(row["invocation"], self._output(row["invocation"])) for row in self.db.execute(
+            "SELECT invocation FROM review_attempts WHERE closed_at IS NULL ORDER BY opened_at, invocation")]
 
     def _output(self, invocation):
         chunks = self.db.execute("SELECT chunk FROM review_output WHERE invocation=? ORDER BY id", (invocation,))

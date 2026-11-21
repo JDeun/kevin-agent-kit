@@ -305,7 +305,11 @@ ended with findings open (any phase except `candidate`, `included`, `waiting` an
 that moves to a new branch names its source with `enqueue BRANCH SHA --inherit-from JOB_ID`;
 any job can be the source, and its own sources follow. The review then requires resolution
 evidence for each inherited finding (independent evidence in signed mode), so a new SHA
-cannot drop one silently. Repeat detection is scoped to the lens that raised the class. Re-running
+cannot drop one silently. Inheritance is a live dependency: a job with `--inherit-from` is not
+dispatched while any job up its chain is `review` or `interrupted`, and the coordinator reads
+the parents' journals again before it stores a candidate, in `status` and on every export. A
+finding recorded since, or a parent back in review, returns the job to review or makes its
+candidate stale. Repeat detection is scoped to the lens that raised the class. Re-running
 `enqueue --kind routine` on an unclassified SHA that is still in review or `design-needed`
 corrects the classification in place and records a `reclassified` evidence row.
 Inspect phases and counters with [status](observability.md).
@@ -355,7 +359,9 @@ kevin-agent-kit enqueue BRANCH NEW_SHA # or continue with a new commit
 `resume` keeps the evidence and returns the job to review. The next reviewer
 receives every journaled finding as a prior protected finding. A new SHA on
 the same branch inherits them automatically; `--inherit-from JOB_ID` carries
-them to another branch and marks the interrupted job `superseded`.
+them to another branch and marks the interrupted job `superseded`. Starting the
+coordinator re-reads the stored output of every open attempt first, so a finding printed
+before a forced kill is journaled before `resume` can close the attempt.
 At the round cap, remaining safety, security, or honesty findings block the
 job and retain the evidence for the operator. Other findings create a human
 decision record. Inspect it with `accept-record ID` and record `revise`

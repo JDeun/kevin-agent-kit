@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.6
+
+Inheritance across branches is a live dependency, not a snapshot taken at dispatch.
+
+- A job that names `--inherit-from` waits while any job up its inheritance
+  chain is still in `review` or `interrupted`, so it is never dispatched before
+  its parent's protected findings are final.
+- A candidate records the lineage findings its review saw. Before a job is
+  stored as a candidate, in `status`, and on every export, the coordinator
+  reads the parents' and the branch's journals again. A finding recorded
+  since, or a parent back in review, sends the job back to review or makes
+  the candidate stale. A candidate prepared by 0.3.5 has no lineage record and
+  must be retried.
+- Starting the coordinator re-reads the stored output of every open review
+  attempt, so a finding printed before a forced kill is journaled (or becomes an
+  unreadable-finding obligation) before `resume` can close the attempt.
+- The command supervisor now ends its process group when the coordinator dies
+  instead of waiting forever, so a killed coordinator leaves no orphan session.
+- `docs/known-issues.md`: correct the interrupted-review wording and the
+  `--inherit-from` note.
+
 ## 0.3.5
 
 Redesign of stop integrity and install trust. See

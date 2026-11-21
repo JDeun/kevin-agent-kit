@@ -73,6 +73,24 @@ its `--inherit-from` parent, transitively. `--inherit-from` accepts any job.
 A protected finding therefore stays open on a branch until a reviewer of the
 current SHA resolves it.
 
+**Inheritance is a live dependency (0.3.6).** The inherited set is not computed
+once at dispatch. A job with an `--inherit-from` parent is not dispatched while a
+job up that chain is in `review` or `interrupted`. A candidate records the
+`(lens, id)` pairs its review was given (`lineage_reviewed`) and its job ID.
+The coordinator recomputes the lineage from the journals when it is about to
+store the candidate, in `status` and on every export, and treats a finding the
+review never saw, or a parent that is back in review, as a conflict: the job
+returns to review, or the candidate is stale. Findings the job journaled itself
+are excluded from that comparison. Evidence without a lineage record, from a
+0.3.5 queue, is refused until the job is retried.
+
+**A killed coordinator.** Starting the coordinator reads the stored output of
+every open attempt through the scanner again before it interrupts the job, so a
+finding printed before the kill is journaled and a cut-off one becomes a
+stand-in obligation. Only text the reader had not yet polled when the process
+died is lost, as before. The command supervisor ends its own process group once
+the coordinator that started it is gone.
+
 Design reviews use the same scanner. Each finding, stand-ins included, is saved
 into the branch's design report as it appears. Unsettled output is kept in that
 report and carried into later reports of the branch (the last three).

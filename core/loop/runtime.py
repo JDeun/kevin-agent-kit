@@ -103,17 +103,35 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 status = int(sys.argv[1])
+parent = int(sys.argv[2])
+
+
+def orphaned():
+    # The coordinator is gone: nothing will ever stop this session, so end it.
+    return os.getppid() != parent
+
+
 try:
-    code = subprocess.run(sys.argv[2:], check=False).returncode
+    child = subprocess.Popen(sys.argv[3:])
 except OSError as error:
     print(error, file=sys.stderr)
     code = 127
+else:
+    while True:
+        try:
+            code = child.wait(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if orphaned():
+                os.killpg(0, signal.SIGKILL)
 os.write(status, str(code).encode("ascii"))
 os.close(status)
-while True:
-    signal.pause()
+while not orphaned():
+    time.sleep(0.2)
+os.killpg(0, signal.SIGKILL)
 """
 
 
@@ -179,7 +197,7 @@ def run(argv, cwd, cancel, timeout, *, prompt=None, env=None, capture_failed_out
         try:
             try:
                 child = subprocess.Popen(
-                    [sys.executable, "-I", "-c", _SUPERVISOR, str(write_fd), *argv],
+                    [sys.executable, "-I", "-c", _SUPERVISOR, str(write_fd), str(os.getpid()), *argv],
                     cwd=cwd, env=env, stdin=stdin if prompt is not None else subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, start_new_session=True, pass_fds=(write_fd,),
                 )
